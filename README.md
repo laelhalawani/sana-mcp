@@ -1,27 +1,12 @@
 # sana-mcp
 
-Give any AI agent instant, local access to your [Sana.AI](https://sana.ai) meeting
-transcripts - it runs a background daemon that syncs them into a local database,
-unlocking search, read, summarize, and more through a single
-[MCP](https://modelcontextprotocol.io) tool (`meeting_transcripts`) and a CLI.
-
-Everything runs on your machine. A background daemon is the only thing that talks
-to Sana; tools read from a local SQLite database and answer instantly.
-
-Maintained by [Lumen](https://lumen.com).
-
 [![release](https://img.shields.io/github/v/release/Lumen-AiApp/sana-ai-mcp?include_prereleases&label=release)](https://github.com/Lumen-AiApp/sana-ai-mcp/releases)
 [![license](https://img.shields.io/github/license/Lumen-AiApp/sana-ai-mcp)](#license)
 [![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#quickstart)
 
----
-
 ## Quickstart
 
-`sana-mcp` ships as a single self-contained binary. The usual flow is one-line
-install, register it with your AI clients, then sign in.
-
-**1. Install** - macOS / Linux:
+macOS / Linux:
 
 ```bash
 curl -fsSL https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.sh | sh
@@ -33,52 +18,10 @@ Windows (PowerShell):
 irm https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
 ```
 
-Or download the asset for your platform from the
-[Releases page](https://github.com/Lumen-AiApp/sana-ai-mcp/releases)
-(`sana-mcp-{linux,darwin,windows}-{x64,arm64}`) and put it on your `PATH`.
-
-**2. Register with your AI clients:**
-
-```bash
-sana-mcp install      # detect installed clients, register sana-mcp with your picks
-```
-
-See [Register with an AI client](#register-with-an-ai-client) for the full list
-of supported clients and flags. Prefer to wire it up yourself? See
-[Manual configuration](#manual-configuration) below.
-
-**3. Sign in** - now, or let the agent do it later:
-
-```bash
-sana-mcp login --email you@example.com                 # emails you a 6-digit code
-sana-mcp login --email you@example.com --code 123456   # verify it
-```
-
-Or skip this step - the agent will ask for your email and the confirmation code
-the first time it tries to use the tools.
-
-After the first login, a catch-up sync runs and the daemon keeps your meetings
-current. Run `sana-mcp status` to watch progress, then ask your agent to search,
-read, or summarize your meetings.
-
-### Manual configuration
-
-Point your client at the installed binary with the `mcp` subcommand (use the
-absolute path to the binary):
-
-```json
-{
-  "mcpServers": {
-    "sana-mcp": {
-      "command": "/absolute/path/to/sana-mcp",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-The server name is `sana-mcp`; the tool it exposes is `meeting_transcripts`. The
-daemon starts automatically on first use after login.
+Give any AI agent instant, local access to your [Sana.AI](https://sana.ai) meeting
+transcripts - it runs a background daemon that syncs them into a local database,
+unlocking search, read, summarize, and more through a single
+[MCP](https://modelcontextprotocol.io) tool (`meeting_transcripts`) and a CLI.
 
 ## What it does
 
@@ -175,6 +118,12 @@ Subcommands:
 
 ## Register with an AI client
 
+After installing the binary, register it with your AI clients:
+
+```bash
+sana-mcp install      # detect installed clients, register sana-mcp with your picks
+```
+
 `sana-mcp install` detects the MCP-capable clients on your machine and registers
 `sana-mcp` with the ones you choose. Each client's config is written safely -
 your existing servers are preserved - and the operation is idempotent.
@@ -186,6 +135,38 @@ your existing servers are preserved - and the operation is idempotent.
   detected clients, no prompt), `--name <name>` (server name; default `sana-mcp`).
 - After registering, most clients need a restart or a session reload to pick up
   the new server. Remove it later with `sana-mcp uninstall` (same flags).
+
+No supported client detected, or prefer to wire it up yourself? Point your client
+at the installed binary with the `mcp` subcommand (use the absolute path, or grab
+the binary from the [Releases page](https://github.com/Lumen-AiApp/sana-ai-mcp/releases)):
+
+```json
+{
+  "mcpServers": {
+    "sana-mcp": {
+      "command": "/absolute/path/to/sana-mcp",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The server name is `sana-mcp`; the tool it exposes is `meeting_transcripts`. The
+daemon starts automatically on first use after login.
+
+## Sign in
+
+Sign in now:
+
+```bash
+sana-mcp login --email you@example.com                 # emails you a 6-digit code
+sana-mcp login --email you@example.com --code 123456   # verify it
+```
+
+Or skip it - the agent will ask for your email and the confirmation code the
+first time it tries to use the tools. After the first login, a catch-up sync runs
+and the daemon keeps your meetings current; run `sana-mcp status` to watch
+progress, then ask your agent to search, read, or summarize your meetings.
 
 ## How sync works
 
