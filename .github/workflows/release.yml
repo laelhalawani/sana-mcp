@@ -1,0 +1,53 @@
+name: release
+
+# Builds self-contained sana-mcp binaries for all six targets and attaches them
+# to the GitHub release for the pushed tag. Cut a release with:
+#   git tag v0.1.0 && git push --tags
+# Tags containing "-" (e.g. v0.1.0-rc1) are published as prereleases.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and attach binaries to"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64,     bun_target: bun-linux-x64 }
+          - { target: linux-arm64,   bun_target: bun-linux-arm64 }
+          - { target: darwin-x64,    bun_target: bun-darwin-x64 }
+          - { target: darwin-arm64,  bun_target: bun-darwin-arm64 }
+          - { target: windows-x64,   bun_target: bun-windows-x64,   ext: .exe }
+          - { target: windows-arm64, bun_target: bun-windows-arm64, ext: .exe }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --no-progress
+      - name: Compile
+        run: |
+          bun build src/cli.ts --compile \
+            --target ${{ matrix.bun_target }} \
+            --external @huggingface/transformers \
+            --external sqlite-vec \
+            --outfile sana-mcp-${{ matrix.target }}${{ matrix.ext }}
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: sana-mcp-${{ matrix.target }}${{ matrix.ext }}
+          prerelease: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
+          fail_on_unmatched_files: true

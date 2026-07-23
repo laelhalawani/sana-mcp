@@ -5,7 +5,7 @@
 set -eu
 
 REPO="Lumen-AiApp/sana-ai-mcp"
-VERSION="${SANA_MCP_VERSION:-v0.1.0-rc1}"
+VERSION="${SANA_MCP_VERSION:-v0.1.0}"
 
 os="$(uname -s)"
 arch="$(uname -m)"
