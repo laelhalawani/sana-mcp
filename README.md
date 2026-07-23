@@ -4,6 +4,11 @@
 [![license](https://img.shields.io/github/license/Lumen-AiApp/sana-ai-mcp)](#license)
 [![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#what-it-does)
 
+Give any AI agent instant, local access to your [Sana.AI](https://sana.ai) meeting
+transcripts - it runs a background daemon that syncs them into a local database,
+unlocking search, read, summarize, and more through a single
+[MCP](https://modelcontextprotocol.io) tool (`meeting_transcripts`) and a CLI.
+
 macOS / Linux:
 
 ```bash
@@ -15,11 +20,6 @@ Windows (PowerShell):
 ```powershell
 irm https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
 ```
-
-Give any AI agent instant, local access to your [Sana.AI](https://sana.ai) meeting
-transcripts - it runs a background daemon that syncs them into a local database,
-unlocking search, read, summarize, and more through a single
-[MCP](https://modelcontextprotocol.io) tool (`meeting_transcripts`) and a CLI.
 
 ## What it does
 
