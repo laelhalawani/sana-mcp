@@ -36,6 +36,7 @@ export interface MeetingRow {
   created_at_ms: number;
   modified_at_ms: number | null;
   first_seen_ms: number;
+  processing_phase: string | null; // "done" when Sana has finished processing
 }
 
 export interface TranscriptRow {
@@ -131,11 +132,17 @@ export class SanaStore {
       INSERT OR IGNORE INTO sync_state (id, phase, updated_ms)
         VALUES (1, 'idle', 0);
     `);
-    // Migrate older DBs that predate the `blocking` column.
-    const cols = this.db.prepare(`PRAGMA table_info(sync_state)`).all() as { name: string }[];
-    if (!cols.some((c) => c.name === "blocking")) {
+    // --- lightweight column migrations for older DBs ---
+    const hasCol = (table: string, col: string): boolean =>
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
+        (c) => c.name === col
+      );
+    if (!hasCol("sync_state", "blocking"))
       this.db.exec(`ALTER TABLE sync_state ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1`);
-    }
+    if (!hasCol("meetings", "processing_phase"))
+      this.db.exec(`ALTER TABLE meetings ADD COLUMN processing_phase TEXT`);
+    if (!hasCol("meeting_metadata", "has_recording"))
+      this.db.exec(`ALTER TABLE meeting_metadata ADD COLUMN has_recording INTEGER NOT NULL DEFAULT 0`);
   }
 
   // ---- meetings ----------------------------------------------------------
@@ -147,15 +154,17 @@ export class SanaStore {
     source: string;
     created_at_ms: number;
     modified_at_ms?: number | null;
+    processing_phase?: string | null;
   }): void {
     this.db
       .prepare(
-        `INSERT INTO meetings (id, external_id, name, source, created_at_ms, modified_at_ms, first_seen_ms)
-         VALUES (@id, @external_id, @name, @source, @created_at_ms, @modified_at_ms, @first_seen_ms)
+        `INSERT INTO meetings (id, external_id, name, source, created_at_ms, modified_at_ms, first_seen_ms, processing_phase)
+         VALUES (@id, @external_id, @name, @source, @created_at_ms, @modified_at_ms, @first_seen_ms, @processing_phase)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            external_id = excluded.external_id,
-           modified_at_ms = excluded.modified_at_ms`
+           modified_at_ms = excluded.modified_at_ms,
+           processing_phase = excluded.processing_phase`
       )
       .run({
         id: m.id,
@@ -165,6 +174,7 @@ export class SanaStore {
         created_at_ms: m.created_at_ms,
         modified_at_ms: m.modified_at_ms ?? null,
         first_seen_ms: Date.now(),
+        processing_phase: m.processing_phase ?? null,
       });
   }
 
@@ -252,6 +262,7 @@ export class SanaStore {
            LEFT JOIN fetch_failures ff ON ff.meeting_id = m.id
            WHERE (t.meeting_id IS NULL OR mm.meeting_id IS NULL)
              AND COALESCE(ff.attempts, 0) < @maxAtt
+             AND (m.processing_phase IS NULL OR m.processing_phase = 'done')
            ORDER BY m.created_at_ms DESC`
         )
         .all({ maxAtt: MAX_TRANSCRIPT_ATTEMPTS }) as { id: string }[]
@@ -304,26 +315,41 @@ export class SanaStore {
     summary_short: string | null;
     notes_json: string | null;
     participants_json: string | null;
+    has_recording: number;
   }): void {
     this.db
       .prepare(
-        `INSERT INTO meeting_metadata (meeting_id, summary, summary_short, notes_json, participants_json, fetched_ms)
-         VALUES (@meeting_id, @summary, @summary_short, @notes_json, @participants_json, @fetched_ms)
+        `INSERT INTO meeting_metadata (meeting_id, summary, summary_short, notes_json, participants_json, has_recording, fetched_ms)
+         VALUES (@meeting_id, @summary, @summary_short, @notes_json, @participants_json, @has_recording, @fetched_ms)
          ON CONFLICT(meeting_id) DO UPDATE SET
            summary=excluded.summary, summary_short=excluded.summary_short,
            notes_json=excluded.notes_json, participants_json=excluded.participants_json,
-           fetched_ms=excluded.fetched_ms`
+           has_recording=excluded.has_recording, fetched_ms=excluded.fetched_ms`
       )
       .run({ ...row, fetched_ms: Date.now() });
   }
 
   getMetadata(meetingId: string):
-    | { summary: string | null; summary_short: string | null; notes_json: string | null; participants_json: string | null }
+    | {
+        summary: string | null;
+        summary_short: string | null;
+        notes_json: string | null;
+        participants_json: string | null;
+        has_recording: number;
+      }
     | undefined {
     return this.db
-      .prepare(`SELECT summary, summary_short, notes_json, participants_json FROM meeting_metadata WHERE meeting_id = ?`)
+      .prepare(
+        `SELECT summary, summary_short, notes_json, participants_json, has_recording FROM meeting_metadata WHERE meeting_id = ?`
+      )
       .get(meetingId) as
-      | { summary: string | null; summary_short: string | null; notes_json: string | null; participants_json: string | null }
+      | {
+          summary: string | null;
+          summary_short: string | null;
+          notes_json: string | null;
+          participants_json: string | null;
+          has_recording: number;
+        }
       | undefined;
   }
 

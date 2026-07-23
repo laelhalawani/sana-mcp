@@ -33,7 +33,7 @@ export const TOOLS: ToolDoc[] = [
   {
     name: "read",
     summary:
-      "Read a meeting transcript (header includes participants and a short summary). With no line selection it reports the line count and options; use full:true for the whole thing, or lines:[start,end] for a range. A line is one spoken turn.",
+      "Read a meeting transcript as numbered lines. With no line selection it reports the line count and options; use full:true for the whole thing, or lines:[start,end] for a range. A line is one spoken turn. (Summary, participants and recording are separate tools.)",
     args:
       'meeting_id: string (required); full: boolean (read all); lines: [start,end] (1-based line range); timestamps: boolean (default true)',
     example: 'meeting_transcripts("read", {"meeting_id":"v72HzzJDZx9WqTmF", "lines":[22,26]})',
@@ -45,6 +45,25 @@ export const TOOLS: ToolDoc[] = [
     args:
       'query: string (required); limit: number (default 10); sort: "best" (default, most relevant) or "newest" or "oldest"; filter: {date: {from, to}} where from/to are ISO dates ("YYYY-MM-DD") or epoch ms',
     example: 'meeting_transcripts("search", {"query":"pricing", "sort":"newest"})',
+  },
+  {
+    name: "summary",
+    summary: "Get a meeting's summary, plus notes (by topic) and action items.",
+    args: "meeting_id: string (required)",
+    example: 'meeting_transcripts("summary", {"meeting_id":"v72HzzJDZx9WqTmF"})',
+  },
+  {
+    name: "participants",
+    summary: "List a meeting's participants (name, email, host).",
+    args: "meeting_id: string (required)",
+    example: 'meeting_transcripts("participants", {"meeting_id":"v72HzzJDZx9WqTmF"})',
+  },
+  {
+    name: "recording",
+    summary:
+      "Get a temporary link to a meeting's recording. Fetched live from Sana (the only tool that hits the network); the URL expires after a few hours.",
+    args: "meeting_id: string (required)",
+    example: 'meeting_transcripts("recording", {"meeting_id":"v72HzzJDZx9WqTmF"})',
   },
   {
     name: "help",
