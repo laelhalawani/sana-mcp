@@ -7,12 +7,13 @@
 //   sana-mcp daemon                   run the background syncer in the foreground
 import { Command } from "commander";
 import { sana } from "./tools/dispatch.js";
+import pkg from "../package.json" with { type: "json" };
 
 const program = new Command();
 program
   .name("sana-mcp")
   .description("Sana.AI meeting transcripts - CLI for the Sana.AI transcript tools")
-  .version("0.1.0");
+  .version(pkg.version);
 
 program
   .command("daemon")
