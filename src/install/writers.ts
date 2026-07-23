@@ -46,11 +46,17 @@ export function upsertJsonServer(
 ): WriteResult {
   const { fresh, data } = readJsonTolerant(file);
   if (data === null) return "skipped-unparseable";
+  if (data[topKey] != null && (typeof data[topKey] !== "object" || Array.isArray(data[topKey])))
+    return "skipped-unparseable";
   const servers = (data[topKey] as Record<string, unknown> | undefined) ?? {};
   const obj = entryObject(entry);
-  if (!fresh && JSON.stringify(servers[name] ?? null) === JSON.stringify(obj)) return "noop";
+  const cur: Record<string, unknown> | null = (servers[name] as Record<string, unknown> | undefined) ?? null;
+  const managed = (o: Record<string, unknown>): string =>
+    JSON.stringify({ command: o.command, args: o.args, env: o.env });
+  if (!fresh && cur != null && managed(cur) === managed(obj)) return "noop";
   if (dryRun) return "ok";
-  data[topKey] = { ...servers, [name]: obj };
+  servers[name] = { ...cur, ...obj };
+  data[topKey] = servers;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
   return "ok";

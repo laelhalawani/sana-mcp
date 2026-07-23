@@ -336,10 +336,11 @@ export class SanaStore {
           `SELECT t.meeting_id AS id FROM transcripts t
            LEFT JOIN line_embeddings e ON e.meeting_id = t.meeting_id
            JOIN meetings m ON m.id = t.meeting_id
-           WHERE e.meeting_id IS NULL
+           LEFT JOIN fetch_failures ff ON ff.meeting_id = t.meeting_id
+           WHERE e.meeting_id IS NULL AND COALESCE(ff.attempts, 0) < @maxAtt
            ORDER BY m.created_at_ms DESC`
         )
-        .all() as { id: string }[]
+        .all({ maxAtt: MAX_TRANSCRIPT_ATTEMPTS }) as { id: string }[]
     ).map((r) => r.id);
   }
 
@@ -545,20 +546,22 @@ export class SanaStore {
     return this.db.prepare(`SELECT * FROM sync_state WHERE id = 1`).get() as SyncState;
   }
 
+  private static readonly SYNC_COLS = [
+    "phase", "message", "meetings_total", "transcripts_done", "transcripts_total",
+    "last_full_sync_ms", "last_incremental_ms", "daemon_pid", "daemon_heartbeat_ms",
+    "blocking", "error",
+  ] as const;
+
   updateSyncState(patch: Partial<Omit<SyncState, "updated_ms">>): void {
-    const cur = this.getSyncState();
-    const next = { ...cur, ...patch, updated_ms: Date.now() };
-    this.db
-      .prepare(
-        `UPDATE sync_state SET
-           phase=@phase, message=@message, meetings_total=@meetings_total,
-           transcripts_done=@transcripts_done, transcripts_total=@transcripts_total,
-           last_full_sync_ms=@last_full_sync_ms, last_incremental_ms=@last_incremental_ms,
-           daemon_pid=@daemon_pid, daemon_heartbeat_ms=@daemon_heartbeat_ms,
-           blocking=@blocking, error=@error, updated_ms=@updated_ms
-         WHERE id = 1`
-      )
-      .run(next);
+    const sets: string[] = ["updated_ms = @updated_ms"];
+    const params: Bindings = { updated_ms: Date.now() };
+    for (const col of SanaStore.SYNC_COLS) {
+      if (col in patch) {
+        sets.push(`${col} = @${col}`);
+        params[col] = (patch as Record<string, unknown>)[col] as Bindings[string];
+      }
+    }
+    this.db.prepare(`UPDATE sync_state SET ${sets.join(", ")} WHERE id = 1`).run(params);
   }
 
   close(): void {
