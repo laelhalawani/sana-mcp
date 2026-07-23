@@ -16,7 +16,7 @@ export function hasSession(): boolean {
 /**
  * Launch a persistent browser context backed by an on-disk profile
  * (data/profile). Cookies, localStorage and IndexedDB all persist here, so the
- * user logs in once and every later run — headless or headed — reuses it.
+ * user logs in once and every later run - headless or headed - reuses it.
  *
  * Cross-platform: native window on Windows/macOS when headed, WSLg under WSL.
  * `channel` can select the system Chrome/Edge instead of bundled Chromium.

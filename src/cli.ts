@@ -11,7 +11,7 @@ import { sana } from "./tools/dispatch.js";
 const program = new Command();
 program
   .name("sana")
-  .description("Sana.AI meeting transcripts — CLI over the sana(tool,args) interface")
+  .description("Sana.AI meeting transcripts - CLI over the sana(tool,args) interface")
   .version("0.1.0");
 
 program

@@ -10,7 +10,7 @@ export function pidAlive(pid: number | null): boolean {
     process.kill(pid, 0); // signal 0 = existence check, cross-platform
     return true;
   } catch (e) {
-    // EPERM means it exists but we can't signal it — still alive.
+    // EPERM means it exists but we can't signal it - still alive.
     return (e as NodeJS.ErrnoException).code === "EPERM";
   }
 }

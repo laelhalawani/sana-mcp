@@ -2,7 +2,7 @@
 
 Sync and search your own [Sana.AI](https://sana.ai) meeting transcripts locally,
 and expose them to AI agents through a single [MCP](https://modelcontextprotocol.io)
-tool — plus a matching CLI.
+tool - plus a matching CLI.
 
 Maintained by [Lumen](https://lumen.com).
 
@@ -12,7 +12,7 @@ Maintained by [Lumen](https://lumen.com).
 
 Sana has no public API for meetings, so this talks to the same backend the Sana
 web app uses (tRPC at `sana.ai/x-api`) with your logged-in session. All traffic
-is over HTTPS via direct `fetch` calls and a cookie jar — **no browser is
+is over HTTPS via direct `fetch` calls and a cookie jar - **no browser is
 required**, so it runs headless on any machine (Windows, macOS, Linux, WSL).
 
 - A background **daemon** is the only thing that talks to Sana. It downloads
@@ -102,7 +102,7 @@ Keyword search is always available: a line-level SQLite **FTS5** index with
 **BM25** ranking, whole-word matching, and phrase/date/sort options.
 
 **Semantic search is optional** because it loads an embedding model (RAM/CPU
-cost). Enable it and `search` becomes **hybrid** — keyword + semantic results
+cost). Enable it and `search` becomes **hybrid** - keyword + semantic results
 fused by Reciprocal Rank Fusion:
 
 ```bash
@@ -135,10 +135,10 @@ Environment variables (all optional):
 
 Everything is stored locally under `data/` (gitignored):
 
-- `session.json` — your login cookies + workspace id. **Sensitive; never commit.**
-- `sana.db` — SQLite: meetings, transcripts, metadata, the FTS index, vectors, and sync state.
-- `models/` — cached embedding model (only when semantic search is enabled).
-- `daemon.log` — background daemon log.
+- `session.json` - your login cookies + workspace id. **Sensitive; never commit.**
+- `sana.db` - SQLite: meetings, transcripts, metadata, the FTS index, vectors, and sync state.
+- `models/` - cached embedding model (only when semantic search is enabled).
+- `daemon.log` - background daemon log.
 
 No data leaves your machine except the authenticated requests to Sana itself.
 

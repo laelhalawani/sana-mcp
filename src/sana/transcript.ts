@@ -55,7 +55,7 @@ export function renderLines(
     .join("\n");
 }
 
-/** Flat transcript text (no line numbers) — used for storage and keyword prefilter. */
+/** Flat transcript text (no line numbers) - used for storage and keyword prefilter. */
 export function renderTranscript(
   segments: TranscriptSegment[],
   opts: { timestamps?: boolean } = {}

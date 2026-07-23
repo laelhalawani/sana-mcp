@@ -1,5 +1,5 @@
 // Proof of concept: use the session cookie from the persistent profile to call
-// Sana's tRPC API with plain fetch — NO browser performing the requests.
+// Sana's tRPC API with plain fetch - NO browser performing the requests.
 // Validates the fully-headless HTTP design end to end.
 
 import path from "node:path";
@@ -64,4 +64,4 @@ if (assets[0]) {
     console.log(`  preview: ${preview} ...`);
   }
 }
-console.log("\nOK — headless HTTP access works.");
+console.log("\nOK - headless HTTP access works.");
