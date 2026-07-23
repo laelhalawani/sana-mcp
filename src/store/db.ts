@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "node:path";
 import { DATA_DIR, ensureDataDir, MAX_TRANSCRIPT_ATTEMPTS } from "../config.js";
+import { transcriptLines } from "../sana/transcript.js";
 
 export interface MeetingListOpts {
   limit?: number;
@@ -112,6 +113,15 @@ export class SanaStore {
         attempts INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         last_attempt_ms INTEGER
+      );
+
+      -- Full-text index over transcript lines (one row per spoken turn) for
+      -- BM25-ranked keyword search. meeting_id/line_no are stored but not indexed.
+      CREATE VIRTUAL TABLE IF NOT EXISTS line_fts USING fts5(
+        text,
+        meeting_id UNINDEXED,
+        line_no UNINDEXED,
+        tokenize = 'unicode61 remove_diacritics 2'
       );
 
       CREATE TABLE IF NOT EXISTS sync_state (
@@ -285,16 +295,33 @@ export class SanaStore {
   // ---- transcripts -------------------------------------------------------
 
   saveTranscript(row: Omit<TranscriptRow, "fetched_ms">): void {
-    this.db
-      .prepare(
-        `INSERT INTO transcripts (meeting_id, text, json, word_count, segment_count, fetched_ms)
-         VALUES (@meeting_id, @text, @json, @word_count, @segment_count, @fetched_ms)
-         ON CONFLICT(meeting_id) DO UPDATE SET
-           text = excluded.text, json = excluded.json,
-           word_count = excluded.word_count, segment_count = excluded.segment_count,
-           fetched_ms = excluded.fetched_ms`
-      )
-      .run({ ...row, fetched_ms: Date.now() });
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO transcripts (meeting_id, text, json, word_count, segment_count, fetched_ms)
+           VALUES (@meeting_id, @text, @json, @word_count, @segment_count, @fetched_ms)
+           ON CONFLICT(meeting_id) DO UPDATE SET
+             text = excluded.text, json = excluded.json,
+             word_count = excluded.word_count, segment_count = excluded.segment_count,
+             fetched_ms = excluded.fetched_ms`
+        )
+        .run({ ...row, fetched_ms: Date.now() });
+      this.indexLines(row.meeting_id, row.json);
+    });
+    tx();
+  }
+
+  /** (Re)index one meeting's transcript lines into the FTS table. */
+  private indexLines(meetingId: string, json: string): void {
+    this.db.prepare(`DELETE FROM line_fts WHERE meeting_id = ?`).run(meetingId);
+    let lines: { n: number; text: string }[] = [];
+    try {
+      lines = transcriptLines(JSON.parse(json));
+    } catch {
+      return;
+    }
+    const ins = this.db.prepare(`INSERT INTO line_fts (text, meeting_id, line_no) VALUES (?, ?, ?)`);
+    for (const l of lines) ins.run(l.text, meetingId, l.n);
   }
 
   getTranscript(meetingId: string): TranscriptRow | undefined {
@@ -375,28 +402,94 @@ export class SanaStore {
     this.db.prepare(`DELETE FROM fetch_failures`).run();
   }
 
+  private searchIndexReady = false;
+
+  /** Backfill the FTS index from existing transcripts if it is empty. */
+  private ensureSearchIndex(): void {
+    if (this.searchIndexReady) return;
+    const n = (this.db.prepare(`SELECT COUNT(*) c FROM line_fts`).get() as { c: number }).c;
+    if (n === 0) {
+      const rows = this.db.prepare(`SELECT meeting_id, json FROM transcripts`).all() as {
+        meeting_id: string;
+        json: string;
+      }[];
+      const tx = this.db.transaction(() => {
+        for (const r of rows) this.indexLines(r.meeting_id, r.json);
+      });
+      tx();
+    }
+    this.searchIndexReady = true;
+  }
+
   /**
-   * Meetings whose transcript text contains the query (case-insensitive),
-   * newest first. Returns segment JSON so the caller can locate matching lines.
+   * BM25-ranked full-text search over transcript lines. `match` is an FTS5
+   * MATCH expression (built by the caller from sanitized terms).
    */
-  searchCandidates(
-    query: string,
-    limit = 50
-  ): { id: string; name: string; created_at_ms: number; json: string }[] {
-    const lim = Math.min(Math.max(limit, 1), 500);
+  private searchWhere(
+    match: string,
+    dateFrom?: number,
+    dateTo?: number
+  ): { where: string; params: Record<string, unknown> } {
+    const clauses = ["line_fts MATCH @match"];
+    const params: Record<string, unknown> = { match };
+    if (dateFrom != null) {
+      clauses.push("m.created_at_ms >= @dateFrom");
+      params.dateFrom = dateFrom;
+    }
+    if (dateTo != null) {
+      clauses.push("m.created_at_ms <= @dateTo");
+      params.dateTo = dateTo;
+    }
+    return { where: clauses.join(" AND "), params };
+  }
+
+  countLineMatches(match: string, opts: { dateFrom?: number; dateTo?: number } = {}): number {
+    this.ensureSearchIndex();
+    const { where, params } = this.searchWhere(match, opts.dateFrom, opts.dateTo);
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) c FROM line_fts f JOIN meetings m ON m.id = f.meeting_id WHERE ${where}`
+        )
+        .get(params) as { c: number }
+    ).c;
+  }
+
+  searchLines(
+    match: string,
+    opts: {
+      limit?: number;
+      offset?: number;
+      sort?: "best" | "newest" | "oldest";
+      dateFrom?: number;
+      dateTo?: number;
+    } = {}
+  ): { meeting_id: string; line_no: number; text: string; created_at_ms: number; name: string }[] {
+    this.ensureSearchIndex();
+    const lim = Math.min(Math.max(opts.limit ?? 10, 1), 100);
+    const off = Math.max(opts.offset ?? 0, 0);
+    const { where, params } = this.searchWhere(match, opts.dateFrom, opts.dateTo);
+    const order =
+      opts.sort === "newest"
+        ? "m.created_at_ms DESC"
+        : opts.sort === "oldest"
+          ? "m.created_at_ms ASC"
+          : "bm25(line_fts) ASC"; // best (most relevant) first
     return this.db
       .prepare(
-        `SELECT m.id, m.name, m.created_at_ms, t.json
-         FROM transcripts t JOIN meetings m ON m.id = t.meeting_id
-         WHERE t.text LIKE @like
-         ORDER BY m.created_at_ms DESC
-         LIMIT @lim`
+        `SELECT f.meeting_id AS meeting_id, CAST(f.line_no AS INTEGER) AS line_no, f.text AS text,
+                m.created_at_ms AS created_at_ms, m.name AS name
+         FROM line_fts f JOIN meetings m ON m.id = f.meeting_id
+         WHERE ${where}
+         ORDER BY ${order}
+         LIMIT @lim OFFSET @off`
       )
-      .all({ like: `%${query}%`, lim }) as {
-      id: string;
-      name: string;
+      .all({ ...params, lim, off }) as {
+      meeting_id: string;
+      line_no: number;
+      text: string;
       created_at_ms: number;
-      json: string;
+      name: string;
     }[];
   }
 

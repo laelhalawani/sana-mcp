@@ -404,63 +404,60 @@ function snippetAround(text: string, query: string, pad = 80): string {
 function handleSearch(store: SanaStore, args: Record<string, unknown>): string {
   const query = typeof args.query === "string" ? args.query.trim() : "";
   if (!query) {
-    return 'Provide a search query: meeting_transcripts("search", {"query":"..."}). Optional: limit (number, default 10).';
+    return 'Provide a search query: meeting_transcripts("search", {"query":"..."}). Optional: limit, sort, filter.';
   }
-  const q = query.toLowerCase();
+  // Tokenize into unicode word/number terms and AND them as quoted FTS terms.
+  // This keeps user input safe from FTS5 operator syntax and matches on word
+  // boundaries (all terms must appear in a line).
+  const terms = query.match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (terms.length === 0) return `No searchable words in "${query}".`;
+  const match = terms.map((t) => `"${t}"`).join(" ");
+
   const limit = Math.min(Math.max(Number(args.limit ?? 10), 1), 100);
+  const page = Math.max(1, Number(args.page ?? 1));
+  const offset = (page - 1) * limit;
   const sort = args.sort === "newest" || args.sort === "oldest" ? args.sort : "best";
   const { dateFrom, dateTo } = parseFilters(args);
-  const candidates = store.searchCandidates(query, 500);
 
-  const matches: {
-    meeting_id: string;
-    name: string;
-    ms: number;
-    n: number;
-    text: string;
-    score: number;
-  }[] = [];
-  for (const c of candidates) {
-    if (dateFrom != null && c.created_at_ms < dateFrom) continue;
-    if (dateTo != null && c.created_at_ms > dateTo) continue;
-    const lines = transcriptLines(JSON.parse(c.json));
-    for (const l of lines) {
-      const lower = l.text.toLowerCase();
-      if (lower.includes(q)) {
-        matches.push({
-          meeting_id: c.id,
-          name: c.name,
-          ms: c.created_at_ms,
-          n: l.n,
-          text: snippetAround(l.text, query),
-          score: lower.split(q).length - 1, // occurrences of the query in the line
-        });
-      }
-    }
+  let rows, total: number;
+  try {
+    total = store.countLineMatches(match, { dateFrom, dateTo });
+    rows = store.searchLines(match, { limit, offset, sort, dateFrom, dateTo });
+  } catch (e) {
+    return `Could not run search for "${query}": ${(e as Error).message}`;
+  }
+  if (rows.length === 0) {
+    if (total === 0) return `No transcript lines match "${query}".`;
+    return `No results on page ${page} (${total} match; ${Math.ceil(total / limit)} page(s)).`;
   }
 
-  if (matches.length === 0) return `No transcript lines mention "${query}".`;
+  const n = rows.length;
+  const ranked = sort === "best" ? "relevance" : sort;
+  const before =
+    n === total
+      ? `Showing ${n} matching lines for "${query}" (ranked by ${ranked}).`
+      : `Showing ${n} out of ${total} matching lines for "${query}" (ranked by ${ranked}).`;
 
-  matches.sort((a, b) =>
-    sort === "newest" ? b.ms - a.ms : sort === "oldest" ? a.ms - b.ms : b.score - a.score || b.ms - a.ms
-  );
-  matches.length = Math.min(matches.length, limit);
-
+  const anchor = terms[0] ?? query;
   const table = [
     `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | line (int) | title (string) | snippet (string) |`,
     `|---|---|---|---|---|`,
-    ...matches.map(
-      (m) =>
-        `| ${fmtDateTime(m.ms)} | ${m.meeting_id} | ${m.n} | ${escCell(m.name)} | ${escCell(m.text)} |`
+    ...rows.map(
+      (r) =>
+        `| ${fmtDateTime(r.created_at_ms)} | ${r.meeting_id} | ${r.line_no} | ${escCell(r.name)} | ${escCell(
+          snippetAround(r.text, anchor)
+        )} |`
     ),
   ];
-  return [
-    `Showing ${matches.length} matching lines for "${query}".`,
-    ``,
-    ...table,
-    ``,
-    `Read around a hit with meeting_transcripts("read", {"meeting_id":"<id>", "lines":[<line>-2, <line>+2]}).`,
-  ].join("\n");
+  const out = [before, ``, ...table];
+  if (offset + n < total) {
+    out.push(
+      ``,
+      `Use meeting_transcripts("search", {"query":"${query.replace(/"/g, '\\"')}", "page":${page + 1}}) to see the next page.`
+    );
+  }
+  out.push(``, `Read around a hit with meeting_transcripts("read", {"meeting_id":"<id>", "lines":[<line>-2, <line>+2]}).`);
+  return out.join("\n");
 }
 
 /**
