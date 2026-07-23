@@ -44,7 +44,7 @@ const context = await chromium.launchPersistentContext(PROFILE, {
 await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 
 // Capture ALL requests to auth/api routes at request-time (so magic-link and
-// callback navigations — which carry the token in the URL — are never missed).
+// callback navigations - which carry the token in the URL - are never missed).
 context.on("request", (req) => {
   try {
     const url = req.url();

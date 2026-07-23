@@ -1,5 +1,5 @@
 export interface MeetingSummary {
-  id: string; // assetId — used everywhere else
+  id: string; // assetId - used everywhere else
   externalId?: string | null;
   name: string;
   createdAtEpochMs: number;
