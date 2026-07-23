@@ -1,0 +1,13 @@
+process.env.SANA_DATA_DIR = process.env.TMP_DIR!;
+const { SanaStore } = await import("../src/store/db.js");
+const now = Date.now();
+const st = new SanaStore();
+const seg = JSON.stringify([{speaker:"X",words:[{text:"hi",start_timestamp:0,end_timestamp:1}]}]);
+const mk = (id:string,name:string,off:number,tx:boolean)=>{ st.upsertMeeting({id,name,source:"sana-ai:meeting",created_at_ms:now-off}); if(tx) st.saveTranscript({meeting_id:id,text:"hi",json:seg,word_count:1,segment_count:1}); };
+for (let i=0;i<7;i++) mk("id"+i, i===1?"Budget review, final round": i===3?"東京チーム定例ミーティング": i===5?"Pipe | test":"Meeting "+i, i*86400000, i!==2);
+st.updateSyncState({ phase:"synced", blocking:0, last_full_sync_ms:now, meetings_total:7, transcripts_total:7, transcripts_done:6, daemon_pid:1, daemon_heartbeat_ms:now });
+st.close();
+const { sana } = await import("../src/tools/dispatch.js");
+console.log("=== page 1 (limit 5) ===\n" + await sana("list",{limit:5,page:1}));
+console.log("\n=== page 2 (limit 5) ===\n" + await sana("list",{limit:5,page:2}));
+process.exit(0);
