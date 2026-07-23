@@ -7,11 +7,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { sana } from "./tools/dispatch.js";
 import { isCompiledBinary } from "./config.js";
+import pkg from "../package.json" with { type: "json" };
 
 export async function runMcp(): Promise<void> {
   const server = new McpServer({
     name: "sana-mcp",
-    version: "0.1.0",
+    version: pkg.version,
   });
 
   server.registerTool(

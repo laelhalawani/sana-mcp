@@ -1,12 +1,17 @@
 name: release
 
-# Builds self-contained sana-mcp binaries for all six targets and attaches them
-# to the GitHub release for the pushed tag. Cut a release with:
-#   git tag v0.1.0 && git push --tags
+# Build self-contained sana-mcp binaries and publish a release. The version
+# lives in package.json (single source of truth; cli.ts/mcp.ts read it).
+# Triggers:
+#   - push a v* tag   -> release that exact tag
+#   - push to main    -> release v<package.json version>, but only if that tag
+#                        doesn't exist yet (so bump "version", merge, get a release)
+#   - workflow_dispatch -> release a chosen tag
 # Tags containing "-" (e.g. v0.1.0-rc1) are published as prereleases.
 on:
   push:
     tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
@@ -18,7 +23,39 @@ permissions:
   contents: write
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      skip: ${{ steps.r.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: r
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            tag="v$(jq -r .version package.json)"
+            if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+              echo "$tag already released; skipping"
+              echo "tag=" >> "$GITHUB_OUTPUT"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Releasing new version $tag"
+              echo "tag=$tag" >> "$GITHUB_OUTPUT"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
   build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
@@ -47,7 +84,7 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
           files: sana-mcp-${{ matrix.target }}${{ matrix.ext }}
-          prerelease: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
+          prerelease: ${{ contains(needs.resolve.outputs.tag, '-') }}
           fail_on_unmatched_files: true
