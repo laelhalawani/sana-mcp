@@ -20,9 +20,11 @@ export function isCompiledBinary(): boolean {
     (Bun as { isStandaloneExecutable?: boolean }).isStandaloneExecutable === true
   )
     return true;
-  // Bun <= 1.3.x doesn't set isStandaloneExecutable; standalone executables run
-  // their bundled modules from a virtual /$bunfs root, which is a reliable signal.
-  return import.meta.url.includes("/$bunfs/");
+  // Bun <= 1.3.x doesn't set isStandaloneExecutable, and its standalone-EXE
+  // virtual filesystem path differs by OS (/$bunfs on unix, ~BUN on Windows),
+  // so import.meta.url heuristics aren't portable. Instead: a compiled binary's
+  // process.execPath is our app binary, not the bun/node interpreter.
+  return !/^(node|bun)(\.exe)?$/i.test(path.basename(process.execPath));
 }
 
 export const DATA_DIR = process.env.SANA_DATA_DIR
