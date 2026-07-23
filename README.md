@@ -52,9 +52,26 @@ npm install
 npm run build
 ```
 
+## Register with an AI client
+
+`node dist/cli.js install` detects the MCP-capable clients installed on your
+machine and registers sana-mcp with the ones you choose. Each client's config is
+written safely (your other servers are preserved):
+
+- Detects: Claude Desktop, Claude Code, Cursor, Codex, Gemini CLI, Windsurf,
+  Zed, Cline, Roo Code, Amazon Q, and Continue. Detected clients are
+  pre-selected; you can also add any other supported client.
+- Flags: `--dry-run` (show what would change), `--yes` (register with all
+  detected clients, no prompt), `--name <name>` (server name, default
+  `meeting-transcripts`).
+
+Most clients need a restart or a session reload to pick up the new server. To
+remove it later, run `node dist/cli.js uninstall` (same flags).
+
 ## Use as an MCP server
 
-Point your MCP client at the built server (use the absolute path to your clone):
+To add it by hand instead, point your MCP client at the built server (use the
+absolute path to your clone):
 
 ```json
 {
@@ -81,6 +98,8 @@ node dist/cli.js list --limit 20
 node dist/cli.js read --id <meeting-id>
 node dist/cli.js search --query pricing
 node dist/cli.js daemon          # run the sync daemon in the foreground
+node dist/cli.js install         # register sana-mcp with your AI clients
+node dist/cli.js uninstall       # remove sana-mcp from your AI clients
 ```
 
 During development you can swap `node dist/cli.js` for `npm run cli --`.
