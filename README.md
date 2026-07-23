@@ -2,9 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/Lumen-AiApp/sana-ai-mcp?include_prereleases&label=release)](https://github.com/Lumen-AiApp/sana-ai-mcp/releases)
 [![license](https://img.shields.io/github/license/Lumen-AiApp/sana-ai-mcp)](#license)
-[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#quickstart)
-
-## Quickstart
+[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#what-it-does)
 
 macOS / Linux:
 
