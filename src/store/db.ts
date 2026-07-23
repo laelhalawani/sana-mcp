@@ -77,7 +77,7 @@ export class SanaStore {
 
   constructor(file: string = DB_FILE) {
     ensureDataDir();
-    this.db = new Database(file);
+    this.db = new Database(file, { strict: true });
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.migrate();
