@@ -47,6 +47,14 @@ program
   });
 
 program
+  .command("mcp")
+  .description("Run the MCP server on stdio")
+  .action(async () => {
+    const { runMcp } = await import("./mcp.js");
+    await runMcp();
+  });
+
+program
   .argument("[tool]", "tool name (help, login, status, list, read)", "help")
   .argument("[json]", "optional JSON args, e.g. '{\"limit\":10}'")
   .option("--email <email>")

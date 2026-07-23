@@ -1,14 +1,28 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 
 // Project root = one level up from this file's directory (src/ or dist/).
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const PROJECT_ROOT = path.resolve(here, "..");
 
+/**
+ * Whether we are running inside a `bun build --compile`-produced standalone
+ * binary. When true, the project's dist/ tree is bundled into the executable
+ * and no longer lives on disk, so callers must not reference source/dist paths
+ * and persistent data should live under the user's home directory.
+ */
+export function isCompiledBinary(): boolean {
+  // Bun's first-class flag for `bun build --compile` standalone executables.
+  // The cast: @types/bun@1.3.14 may not declare isStandaloneExecutable yet;
+  // Bun is always defined here since the app imports bun:sqlite.
+  return typeof Bun !== "undefined" && (Bun as { isStandaloneExecutable?: boolean }).isStandaloneExecutable === true;
+}
+
 export const DATA_DIR = process.env.SANA_DATA_DIR
   ? path.resolve(process.env.SANA_DATA_DIR)
-  : path.join(PROJECT_ROOT, "data");
+  : (isCompiledBinary() ? path.join(os.homedir(), ".sana-mcp") : path.join(PROJECT_ROOT, "data"));
 
 export const SESSION_FILE = path.join(DATA_DIR, "session.json");
 export const CONFIG_FILE = path.join(DATA_DIR, "config.json");

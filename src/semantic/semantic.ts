@@ -2,8 +2,9 @@
 // dependencies and are only loaded when semantic search is enabled AND used,
 // so a base install pays no RAM/CPU cost. Enable with SANA_SEMANTIC=1.
 import path from "node:path";
-import type Database from "better-sqlite3";
+import type { Database } from "bun:sqlite";
 import { DATA_DIR } from "../config.js";
+import type { Bindings } from "../store/db.js";
 
 export const EMBED_MODEL = process.env.SANA_EMBED_MODEL ?? "Xenova/all-MiniLM-L6-v2";
 export const EMBED_DIM = Number(process.env.SANA_EMBED_DIM ?? 384);
@@ -97,10 +98,10 @@ export async function embedQuery(text: string): Promise<Buffer> {
 
 // ---- sqlite-vec storage (lazy) -------------------------------------------
 
-const vecLoaded = new WeakSet<Database.Database>();
+const vecLoaded = new WeakSet<Database>();
 
 /** Load the sqlite-vec extension into a connection and ensure the table. */
-export async function ensureVec(db: Database.Database): Promise<void> {
+export async function ensureVec(db: Database): Promise<void> {
   if (vecLoaded.has(db)) return;
   let sqliteVec: typeof import("sqlite-vec");
   try {
@@ -121,7 +122,7 @@ export async function ensureVec(db: Database.Database): Promise<void> {
 
 /** Embed a meeting's lines (skipping trivially short ones) and store vectors. */
 export async function embedMeeting(
-  db: Database.Database,
+  db: Database,
   meetingId: string,
   createdAtMs: number,
   lines: { n: number; text: string }[]
@@ -149,13 +150,13 @@ export async function embedMeeting(
 
 /** KNN search over stored line vectors. */
 export async function searchKnn(
-  db: Database.Database,
+  db: Database,
   queryVec: Buffer,
   opts: { k: number; dateFrom?: number; dateTo?: number }
 ): Promise<{ meeting_id: string; line_no: number; distance: number }[]> {
   await ensureVec(db);
   const clauses = ["embedding MATCH @q"];
-  const params: Record<string, unknown> = { q: queryVec, k: BigInt(Math.max(1, opts.k)) };
+  const params: Bindings = { q: queryVec, k: BigInt(Math.max(1, opts.k)) };
   if (opts.dateFrom != null) {
     clauses.push("created_at >= @from");
     params.from = BigInt(opts.dateFrom);
