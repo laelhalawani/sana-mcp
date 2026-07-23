@@ -23,6 +23,30 @@ program
   });
 
 program
+  .command("install")
+  .description("Detect installed MCP clients and register sana-mcp with the ones you choose")
+  .option("--dry-run", "show what would change without writing anything")
+  .option("--yes", "register with all detected clients, no prompts")
+  .option("--name <name>", "server name written into client configs", "meeting-transcripts")
+  .action(async (opts: { dryRun?: boolean; yes?: boolean; name?: string }) => {
+    const { runInstall } = await import("./install/install.js");
+    await runInstall(opts);
+    process.exit(0);
+  });
+
+program
+  .command("uninstall")
+  .description("Remove sana-mcp from the MCP clients you choose")
+  .option("--dry-run", "show what would change without writing anything")
+  .option("--yes", "remove from all detected clients, no prompts")
+  .option("--name <name>", "server name to remove", "meeting-transcripts")
+  .action(async (opts: { dryRun?: boolean; yes?: boolean; name?: string }) => {
+    const { runUninstall } = await import("./install/install.js");
+    await runUninstall(opts);
+    process.exit(0);
+  });
+
+program
   .argument("[tool]", "tool name (help, login, status, list_meetings, read_transcript)", "help")
   .argument("[json]", "optional JSON args, e.g. '{\"limit\":10}'")
   .option("--email <email>")
