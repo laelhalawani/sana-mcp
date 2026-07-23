@@ -14,10 +14,15 @@ export const PROJECT_ROOT = path.resolve(here, "..");
  * and persistent data should live under the user's home directory.
  */
 export function isCompiledBinary(): boolean {
-  // Bun's first-class flag for `bun build --compile` standalone executables.
-  // The cast: @types/bun@1.3.14 may not declare isStandaloneExecutable yet;
-  // Bun is always defined here since the app imports bun:sqlite.
-  return typeof Bun !== "undefined" && (Bun as { isStandaloneExecutable?: boolean }).isStandaloneExecutable === true;
+  // Bun's first-class flag when available (newer Bun).
+  if (
+    typeof Bun !== "undefined" &&
+    (Bun as { isStandaloneExecutable?: boolean }).isStandaloneExecutable === true
+  )
+    return true;
+  // Bun <= 1.3.x doesn't set isStandaloneExecutable; standalone executables run
+  // their bundled modules from a virtual /$bunfs root, which is a reliable signal.
+  return import.meta.url.includes("/$bunfs/");
 }
 
 export const DATA_DIR = process.env.SANA_DATA_DIR
