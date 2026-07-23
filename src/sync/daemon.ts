@@ -1,8 +1,15 @@
 import { SanaStore } from "../store/db.js";
 import { SanaClient } from "../sana/client.js";
 import { SessionExpiredError } from "../sana/types.js";
-import { renderTranscript, countWords } from "../sana/transcript.js";
+import { renderTranscript, countWords, transcriptLines } from "../sana/transcript.js";
 import { isDaemonAlive } from "./lock.js";
+import {
+  semanticEnabled,
+  embedMeeting,
+  EMBED_DIM,
+  EMBED_MODEL,
+  SemanticUnavailableError,
+} from "../semantic/semantic.js";
 
 const INCREMENTAL_INTERVAL_MS = Number(process.env.SANA_SYNC_INTERVAL_MS ?? 10 * 60_000);
 const HEARTBEAT_MS = 5_000;
@@ -126,8 +133,44 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
     await sleep(REQUEST_DELAY_MS);
   }
 
+  // --- semantic embeddings (required for hybrid search when enabled) ---
+  if (semanticEnabled()) {
+    const needEmbed = store.meetingsMissingEmbedding();
+    if (needEmbed.length) {
+      store.updateSyncState({
+        phase: "downloading",
+        message: `Embedding meetings: 0/${needEmbed.length}...`,
+      });
+    }
+    let emb = 0;
+    for (const id of needEmbed) {
+      try {
+        const t = store.getTranscript(id);
+        if (!t) continue;
+        const meeting = store.getMeeting(id);
+        const lines = transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text }));
+        await embedMeeting(store.db, id, meeting?.created_at_ms ?? Date.now(), lines);
+        store.markEmbedded(id, EMBED_DIM, EMBED_MODEL);
+        store.clearFailure(id);
+        emb++;
+      } catch (e) {
+        if (e instanceof SemanticUnavailableError) {
+          store.updateSyncState({ phase: "error", error: e.message });
+          throw e; // semantic is enabled but cannot run; surface and stop
+        }
+        store.recordFailure(id, (e as Error).message);
+      }
+      if (emb % 3 === 0 || emb === needEmbed.length) {
+        store.updateSyncState({ message: `Embedding meetings: ${emb}/${needEmbed.length}...` });
+        heartbeat(store);
+      }
+    }
+  }
+
   const now = Date.now();
-  const caughtUp = store.meetingsIncomplete().length === 0;
+  const caughtUp =
+    store.meetingsIncomplete().length === 0 &&
+    (!semanticEnabled() || store.meetingsMissingEmbedding().length === 0);
   store.updateSyncState({
     phase: "synced",
     message: `Up to date - ${total} meetings, ${store.countComplete()} complete.`,

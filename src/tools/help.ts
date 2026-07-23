@@ -41,7 +41,7 @@ export const TOOLS: ToolDoc[] = [
   {
     name: "search",
     summary:
-      "Full-text search across transcripts, BM25-ranked. Matches whole words (all query words must appear in a line). Returns matching lines with meeting id and line number, so you can read that line or the lines around it.",
+      "Search transcripts and get matching lines with meeting id and line number. Keyword (BM25, whole-word) by default; becomes hybrid keyword+semantic when semantic search is enabled (SANA_SEMANTIC=1).",
     args:
       'query: string (required); page: number (default 1); limit: number (page size, default 10); sort: "best" (default, relevance) or "newest" or "oldest"; filter: {date: {from, to}} where from/to are ISO dates ("YYYY-MM-DD") or epoch ms',
     example: 'meeting_transcripts("search", {"query":"pricing", "sort":"newest"})',

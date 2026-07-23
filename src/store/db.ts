@@ -115,6 +115,15 @@ export class SanaStore {
         last_attempt_ms INTEGER
       );
 
+      -- Marks meetings whose transcript lines have been embedded for semantic
+      -- search (the vectors live in a sqlite-vec table created lazily elsewhere).
+      CREATE TABLE IF NOT EXISTS line_embeddings (
+        meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
+        dim INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        done_ms INTEGER NOT NULL
+      );
+
       -- Full-text index over transcript lines (one row per spoken turn) for
       -- BM25-ranked keyword search. meeting_id/line_no are stored but not indexed.
       CREATE VIRTUAL TABLE IF NOT EXISTS line_fts USING fts5(
@@ -307,8 +316,39 @@ export class SanaStore {
         )
         .run({ ...row, fetched_ms: Date.now() });
       this.indexLines(row.meeting_id, row.json);
+      // Transcript changed -> its embeddings are stale; force a re-embed.
+      this.db.prepare(`DELETE FROM line_embeddings WHERE meeting_id = ?`).run(row.meeting_id);
     });
     tx();
+  }
+
+  /** Meetings that have a transcript but have not been embedded yet. */
+  meetingsMissingEmbedding(): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT t.meeting_id AS id FROM transcripts t
+           LEFT JOIN line_embeddings e ON e.meeting_id = t.meeting_id
+           JOIN meetings m ON m.id = t.meeting_id
+           WHERE e.meeting_id IS NULL
+           ORDER BY m.created_at_ms DESC`
+        )
+        .all() as { id: string }[]
+    ).map((r) => r.id);
+  }
+
+  markEmbedded(meetingId: string, dim: number, model: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO line_embeddings (meeting_id, dim, model, done_ms)
+         VALUES (@id, @dim, @model, @ts)
+         ON CONFLICT(meeting_id) DO UPDATE SET dim=@dim, model=@model, done_ms=@ts`
+      )
+      .run({ id: meetingId, dim, model, ts: Date.now() });
+  }
+
+  countEmbedded(): number {
+    return (this.db.prepare(`SELECT COUNT(*) n FROM line_embeddings`).get() as { n: number }).n;
   }
 
   /** (Re)index one meeting's transcript lines into the FTS table. */
