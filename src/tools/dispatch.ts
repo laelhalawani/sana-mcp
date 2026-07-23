@@ -1,4 +1,5 @@
 import { SanaClient } from "../sana/client.js";
+import { SessionExpiredError } from "../sana/types.js";
 import { SanaStore, type SyncState, type MeetingListOpts } from "../store/db.js";
 import { ensureDaemonRunning } from "../sync/spawn.js";
 import { transcriptLines, renderLines } from "../sana/transcript.js";
@@ -75,7 +76,7 @@ function syncBlockedMessage(s: SyncState): string {
       : "building the meeting list";
   return (
     `Sync in progress (${detail}). ` +
-    `list, read and search are unavailable until it completes. ` +
+    `Meeting tools are unavailable until it completes. ` +
     `Check progress with meeting_transcripts("status").`
   );
 }
@@ -128,7 +129,7 @@ async function handleLogin(args: Record<string, unknown>): Promise<string> {
         `Use meeting_transcripts("help", {"tool":"<name>"}) for details.`,
       ];
       const blockedLine =
-        `list, read and search are unavailable until it completes. Check progress with meeting_transcripts("status").`;
+        `Meeting tools are unavailable until it completes. Check progress with meeting_transcripts("status").`;
 
       const res = await waitForSync(store, COUNT_WAIT_MS);
       if (res.done) {
@@ -163,7 +164,7 @@ function handleStatus(store: SanaStore): string {
           )} min remaining).`
         : `Sync in progress: building the meeting list.`
     );
-    lines.push("list, read and search are unavailable until it completes.");
+    lines.push("Meeting tools are unavailable until it completes.");
   } else {
     lines.push(
       `Up to date. ${store.countMeetings()} meetings, ${store.countTranscripts()} transcripts stored.`
@@ -212,8 +213,9 @@ function parseFilters(args: Record<string, unknown>): {
   };
 }
 
-function rowStatus(r: { has_transcript: number; attempts: number }): string {
+function rowStatus(r: { has_transcript: number; attempts: number; processing_phase: string | null }): string {
   if (r.has_transcript) return "ready";
+  if (r.processing_phase && r.processing_phase !== "done") return "processing";
   return r.attempts >= MAX_TRANSCRIPT_ATTEMPTS ? "failed" : "downloading";
 }
 
@@ -240,7 +242,7 @@ function handleListMeetings(store: SanaStore, args: Record<string, unknown>): st
       : `Showing ${n} out of ${total} meeting transcripts.`;
 
   const table = [
-    `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | status (ready/downloading/failed) | title (string) |`,
+    `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | status (ready/downloading/processing/failed) | title (string) |`,
     `|---|---|---|---|`,
     ...rows.map(
       (r) => `| ${fmtDateTime(r.created_at_ms)} | ${r.id} | ${rowStatus(r)} | ${escCell(r.name)} |`
@@ -251,6 +253,10 @@ function handleListMeetings(store: SanaStore, args: Record<string, unknown>): st
   if (offset + n < total) {
     out.push("", `Use meeting_transcripts("list", {"page":${page + 1}}) to see the next page.`);
   }
+  out.push(
+    "",
+    `Per meeting (by id): read (transcript), summary, participants, recording.`
+  );
   return out.join("\n");
 }
 
@@ -281,35 +287,7 @@ function handleReadTranscript(store: SanaStore, args: Record<string, unknown>): 
   const title = meeting?.name ?? id;
   const dateStr = meeting ? fmtDate(meeting.created_at_ms) : "";
 
-  const headerLines = [`# ${title}`, `${dateStr} | ${lines.length} lines | ${t.word_count} words`];
-  const meta = store.getMetadata(id);
-  if (meta) {
-    if (meta.participants_json) {
-      try {
-        const ps = JSON.parse(meta.participants_json) as {
-          displayName?: string;
-          email?: string;
-          isHost?: boolean;
-        }[];
-        if (ps.length) {
-          headerLines.push(
-            "Participants: " +
-              ps
-                .map((p) => {
-                  const name = p.displayName || p.email || "unknown";
-                  const email = p.displayName && p.email ? ` <${p.email}>` : "";
-                  return `${name}${email}${p.isHost ? " (host)" : ""}`;
-                })
-                .join(", ")
-          );
-        }
-      } catch {
-        // ignore malformed metadata
-      }
-    }
-    if (meta.summary_short) headerLines.push(`Summary: ${meta.summary_short}`);
-  }
-  const header = headerLines.join("\n");
+  const header = `# ${title}\n${dateStr} | ${lines.length} lines | ${t.word_count} words`;
 
   const full = args.full === true;
   const range = Array.isArray(args.lines) ? (args.lines as unknown[]).map(Number).filter((n) => Number.isFinite(n)) : null;
@@ -341,6 +319,77 @@ function handleReadTranscript(store: SanaStore, args: Record<string, unknown>): 
     timestamps: withTs,
     numbers: true,
   })}`;
+}
+
+function argMeetingId(args: Record<string, unknown>): string {
+  return typeof args.meeting_id === "string" ? args.meeting_id : typeof args.id === "string" ? args.id : "";
+}
+
+function handleSummary(store: SanaStore, args: Record<string, unknown>): string {
+  const id = argMeetingId(args);
+  if (!id) return 'Provide a meeting id: meeting_transcripts("summary", {"meeting_id":"..."}).';
+  const meeting = store.getMeeting(id);
+  const meta = store.getMetadata(id);
+  if (!meeting && !meta) return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
+  if (!meta) return `No summary available yet for "${meeting?.name ?? id}".`;
+
+  const out: string[] = [`# ${meeting?.name ?? id}`, meeting ? fmtDate(meeting.created_at_ms) : ""];
+  if (meta.summary_short) out.push("", `Short summary: ${meta.summary_short}`);
+  if (meta.summary) out.push("", "Summary:", meta.summary);
+  if (meta.notes_json) {
+    try {
+      const parsed = JSON.parse(meta.notes_json) as {
+        notes?: { topic?: string; notes?: string[] }[] | null;
+        actionItems?: { assignedTo?: string | null; action?: string; dueDate?: string | null }[] | null;
+      };
+      const ai = Array.isArray(parsed.actionItems) ? parsed.actionItems : [];
+      if (ai.length) {
+        out.push("", "Action items:");
+        for (const a of ai) {
+          const tags = [a.assignedTo ? `assignee: ${a.assignedTo}` : "", a.dueDate ? `due: ${a.dueDate}` : ""]
+            .filter(Boolean)
+            .join("; ");
+          out.push(`- ${a.action ?? ""}${tags ? ` (${tags})` : ""}`);
+        }
+      }
+      const notes = Array.isArray(parsed.notes) ? parsed.notes : [];
+      if (notes.length) {
+        out.push("", "Notes:");
+        for (const nt of notes) {
+          out.push(`- ${nt.topic ?? "Topic"}: ${Array.isArray(nt.notes) ? nt.notes.join(" ") : ""}`);
+        }
+      }
+    } catch {
+      // ignore malformed metadata
+    }
+  }
+  if (out.filter((l) => l).length <= 2) return `No summary available for "${meeting?.name ?? id}".`;
+  return out.join("\n");
+}
+
+function handleParticipants(store: SanaStore, args: Record<string, unknown>): string {
+  const id = argMeetingId(args);
+  if (!id) return 'Provide a meeting id: meeting_transcripts("participants", {"meeting_id":"..."}).';
+  const meeting = store.getMeeting(id);
+  const meta = store.getMetadata(id);
+  if (!meeting && !meta) return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
+  let ps: { displayName?: string; email?: string; isHost?: boolean }[] = [];
+  try {
+    ps = meta?.participants_json ? JSON.parse(meta.participants_json) : [];
+  } catch {
+    ps = [];
+  }
+  if (!ps.length) return `No participant information for "${meeting?.name ?? id}".`;
+  const table = [
+    `Participants for "${meeting?.name ?? id}" (${ps.length}):`,
+    "",
+    `| name (string) | email (string) | host (yes/no) |`,
+    `|---|---|---|`,
+    ...ps.map(
+      (p) => `| ${escCell(p.displayName || "")} | ${escCell(p.email || "")} | ${p.isHost ? "yes" : "no"} |`
+    ),
+  ];
+  return table.join("\n");
 }
 
 function snippetAround(text: string, query: string, pad = 80): string {
@@ -415,8 +464,32 @@ function handleSearch(store: SanaStore, args: Record<string, unknown>): string {
 }
 
 /**
- * Single entry point: sana(tool, args). Non-blocking - reads the local store
- * and only touches the network for login. Kicks the background daemon awake.
+ * Fetch a fresh, temporary recording link on demand. This is the only data
+ * tool that hits the network (recording URLs are signed and expire), keeping
+ * read/list/search fully local.
+ */
+async function handleRecording(
+  client: SanaClient,
+  store: SanaStore,
+  args: Record<string, unknown>
+): Promise<string> {
+  const id = typeof args.meeting_id === "string" ? args.meeting_id : typeof args.id === "string" ? args.id : "";
+  if (!id) return 'Provide a meeting id: meeting_transcripts("recording", {"meeting_id":"..."}).';
+  const name = store.getMeeting(id)?.name ?? id;
+  try {
+    const info = await client.getMeetingById(id);
+    const url = info?.recordingUrl || info?.fallbackRecordingUrl;
+    if (!url) return `No recording available for "${name}".`;
+    return `Recording for "${name}" (temporary signed URL, expires in a few hours):\n${url}`;
+  } catch (e) {
+    if (e instanceof SessionExpiredError) return EXPIRED_MSG;
+    return `Could not fetch the recording link: ${(e as Error).message}`;
+  }
+}
+
+/**
+ * Single entry point: sana(tool, args). Reads are served from the local store;
+ * only login and the recording tool touch the network. Kicks the daemon awake.
  */
 export async function sana(tool: string, args: Record<string, unknown> = {}): Promise<string> {
   const name = (tool || "help").trim().toLowerCase();
@@ -464,6 +537,12 @@ export async function sana(tool: string, args: Record<string, unknown> = {}): Pr
         return blocked ?? handleReadTranscript(store, args);
       case "search":
         return blocked ?? handleSearch(store, args);
+      case "summary":
+        return blocked ?? handleSummary(store, args);
+      case "participants":
+        return blocked ?? handleParticipants(store, args);
+      case "recording":
+        return blocked ?? (await handleRecording(client, store, args));
       default:
         return `Unknown tool "${tool}". ${renderHelp()}`;
     }

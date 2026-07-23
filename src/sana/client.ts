@@ -251,6 +251,8 @@ export class SanaClient {
     summaryShort?: string | null;
     notes?: unknown;
     actionItems?: unknown;
+    recordingUrl?: string | null;
+    fallbackRecordingUrl?: string | null;
   } | null> {
     return this.trpcQuery("meeting.getById", { assetId });
   }

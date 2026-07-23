@@ -5,13 +5,14 @@ exposed as a single agent tool `meeting_transcripts(tool, args)` (MCP) and a CLI
 
 No official API is used — Sana's public API has no meeting/transcript endpoints.
 Instead this talks to the same backend the web app uses (tRPC at
-`sana.ai/x-api/trpc`) with your logged-in session. Everything is plain HTTP +
-a cookie jar; **no browser is required**, so it runs headless anywhere.
+`sana.ai/x-api/trpc`) with your logged-in session. All traffic is over HTTPS
+(TLS) using direct `fetch` requests plus a cookie jar — **no browser is
+required**, so it runs headless anywhere.
 Cross-platform: Windows, macOS, Linux/WSL (Node only).
 
 ## How it works
 
-- **Login** is a passwordless email code, done entirely over HTTP:
+- **Login** is a passwordless email code, done entirely over HTTPS:
   `csrf-token` → `user.sendSignInLink` (emails a 6-digit code) →
   `auth/magic-link?email&csrfToken&code` (sets the session cookie).
 - A **background sync daemon** is the only thing that talks to Sana. On first

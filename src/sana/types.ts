@@ -5,6 +5,7 @@ export interface MeetingSummary {
   createdAtEpochMs: number;
   modifiedAtEpochMs?: number | null;
   source: string; // "sana-ai:meeting"
+  processingPhase?: string | null; // "done" when Sana has finished processing
 }
 
 export interface TranscriptWord {

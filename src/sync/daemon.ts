@@ -55,6 +55,7 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
         source: a.source,
         created_at_ms: a.createdAtEpochMs,
         modified_at_ms: a.modifiedAtEpochMs ?? null,
+        processing_phase: a.processingPhase ?? null,
       });
       if (!existed) newOnThisPage++;
     }
@@ -105,6 +106,7 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
             ? JSON.stringify({ notes: meta.notes ?? null, actionItems: meta.actionItems ?? null })
             : null,
           participants_json: JSON.stringify(participants),
+          has_recording: meta?.recordingUrl || meta?.fallbackRecordingUrl ? 1 : 0,
         });
       }
       store.clearFailure(id);

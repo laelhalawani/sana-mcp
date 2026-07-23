@@ -16,7 +16,8 @@ server.registerTool(
   {
     title: "Meeting transcripts",
     description:
-      'Access the meeting transcripts: list, read and search through them. ' +
+      'Access your meetings: list and search them, read transcripts, and get ' +
+      'summaries, participants, and recording links. ' +
       'New meetings sync automatically shortly after they end. ' +
       'Call meeting_transcripts("help") for a summary of all tools and their usage. ' +
       'Powered by Sana.ai.',
@@ -24,7 +25,7 @@ server.registerTool(
       tool: z
         .string()
         .describe(
-          'The name of the meeting transcripts tool you want to use. One of: help, login, status, list, read.'
+          'The name of the meeting transcripts tool you want to use. One of: help, login, status, list, read, search, summary, participants, recording.'
         ),
       args: z
         .record(z.string(), z.any())
