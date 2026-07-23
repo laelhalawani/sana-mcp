@@ -1,7 +1,7 @@
 {
   "name": "sana-mcp",
   "version": "0.1.0",
-  "description": "Download your Sana.AI meeting transcripts via the web frontend (CLI + MCP server)",
+  "description": "Sync and read your Sana.AI meeting transcripts (CLI + MCP server)",
   "type": "module",
   "bin": {
     "sana": "./dist/cli.js"
@@ -10,9 +10,8 @@
     "build": "tsc -p tsconfig.json",
     "cli": "tsx src/cli.ts",
     "login": "tsx src/cli.ts login",
-    "inspect": "tsx src/cli.ts inspect",
-    "scan": "tsx src/cli.ts scan",
     "mcp": "tsx src/mcp.ts",
+    "daemon": "tsx src/daemon-main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -22,6 +21,10 @@
     "better-sqlite3": "^11.10.0",
     "commander": "^12.1.0",
     "playwright": "^1.48.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "sqlite-vec": "^0.1.9"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",

@@ -5,6 +5,12 @@ import { ensureDaemonRunning } from "../sync/spawn.js";
 import { transcriptLines, renderLines } from "../sana/transcript.js";
 import { renderHelp, toolListLine } from "./help.js";
 import { MAX_TRANSCRIPT_ATTEMPTS } from "../config.js";
+import {
+  semanticEnabled,
+  embedQuery,
+  searchKnn,
+  SemanticUnavailableError,
+} from "../semantic/semantic.js";
 
 const LOGIN_HINT = 'Run meeting_transcripts("login", {"email":"you@example.com"}) to sign in.';
 const EXPIRED_MSG = `Your login has expired. To login again run meeting_transcripts("login", {"email":"you@example.com"}).`;
@@ -172,6 +178,8 @@ function handleStatus(store: SanaStore): string {
     lines.push("New meetings sync automatically shortly after they end.");
   }
   if (s.last_full_sync_ms) lines.push(`Last sync: ${new Date(s.last_full_sync_ms).toISOString()}.`);
+  if (semanticEnabled())
+    lines.push(`Semantic search: on (${store.countEmbedded()}/${store.countTranscripts()} transcripts embedded).`);
   return lines.join("\n");
 }
 
@@ -401,48 +409,31 @@ function snippetAround(text: string, query: string, pad = 80): string {
   return `${start > 0 ? "..." : ""}${core}${end < text.length ? "..." : ""}`;
 }
 
-function handleSearch(store: SanaStore, args: Record<string, unknown>): string {
-  const query = typeof args.query === "string" ? args.query.trim() : "";
-  if (!query) {
-    return 'Provide a search query: meeting_transcripts("search", {"query":"..."}). Optional: limit, sort, filter.';
-  }
-  // Tokenize into unicode word/number terms and AND them as quoted FTS terms.
-  // This keeps user input safe from FTS5 operator syntax and matches on word
-  // boundaries (all terms must appear in a line).
-  const terms = query.match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (terms.length === 0) return `No searchable words in "${query}".`;
-  const match = terms.map((t) => `"${t}"`).join(" ");
+interface SearchRow {
+  meeting_id: string;
+  line_no: number;
+  text: string;
+  created_at_ms: number;
+  name: string;
+}
 
-  const limit = Math.min(Math.max(Number(args.limit ?? 10), 1), 100);
-  const page = Math.max(1, Number(args.page ?? 1));
-  const offset = (page - 1) * limit;
-  const sort = args.sort === "newest" || args.sort === "oldest" ? args.sort : "best";
-  const { dateFrom, dateTo } = parseFilters(args);
-
-  let rows, total: number;
-  try {
-    total = store.countLineMatches(match, { dateFrom, dateTo });
-    rows = store.searchLines(match, { limit, offset, sort, dateFrom, dateTo });
-  } catch (e) {
-    return `Could not run search for "${query}": ${(e as Error).message}`;
-  }
-  if (rows.length === 0) {
-    if (total === 0) return `No transcript lines match "${query}".`;
-    return `No results on page ${page} (${total} match; ${Math.ceil(total / limit)} page(s)).`;
-  }
-
-  const n = rows.length;
-  const ranked = sort === "best" ? "relevance" : sort;
+function renderSearchResults(
+  query: string,
+  anchor: string,
+  pageItems: SearchRow[],
+  total: number,
+  page: number,
+  offset: number,
+  label: string
+): string {
   const before =
-    n === total
-      ? `Showing ${n} matching lines for "${query}" (ranked by ${ranked}).`
-      : `Showing ${n} out of ${total} matching lines for "${query}" (ranked by ${ranked}).`;
-
-  const anchor = terms[0] ?? query;
+    pageItems.length === total
+      ? `Showing ${total} matching lines for "${query}" (${label}).`
+      : `Showing ${pageItems.length} out of ${total} matching lines for "${query}" (${label}).`;
   const table = [
     `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | line (int) | title (string) | snippet (string) |`,
     `|---|---|---|---|---|`,
-    ...rows.map(
+    ...pageItems.map(
       (r) =>
         `| ${fmtDateTime(r.created_at_ms)} | ${r.meeting_id} | ${r.line_no} | ${escCell(r.name)} | ${escCell(
           snippetAround(r.text, anchor)
@@ -450,7 +441,7 @@ function handleSearch(store: SanaStore, args: Record<string, unknown>): string {
     ),
   ];
   const out = [before, ``, ...table];
-  if (offset + n < total) {
+  if (offset + pageItems.length < total) {
     out.push(
       ``,
       `Use meeting_transcripts("search", {"query":"${query.replace(/"/g, '\\"')}", "page":${page + 1}}) to see the next page.`
@@ -458,6 +449,116 @@ function handleSearch(store: SanaStore, args: Record<string, unknown>): string {
   }
   out.push(``, `Read around a hit with meeting_transcripts("read", {"meeting_id":"<id>", "lines":[<line>-2, <line>+2]}).`);
   return out.join("\n");
+}
+
+async function handleSearch(store: SanaStore, args: Record<string, unknown>): Promise<string> {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (!query) {
+    return 'Provide a search query: meeting_transcripts("search", {"query":"..."}). Optional: page, limit, sort, filter.';
+  }
+  // Tokenize into unicode word terms, AND-ed as quoted FTS terms (safe from
+  // FTS5 operator syntax; matches whole words).
+  const terms = query.match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (terms.length === 0) return `No searchable words in "${query}".`;
+  const match = terms.map((t) => `"${t}"`).join(" ");
+  const anchor = terms[0] ?? query;
+
+  const limit = Math.min(Math.max(Number(args.limit ?? 10), 1), 100);
+  const page = Math.max(1, Number(args.page ?? 1));
+  const offset = (page - 1) * limit;
+  const sort = args.sort === "newest" || args.sort === "oldest" ? args.sort : "best";
+  const { dateFrom, dateTo } = parseFilters(args);
+
+  // --- keyword-only (BM25) when semantic search is disabled ---
+  if (!semanticEnabled()) {
+    let rows: SearchRow[], total: number;
+    try {
+      total = store.countLineMatches(match, { dateFrom, dateTo });
+      rows = store.searchLines(match, { limit, offset, sort, dateFrom, dateTo });
+    } catch (e) {
+      return `Could not run search for "${query}": ${(e as Error).message}`;
+    }
+    if (rows.length === 0) {
+      if (total === 0) return `No transcript lines match "${query}".`;
+      return `No results on page ${page} (${total} match; ${Math.ceil(total / limit)} page(s)).`;
+    }
+    const label = sort === "best" ? "keyword, ranked by relevance" : `keyword, ${sort}`;
+    return renderSearchResults(query, anchor, rows, total, page, offset, label);
+  }
+
+  // --- hybrid (BM25 + semantic vectors, fused via Reciprocal Rank Fusion) ---
+  const POOL = 60;
+  const RRF_K = 60;
+  let kw: SearchRow[];
+  try {
+    kw = store.searchLines(match, { limit: POOL, offset: 0, sort: "best", dateFrom, dateTo });
+  } catch (e) {
+    return `Could not run search for "${query}": ${(e as Error).message}`;
+  }
+
+  const meetingCache = new Map<string, ReturnType<typeof store.getMeeting>>();
+  const linesCache = new Map<string, { n: number; text: string }[]>();
+  const resolve = (mid: string, ln: number): SearchRow | null => {
+    let m = meetingCache.get(mid);
+    if (m === undefined) {
+      m = store.getMeeting(mid);
+      meetingCache.set(mid, m);
+    }
+    if (!m) return null;
+    let lines = linesCache.get(mid);
+    if (!lines) {
+      const t = store.getTranscript(mid);
+      try {
+        lines = t ? transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text })) : [];
+      } catch {
+        lines = [];
+      }
+      linesCache.set(mid, lines);
+    }
+    const line = lines.find((l) => l.n === ln);
+    return line
+      ? { meeting_id: mid, line_no: ln, text: line.text, created_at_ms: m.created_at_ms, name: m.name }
+      : null;
+  };
+
+  const fused = new Map<string, { row: SearchRow; score: number }>();
+  const add = (row: SearchRow, rank: number) => {
+    const key = `${row.meeting_id}:${row.line_no}`;
+    const inc = 1 / (RRF_K + rank);
+    const cur = fused.get(key);
+    if (cur) cur.score += inc;
+    else fused.set(key, { row, score: inc });
+  };
+  kw.forEach((r, i) => add(r, i));
+
+  try {
+    const qv = await embedQuery(query);
+    const knn = await searchKnn(store.db, qv, { k: POOL, dateFrom, dateTo });
+    knn.forEach((h, i) => {
+      const row = resolve(h.meeting_id, h.line_no);
+      if (row) add(row, i);
+    });
+  } catch (e) {
+    if (e instanceof SemanticUnavailableError) {
+      return `Semantic search is enabled but unavailable: ${e.message} Set SANA_SEMANTIC=0 to use keyword search.`;
+    }
+    // Any other embedding error: fall back to the keyword results already fused.
+  }
+
+  const items = [...fused.values()];
+  if (items.length === 0) return `No transcript lines match "${query}".`;
+  items.sort((a, b) =>
+    sort === "newest"
+      ? b.row.created_at_ms - a.row.created_at_ms
+      : sort === "oldest"
+        ? a.row.created_at_ms - b.row.created_at_ms
+        : b.score - a.score
+  );
+  const total = items.length;
+  const pageItems = items.slice(offset, offset + limit).map((x) => x.row);
+  if (pageItems.length === 0) return `No results on page ${page} (${total} match).`;
+  const label = sort === "best" ? "hybrid: keyword + semantic" : `hybrid, ${sort}`;
+  return renderSearchResults(query, anchor, pageItems, total, page, offset, label);
 }
 
 /**
@@ -533,7 +634,7 @@ export async function sana(tool: string, args: Record<string, unknown> = {}): Pr
       case "read":
         return blocked ?? handleReadTranscript(store, args);
       case "search":
-        return blocked ?? handleSearch(store, args);
+        return blocked ?? (await handleSearch(store, args));
       case "summary":
         return blocked ?? handleSummary(store, args);
       case "participants":

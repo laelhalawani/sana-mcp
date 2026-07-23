@@ -4,3 +4,6 @@ data/
 *.log
 .env
 .DS_Store
+
+# throwaway dev test scripts
+scripts/test-*.ts
