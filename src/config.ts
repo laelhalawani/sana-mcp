@@ -1,22 +1,37 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 
 // Project root = one level up from this file's directory (src/ or dist/).
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const PROJECT_ROOT = path.resolve(here, "..");
 
+/**
+ * Whether we are running inside a `bun build --compile`-produced standalone
+ * binary. When true, the project's dist/ tree is bundled into the executable
+ * and no longer lives on disk, so callers must not reference source/dist paths
+ * and persistent data should live under the user's home directory.
+ */
+export function isCompiledBinary(): boolean {
+  // Bun's first-class flag when available (newer Bun).
+  if (
+    typeof Bun !== "undefined" &&
+    (Bun as { isStandaloneExecutable?: boolean }).isStandaloneExecutable === true
+  )
+    return true;
+  // Bun <= 1.3.x doesn't set isStandaloneExecutable, and its standalone-EXE
+  // virtual filesystem path differs by OS (/$bunfs on unix, ~BUN on Windows),
+  // so import.meta.url heuristics aren't portable. Instead: a compiled binary's
+  // process.execPath is our app binary, not the bun/node interpreter.
+  return !/^(node|bun)(\.exe)?$/i.test(path.basename(process.execPath));
+}
+
 export const DATA_DIR = process.env.SANA_DATA_DIR
   ? path.resolve(process.env.SANA_DATA_DIR)
-  : path.join(PROJECT_ROOT, "data");
+  : (isCompiledBinary() ? path.join(os.homedir(), ".sana-mcp") : path.join(PROJECT_ROOT, "data"));
 
 export const SESSION_FILE = path.join(DATA_DIR, "session.json");
-// Persistent browser profile: stores cookies + localStorage + IndexedDB, so
-// login survives across runs and works regardless of Sana's auth mechanism.
-export const PROFILE_DIR = process.env.SANA_PROFILE_DIR
-  ? path.resolve(process.env.SANA_PROFILE_DIR)
-  : path.join(DATA_DIR, "profile");
-export const STATE_FILE = path.join(DATA_DIR, "state.json");
 export const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 export const TRANSCRIPTS_DIR = process.env.SANA_TRANSCRIPTS_DIR
   ? path.resolve(process.env.SANA_TRANSCRIPTS_DIR)

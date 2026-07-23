@@ -1,147 +1,259 @@
-# sana-ai-mcp
+# sana-mcp
 
-Sync and search your own [Sana.AI](https://sana.ai) meeting transcripts locally,
+Sync your own [Sana.AI](https://sana.ai) meeting transcripts to a local database,
 and expose them to AI agents through a single [MCP](https://modelcontextprotocol.io)
-tool - plus a matching CLI.
+tool - `meeting_transcripts` - plus a matching CLI.
+
+Everything runs on your machine. A background daemon is the only thing that talks
+to Sana; tools read from a local SQLite database and answer instantly.
 
 Maintained by [Lumen](https://lumen.com).
+
+[![release](https://img.shields.io/github/v/release/Lumen-AiApp/sana-ai-mcp?include_prereleases&label=release)](https://github.com/Lumen-AiApp/sana-ai-mcp/releases)
+[![license](https://img.shields.io/github/license/Lumen-AiApp/sana-ai-mcp)](#license)
+[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#quickstart)
 
 ---
 
 ## What it does
 
-Sana has no public API for meetings, so this talks to the same backend the Sana
-web app uses (tRPC at `sana.ai/x-api`) with your logged-in session. All traffic
-is over HTTPS via direct `fetch` calls and a cookie jar - **no browser is
-required**, so it runs headless on any machine (Windows, macOS, Linux, WSL).
+Sana has no public API for meetings. `sana-mcp` drives the same web backend the
+Sana app uses (tRPC at `sana.ai/x-api`) with your logged-in session, over HTTPS
+via direct `fetch` and a cookie jar. **No browser is required**, so it runs
+headless on macOS, Linux, Windows, and WSL.
 
-- A background **daemon** is the only thing that talks to Sana. It downloads
-  your meetings, transcripts, and metadata into a local SQLite database, then
-  quietly checks for new meetings and keeps up to date.
-- The **agent tools read only from that local database**, so they respond
-  instantly and never block on the network (the sole exception is
-  `recording`, which fetches a short-lived link on demand).
-- Everything stays on your machine.
+- A background **daemon** downloads your meetings, transcripts, and metadata into
+  a local SQLite database, then checks periodically for new meetings.
+- The **agent tools read only from that database**, so they respond instantly and
+  never block on the network. The sole exception is `recording`, which fetches a
+  short-lived link on demand.
+- Everything - session, database, models, logs - stays on your machine.
 
-## Tools
+## Quickstart
 
-The agent calls one tool, `meeting_transcripts`, with a `tool` name and `args`:
+`sana-mcp` ships as a single self-contained binary. Install it with a one-liner:
 
-| tool | args | returns |
-|------|------|---------|
-| `help` | `{tool?}` | list all tools, or the argument schema for one |
-| `login` | `{email}` then `{email, confirmation_code}` | sign in (passwordless email code) |
-| `status` | (none) | sync progress and coverage |
-| `list` | `{page?, limit?, query?, sort?, filter?}` | meetings as a table: id, timestamp, title, status |
-| `read` | `{meeting_id, full?, lines?, timestamps?}` | transcript lines (all, or a `[start,end]` range) |
-| `search` | `{query, page?, limit?, sort?, filter?}` | matching transcript lines with meeting id + line number |
-| `summary` | `{meeting_id}` | summary, notes by topic, and action items |
-| `participants` | `{meeting_id}` | attendees (name, email, host) |
-| `recording` | `{meeting_id}` | a temporary link to the recording (fetched live) |
-
-Discovery is built in: `help` lists everything, `help {tool}` gives a tool's
-exact arguments and an example. `list` and `search` support pagination
-(`page`), sorting (`sort`), and filtering (`filter` by date range and status).
-
-## Install
+**macOS / Linux**
 
 ```bash
-git clone https://github.com/Lumen-AiApp/sana-ai-mcp.git
-cd sana-ai-mcp
-npm install
-npm run build
+curl -fsSL https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.sh | sh
 ```
 
-## Use as an MCP server
+**Windows (PowerShell)**
 
-Point your MCP client at the built server (use the absolute path to your clone):
+```powershell
+irm https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
+```
+
+**Manual** - download the asset for your platform from the
+[Releases page](https://github.com/Lumen-AiApp/sana-ai-mcp/releases)
+(`sana-mcp-{linux,darwin,windows}-{x64,arm64}`) and put it on your `PATH`.
+
+Then register with your AI client and sign in:
+
+```bash
+sana-mcp install                         # detect AI clients, register sana-mcp
+sana-mcp login --email you@example.com   # sends a 6-digit code to your email
+sana-mcp login --email you@example.com --code 123456   # verify it
+```
+
+After the first login, a catch-up sync runs and the daemon starts keeping things
+current. Run `sana-mcp status` to watch progress. That's it - ask your agent to
+search, read, or summarize your meetings.
+
+## Features
+
+- **One tool for agents** - `meeting_transcripts` - with built-in discovery:
+  `help` lists everything, `help {tool}` shows exact arguments and an example.
+- **List, read, search** transcripts, plus **summaries**, **participants**, and
+  on-demand **recording** links.
+- **Keyword search always available** - line-level SQLite FTS5 with BM25 ranking,
+  whole-word matching, phrase, date-range, and sort options.
+- **Optional semantic / hybrid search** - keyword + vector results fused by
+  Reciprocal Rank Fusion (RRF). Off by default; no cost until you enable it.
+- **Automatic sync** - the daemon polls for new meetings and pulls them in the
+  background; failed downloads are retried then marked, never blocking the rest.
+- **Works with your client** - auto-registers with Claude Desktop, Claude Code,
+  Cursor, Codex, Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q, Continue.
+- **Local-first & private** - no data leaves your machine except authenticated
+  requests to Sana.
+
+## Agent tools
+
+Agents call one tool, `meeting_transcripts`, with a `tool` name and an optional
+`args` object:
+
+```text
+meeting_transcripts("<tool>", { ...args })
+```
+
+| tool          | args                                                       | returns                                                                 |
+|---------------|------------------------------------------------------------|-------------------------------------------------------------------------|
+| `help`        | `{tool?}`                                                  | all tools, or the argument schema for one                               |
+| `login`       | `{email}`, then `{email, confirmation_code}`               | passwordless sign-in via email code                                     |
+| `status`      | (none)                                                     | sync progress and coverage                                              |
+| `list`        | `{page?, limit?, query?, sort?, filter?}`                  | meetings: id, timestamp, title, status                                  |
+| `read`        | `{meeting_id, full?, lines?, timestamps?}`                 | transcript lines (all, or a `[start,end]` range)                        |
+| `search`      | `{query, page?, limit?, sort?, filter?}`                   | matching lines with meeting id + line number                            |
+| `summary`     | `{meeting_id}`                                             | summary, notes by topic, and action items                               |
+| `participants`| `{meeting_id}`                                             | attendees (name, email, host)                                           |
+| `recording`   | `{meeting_id}`                                             | a temporary recording link, fetched live                                |
+
+Notes:
+
+- `list.sort` is `"newest"` (default) or `"oldest"`; `list.filter` is
+  `{status: "ready"|"downloading"|"failed", date: {from, to}}` with ISO dates
+  (`"YYYY-MM-DD"`) or epoch ms.
+- `read.lines` is a 1-based `[start, end]` range. With no selection it reports
+  the line count and your options; `full: true` returns everything.
+- `search.sort` is `"best"` (relevance, default), `"newest"`, or `"oldest"`.
+- `recording` is the only tool that hits the network; the returned URL expires
+  after a few hours.
+
+Example:
+
+```text
+meeting_transcripts("search", {"query": "pricing", "sort": "newest"})
+meeting_transcripts("read",   {"meeting_id": "v72HzzJDZx9WqTmF", "lines": [22, 26]})
+```
+
+## Use from the CLI
+
+The same tools work on the command line. Run `sana-mcp help` to see everything.
+
+```bash
+sana-mcp login --email you@example.com
+sana-mcp login --email you@example.com --code 123456
+sana-mcp status
+sana-mcp list --limit 20
+sana-mcp read --id <meeting-id>
+sana-mcp search --query pricing
+```
+
+Subcommands:
+
+| command                       | purpose                                                  |
+|-------------------------------|----------------------------------------------------------|
+| `sana-mcp <tool> [json]`      | run a tool, e.g. `sana-mcp list '{"limit":10}'`          |
+| `sana-mcp daemon`             | run the background sync daemon in the foreground         |
+| `sana-mcp install`            | detect MCP clients and register sana-mcp with your picks |
+| `sana-mcp uninstall`          | remove sana-mcp from the clients you choose              |
+| `sana-mcp mcp`                | run the MCP server on stdio (used by clients internally) |
+
+## Register with an AI client
+
+`sana-mcp install` detects the MCP-capable clients on your machine and registers
+`sana-mcp` with the ones you choose. Each client's config is written safely -
+your existing servers are preserved - and the operation is idempotent.
+
+- **Detects:** Claude Desktop, Claude Code, Cursor, Codex, Gemini CLI, Windsurf,
+  Zed, Cline, Roo Code, Amazon Q, and Continue. Detected clients are
+  pre-selected; you can add any other supported client too.
+- **Flags:** `--dry-run` (show what would change), `--yes` (register with all
+  detected clients, no prompt), `--name <name>` (server name; default `sana-mcp`).
+- After registering, most clients need a restart or a session reload to pick up
+  the new server. Remove it later with `sana-mcp uninstall` (same flags).
+
+**Add it by hand instead:** point your client at the installed binary with the
+`mcp` subcommand (use the absolute path):
 
 ```json
 {
   "mcpServers": {
-    "meeting-transcripts": {
-      "command": "node",
-      "args": ["/absolute/path/to/sana-ai-mcp/dist/mcp.js"]
+    "sana-mcp": {
+      "command": "/absolute/path/to/sana-mcp",
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-The agent then calls `meeting_transcripts` with `{ "tool": "…", "args": {…} }`.
-It signs in with `login` (an email code), and the background sync daemon starts
-automatically on first use.
-
-## Use from the CLI
-
-```bash
-node dist/cli.js login --email you@example.com
-node dist/cli.js login --email you@example.com --code 123456
-node dist/cli.js status
-node dist/cli.js list --limit 20
-node dist/cli.js read --id <meeting-id>
-node dist/cli.js search --query pricing
-node dist/cli.js daemon          # run the sync daemon in the foreground
-```
-
-During development you can swap `node dist/cli.js` for `npm run cli --`.
+The agent-facing server name is `sana-mcp`; the tool it exposes is
+`meeting_transcripts`. The daemon starts automatically on first use after login.
 
 ## How sync works
 
-- **On every login** a fresh catch-up sync runs and the meeting tools are held
-  until it finishes, so a returning user always gets current content. `status`
-  reports progress and an ETA; if there is little new, it completes in seconds.
-- **Between logins** the daemon checks periodically for new meetings and pulls
-  them in the background without interrupting anything; a meeting still
+- **On every login**, a fresh catch-up sync runs and the meeting tools are held
+  until it finishes, so a returning user always sees current content. `status`
+  reports progress and an ETA; if there is little new, it finishes in seconds.
+- **Between logins**, the daemon checks periodically for new meetings and pulls
+  them in the background without interrupting anything. A meeting still
   downloading shows as `downloading` in `list`.
 - Downloads that fail are retried and, after several attempts, marked `failed`
-  so they never block the rest.
+  so they never block the rest. A fresh login resets the counter and retries.
 
 ## Search
 
-Keyword search is always available: a line-level SQLite **FTS5** index with
-**BM25** ranking, whole-word matching, and phrase/date/sort options.
+**Keyword search is always available** - a line-level SQLite FTS5 index with BM25
+ranking, whole-word matching, and phrase / date-range / sort options.
 
-**Semantic search is optional** because it loads an embedding model (RAM/CPU
-cost). Enable it and `search` becomes **hybrid** - keyword + semantic results
-fused by Reciprocal Rank Fusion:
+**Semantic / hybrid search is optional**, because it loads an embedding model
+(RAM/CPU cost). Enable it with `SANA_SEMANTIC=1` and `search` becomes hybrid -
+keyword + semantic results fused by Reciprocal Rank Fusion:
 
 ```bash
-npm install                       # pulls the optional deps (transformers.js, sqlite-vec)
-SANA_SEMANTIC=1 node dist/cli.js daemon
+# From a source checkout (installs the optional deps transformers.js + sqlite-vec)
+npm install
+SANA_SEMANTIC=1 sana-mcp daemon
 # set SANA_SEMANTIC=1 for the MCP server process too
 ```
 
-The model (MiniLM-L6-v2, q8) is loaded lazily on demand and unloaded after
-~1 minute idle (~150 MB only while active), and its vectors are stored in the
-same SQLite database via `sqlite-vec`. When enabled, embeddings are built as
-part of the login catch-up (they're required for hybrid ranking).
+The model (`Xenova/all-MiniLM-L6-v2`, q8) is loaded lazily on demand and unloaded
+after roughly a minute of idle (about 150 MB only while active); vectors are
+stored in the same SQLite database via `sqlite-vec`. When enabled, embeddings are
+built as part of the login catch-up because they are required for hybrid ranking.
+
+> The embedding model and `sqlite-vec` are optional dependencies. They are
+> installed by `npm install` (source), but are **not bundled in the prebuilt
+> binary**. If the model cannot be loaded, `search` transparently falls back to
+> keyword (BM25) ranking - so enabling `SANA_SEMANTIC=1` is always safe.
 
 ## Configuration
 
-Environment variables (all optional):
+All environment variables are optional.
 
 | var | default | purpose |
 |-----|---------|---------|
-| `SANA_SEMANTIC` | off | `1` to enable semantic/hybrid search |
-| `SANA_SYNC_INTERVAL_MS` | `600000` | incremental check interval |
-| `SANA_REQUEST_DELAY_MS` | `150` | delay between transcript downloads |
-| `SANA_MAX_ATTEMPTS` | `5` | download retries before a meeting is `failed` |
-| `SANA_EMBED_MODEL` / `SANA_EMBED_DIM` | MiniLM / `384` | embedding model + dimension |
-| `SANA_EMBED_IDLE_MS` | `60000` | unload the model after this idle time |
-| `SANA_DATA_DIR` | `./data` | where local state is stored |
-| `SANA_BASE_URL` | `https://sana.ai` | Sana origin |
+| `SANA_SEMANTIC`            | off             | `1` to enable semantic / hybrid search                       |
+| `SANA_SYNC_INTERVAL_MS`    | `600000`        | how often the daemon checks for new meetings                  |
+| `SANA_REQUEST_DELAY_MS`    | `150`           | delay between transcript downloads                            |
+| `SANA_MAX_ATTEMPTS`        | `5`             | download retries before a meeting is marked `failed`          |
+| `SANA_EMBED_MODEL`         | `Xenova/all-MiniLM-L6-v2` | embedding model id                                 |
+| `SANA_EMBED_DIM`           | `384`           | embedding vector dimension                                    |
+| `SANA_EMBED_IDLE_MS`       | `60000`         | unload the embedding model after this idle time               |
+| `SANA_DATA_DIR`            | `~/.sana-mcp`*  | where local state is stored (* `./data` when run from source) |
+| `SANA_BASE_URL`            | `https://sana.ai` | Sana origin                                                 |
 
 ## Data & privacy
 
-Everything is stored locally under `data/` (gitignored):
+Everything is stored locally under the data directory (`~/.sana-mcp` for the
+binary, `./data` when running from source), and nothing there is committed:
 
-- `session.json` - your login cookies + workspace id. **Sensitive; never commit.**
-- `sana.db` - SQLite: meetings, transcripts, metadata, the FTS index, vectors, and sync state.
+- `session.json` - your login cookies and workspace id. **Sensitive; never commit.**
+- `sana.db` - SQLite: meetings, transcripts, metadata, the FTS index, vectors,
+  and sync state.
 - `models/` - cached embedding model (only when semantic search is enabled).
 - `daemon.log` - background daemon log.
 
 No data leaves your machine except the authenticated requests to Sana itself.
 
-## License & maintainer
+## Build from source
 
-Maintained by [Lumen](https://lumen.com). See [LICENSE](LICENSE).
+Requires [Bun](https://bun.sh) 1.3+.
+
+```bash
+git clone https://github.com/Lumen-AiApp/sana-ai-mcp.git
+cd sana-ai-mcp
+bun install
+bun run typecheck     # tsc --noEmit
+bun run compile       # -> dist/sana-mcp (current platform)
+```
+
+Run from source with `bun src/cli.ts ...` (e.g. `bun src/cli.ts install`). The
+prebuilt binaries in Releases are built this way for all six targets
+(linux/darwin/windows, x64/arm64).
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE). Maintained by [Lumen](https://lumen.com) -
+[github.com/Lumen-AiApp/sana-ai-mcp](https://github.com/Lumen-AiApp/sana-ai-mcp).
