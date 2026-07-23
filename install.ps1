@@ -3,7 +3,8 @@
 # Env overrides: $env:SANA_MCP_VERSION (default v0.1.0-rc1), $env:SANA_MCP_INSTALL_DIR.
 $ErrorActionPreference = "Stop"
 $Repo = "Lumen-AiApp/sana-ai-mcp"
-$Version = if ($env:SANA_MCP_VERSION) { $env:SANA_MCP_VERSION } else { "v0.1.0" }
+if ($env:SANA_MCP_VERSION) { $Version = $env:SANA_MCP_VERSION }
+else { $Version = (Invoke-RestMethod "https://api.github.com/repos/Lumen-AiApp/sana-ai-mcp/releases/latest").tag_name }
 
 switch ($env:PROCESSOR_ARCHITECTURE) {
   "AMD64" { $machine = "x64" }

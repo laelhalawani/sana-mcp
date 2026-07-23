@@ -5,7 +5,7 @@
 set -eu
 
 REPO="Lumen-AiApp/sana-ai-mcp"
-VERSION="${SANA_MCP_VERSION:-v0.1.0}"
+VERSION="${SANA_MCP_VERSION:-$(curl -fsSL https://api.github.com/repos/Lumen-AiApp/sana-ai-mcp/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')}"
 
 os="$(uname -s)"
 arch="$(uname -m)"
