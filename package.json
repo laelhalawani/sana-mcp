@@ -2,6 +2,7 @@
   "name": "sana-mcp",
   "version": "0.1.0",
   "description": "Sync and read your Sana.AI meeting transcripts (CLI + MCP server)",
+  "license": "GPL-3.0",
   "type": "module",
   "bin": {
     "sana-mcp": "./dist/cli.js"
