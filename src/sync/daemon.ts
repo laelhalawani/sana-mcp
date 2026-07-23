@@ -2,7 +2,7 @@ import { SanaStore } from "../store/db.js";
 import { SanaClient } from "../sana/client.js";
 import { SessionExpiredError } from "../sana/types.js";
 import { renderTranscript, countWords, transcriptLines } from "../sana/transcript.js";
-import { isDaemonAlive } from "./lock.js";
+import { isDaemonAlive, acquireDaemonLock, releaseDaemonLock } from "./lock.js";
 import {
   semanticEnabled,
   embedMeeting,
@@ -194,6 +194,11 @@ export async function runDaemon(): Promise<void> {
     return;
   }
 
+  if (!acquireDaemonLock()) {
+    log("daemon lock held - exiting");
+    return;
+  }
+
   let stopping = false;
   const stop = () => stopping;
   const shutdown = (sig: string) => {
@@ -247,6 +252,7 @@ export async function runDaemon(): Promise<void> {
       }
     }
   } finally {
+    releaseDaemonLock();
     store.updateSyncState({ daemon_pid: null, daemon_heartbeat_ms: null });
     store.close();
     log("daemon stopped");

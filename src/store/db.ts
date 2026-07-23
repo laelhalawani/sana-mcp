@@ -1,7 +1,13 @@
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import path from "node:path";
 import { DATA_DIR, ensureDataDir, MAX_TRANSCRIPT_ATTEMPTS } from "../config.js";
 import { transcriptLines } from "../sana/transcript.js";
+
+/** Named-parameter values accepted by bun:sqlite (object binding form). */
+export type Bindings = Record<
+  string,
+  string | number | bigint | boolean | null | NodeJS.TypedArray
+>;
 
 export interface MeetingListOpts {
   limit?: number;
@@ -67,13 +73,13 @@ export interface SyncState {
 }
 
 export class SanaStore {
-  readonly db: Database.Database;
+  readonly db: Database;
 
   constructor(file: string = DB_FILE) {
     ensureDataDir();
-    this.db = new Database(file);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
+    this.db = new Database(file, { strict: true });
+    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     this.migrate();
   }
 
@@ -197,19 +203,19 @@ export class SanaStore {
       });
   }
 
-  getMeeting(id: string): MeetingRow | undefined {
+  getMeeting(id: string): MeetingRow | null {
     return this.db.prepare(`SELECT * FROM meetings WHERE id = ?`).get(id) as
       | MeetingRow
-      | undefined;
+      | null;
   }
 
   /** Build a WHERE clause + params for the meeting filters. */
   private meetingFilter(opts: MeetingListOpts): {
     where: string;
-    params: Record<string, unknown>;
+    params: Bindings;
   } {
     const clauses: string[] = [];
-    const params: Record<string, unknown> = {};
+    const params: Bindings = {};
     if (opts.query) {
       clauses.push("m.name LIKE @like");
       params.like = `%${opts.query}%`;
@@ -330,10 +336,11 @@ export class SanaStore {
           `SELECT t.meeting_id AS id FROM transcripts t
            LEFT JOIN line_embeddings e ON e.meeting_id = t.meeting_id
            JOIN meetings m ON m.id = t.meeting_id
-           WHERE e.meeting_id IS NULL
+           LEFT JOIN fetch_failures ff ON ff.meeting_id = t.meeting_id
+           WHERE e.meeting_id IS NULL AND COALESCE(ff.attempts, 0) < @maxAtt
            ORDER BY m.created_at_ms DESC`
         )
-        .all() as { id: string }[]
+        .all({ maxAtt: MAX_TRANSCRIPT_ATTEMPTS }) as { id: string }[]
     ).map((r) => r.id);
   }
 
@@ -364,10 +371,10 @@ export class SanaStore {
     for (const l of lines) ins.run(l.text, meetingId, l.n);
   }
 
-  getTranscript(meetingId: string): TranscriptRow | undefined {
+  getTranscript(meetingId: string): TranscriptRow | null {
     return this.db
       .prepare(`SELECT * FROM transcripts WHERE meeting_id = ?`)
-      .get(meetingId) as TranscriptRow | undefined;
+      .get(meetingId) as TranscriptRow | null;
   }
 
   countTranscripts(): number {
@@ -404,7 +411,7 @@ export class SanaStore {
         participants_json: string | null;
         has_recording: number;
       }
-    | undefined {
+    | null {
     return this.db
       .prepare(
         `SELECT summary, summary_short, notes_json, participants_json, has_recording FROM meeting_metadata WHERE meeting_id = ?`
@@ -417,7 +424,7 @@ export class SanaStore {
           participants_json: string | null;
           has_recording: number;
         }
-      | undefined;
+      | null;
   }
 
   // ---- transcript fetch failures -----------------------------------------
@@ -469,9 +476,9 @@ export class SanaStore {
     match: string,
     dateFrom?: number,
     dateTo?: number
-  ): { where: string; params: Record<string, unknown> } {
+  ): { where: string; params: Bindings } {
     const clauses = ["line_fts MATCH @match"];
-    const params: Record<string, unknown> = { match };
+    const params: Bindings = { match };
     if (dateFrom != null) {
       clauses.push("m.created_at_ms >= @dateFrom");
       params.dateFrom = dateFrom;
@@ -539,20 +546,22 @@ export class SanaStore {
     return this.db.prepare(`SELECT * FROM sync_state WHERE id = 1`).get() as SyncState;
   }
 
+  private static readonly SYNC_COLS = [
+    "phase", "message", "meetings_total", "transcripts_done", "transcripts_total",
+    "last_full_sync_ms", "last_incremental_ms", "daemon_pid", "daemon_heartbeat_ms",
+    "blocking", "error",
+  ] as const;
+
   updateSyncState(patch: Partial<Omit<SyncState, "updated_ms">>): void {
-    const cur = this.getSyncState();
-    const next = { ...cur, ...patch, updated_ms: Date.now() };
-    this.db
-      .prepare(
-        `UPDATE sync_state SET
-           phase=@phase, message=@message, meetings_total=@meetings_total,
-           transcripts_done=@transcripts_done, transcripts_total=@transcripts_total,
-           last_full_sync_ms=@last_full_sync_ms, last_incremental_ms=@last_incremental_ms,
-           daemon_pid=@daemon_pid, daemon_heartbeat_ms=@daemon_heartbeat_ms,
-           blocking=@blocking, error=@error, updated_ms=@updated_ms
-         WHERE id = 1`
-      )
-      .run(next);
+    const sets: string[] = ["updated_ms = @updated_ms"];
+    const params: Bindings = { updated_ms: Date.now() };
+    for (const col of SanaStore.SYNC_COLS) {
+      if (col in patch) {
+        sets.push(`${col} = @${col}`);
+        params[col] = (patch as Record<string, unknown>)[col] as Bindings[string];
+      }
+    }
+    this.db.prepare(`UPDATE sync_state SET ${sets.join(", ")} WHERE id = 1`).run(params);
   }
 
   close(): void {
