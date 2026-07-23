@@ -11,12 +11,6 @@ export const DATA_DIR = process.env.SANA_DATA_DIR
   : path.join(PROJECT_ROOT, "data");
 
 export const SESSION_FILE = path.join(DATA_DIR, "session.json");
-// Persistent browser profile: stores cookies + localStorage + IndexedDB, so
-// login survives across runs and works regardless of Sana's auth mechanism.
-export const PROFILE_DIR = process.env.SANA_PROFILE_DIR
-  ? path.resolve(process.env.SANA_PROFILE_DIR)
-  : path.join(DATA_DIR, "profile");
-export const STATE_FILE = path.join(DATA_DIR, "state.json");
 export const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 export const TRANSCRIPTS_DIR = process.env.SANA_TRANSCRIPTS_DIR
   ? path.resolve(process.env.SANA_TRANSCRIPTS_DIR)

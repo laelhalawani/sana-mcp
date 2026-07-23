@@ -1,4 +1,4 @@
-// `sana install`: detect installed MCP clients, let the user pick, and
+// `sana-mcp install`: detect installed MCP clients, let the user pick, and
 // register this server with each chosen client (idempotent, non-destructive).
 import { execFileSync } from "node:child_process";
 import { checkbox } from "@inquirer/prompts";
@@ -87,7 +87,7 @@ function describe(r: ApplyResult): string {
 }
 
 export async function runInstall(opts: InstallOpts = {}): Promise<void> {
-  const serverName = opts.name ?? "meeting-transcripts";
+  const serverName = opts.name ?? "sana-mcp";
   const entry = serverTarget();
   const dryRun = !!opts.dryRun;
 
@@ -171,7 +171,7 @@ function describeRemove(r: ApplyResult, dryRun: boolean): string {
 }
 
 export async function runUninstall(opts: InstallOpts = {}): Promise<void> {
-  const serverName = opts.name ?? "meeting-transcripts";
+  const serverName = opts.name ?? "sana-mcp";
   const dryRun = !!opts.dryRun;
   const detected = CLIENTS.filter(safeDetect);
   if (detected.length === 0) {
