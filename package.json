@@ -4,7 +4,7 @@
   "description": "Sync and read your Sana.AI meeting transcripts (CLI + MCP server)",
   "type": "module",
   "bin": {
-    "sana": "./dist/cli.js"
+    "sana-mcp": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -69,7 +69,7 @@ export const TOOLS: ToolDoc[] = [
     name: "help",
     summary: "Show this help, or details for one tool.",
     args: "tool: string (optional)",
-    example: 'meeting_transcripts("help", {"tool":"list_meetings"})',
+    example: 'meeting_transcripts("help", {"tool":"list"})',
   },
 ];
 

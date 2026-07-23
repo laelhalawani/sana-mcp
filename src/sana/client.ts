@@ -225,24 +225,11 @@ export class SanaClient {
     }
   }
 
-  /** All meetings, following the server-provided nextCursor to the end. */
-  async listMeetings(): Promise<MeetingSummary[]> {
-    const out: MeetingSummary[] = [];
-    await this.walkMeetings((assets) => {
-      out.push(...assets);
-    });
-    return out;
-  }
-
   async getTranscription(assetId: string): Promise<TranscriptSegment[]> {
     const data = await this.trpcQuery<TranscriptSegment[]>("meeting.getTranscription", {
       assetId,
     });
     return data ?? [];
-  }
-
-  async getMeetingData(assetId: string): Promise<unknown> {
-    return this.trpcMutation("meeting.getMeetingData", { assetId });
   }
 
   /** Rich meeting metadata: summary, summaryShort, notes, actionItems, etc. */

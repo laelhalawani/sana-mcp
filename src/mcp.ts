@@ -7,7 +7,7 @@ import { z } from "zod";
 import { sana } from "./tools/dispatch.js";
 
 const server = new McpServer({
-  name: "meeting-transcripts",
+  name: "sana-mcp",
   version: "0.1.0",
 });
 
@@ -44,4 +44,4 @@ server.registerTool(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("sana MCP server running on stdio");
+console.error("sana-mcp MCP server running on stdio");

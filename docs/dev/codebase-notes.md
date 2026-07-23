@@ -155,18 +155,14 @@ Every tool returns a **plain string** - never structured JSON, never thrown.
 
 ## 7. Quirks, dead code, inconsistencies
 
-- **`src/browser.ts` and `src/state.ts` are dead code** - neither imported
-  anywhere. `browser.ts` (Playwright `launchPersistent`/`hasSession`) is
-  leftover from an earlier browser-driven design; `state.ts` (file-based
-  `DownloadedMeeting`/`saveState`) predates the SQLite store. The README's
-  "no browser required" is true only for the live path - Playwright is still a
-  hard dep and powers every dev script.
-- **`SanaClient.listMeetings()` and `getMeetingData()` are defined but never
-  called.**
+- **`src/browser.ts` and `src/state.ts` were removed** (Pass 1). `browser.ts`
+  (Playwright `launchPersistent`/`hasSession`) was leftover from an earlier
+  browser-driven design; `state.ts` (file-based `DownloadedMeeting`/`saveState`)
+  predates the SQLite store. Playwright is still a hard dep and powers every dev
+  script, so the README's "no browser required" is true only for the live path.
 - **Stale tool aliases.** The dispatcher still accepts `list_meetings`/
-  `read_transcript` (dispatch.ts) alongside the documented `list`/`read`, and
-  `help.ts`'s own help example uses the old `list_meetings` name. Works, but
-  inconsistent with the README/MCP `description`/TOOLS list.
+  `read_transcript` (dispatch.ts) alongside the documented `list`/`read`. Works,
+  but inconsistent with the README/MCP `description`/TOOLS list.
 - **`list` status has a value you can't filter by.** `rowStatus` can return
   `"processing"` and the table header advertises it, but `parseFilters` only
   accepts `ready|downloading|failed` - no way to filter for processing.
@@ -177,10 +173,9 @@ Every tool returns a **plain string** - never structured JSON, never thrown.
   `meetingsMissingEmbedding()` is empty. A transcript that succeeds but whose
   embedding persistently fails isn't excluded by failure counters, so the
   daemon could loop on it and `blocking` would stay latched (rare in practice).
-- **CLI flags drift.** `cli.ts`'s header comment and `--offset`/
-  `--no-timestamps` flags are stale: `handleListMeetings` computes offset from
-  `page` and ignores `args.offset`; canonical args use `meeting_id`/`page`/
-  `timestamps`.
+- **CLI flags.** The stale `--offset` flag was removed (`handleListMeetings`
+  derives offset from `page`); `--no-timestamps` remains and is intentional -
+  it's the CLI mirror of the `timestamps` arg.
 - **Hardcoded workspace id** `Yy6S4JGT8SAx` in `record.mjs`/`validate.mjs`/
   `paginate.mjs` - a real-looking identifier left in dev scripts.
 - **FTS is whole-word only.** Query tokens (`\p{L}\p{N}+`) are quoted and

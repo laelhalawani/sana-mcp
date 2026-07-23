@@ -1,4 +1,4 @@
-# sana-ai-mcp
+# sana-mcp
 
 Sync and search your own [Sana.AI](https://sana.ai) meeting transcripts locally,
 and expose them to AI agents through a single [MCP](https://modelcontextprotocol.io)
@@ -54,7 +54,7 @@ npm run build
 
 ## Register with an AI client
 
-`node dist/cli.js install` detects the MCP-capable clients installed on your
+`sana-mcp install` detects the MCP-capable clients installed on your
 machine and registers sana-mcp with the ones you choose. Each client's config is
 written safely (your other servers are preserved):
 
@@ -63,10 +63,10 @@ written safely (your other servers are preserved):
   pre-selected; you can also add any other supported client.
 - Flags: `--dry-run` (show what would change), `--yes` (register with all
   detected clients, no prompt), `--name <name>` (server name, default
-  `meeting-transcripts`).
+  `sana-mcp`).
 
 Most clients need a restart or a session reload to pick up the new server. To
-remove it later, run `node dist/cli.js uninstall` (same flags).
+remove it later, run `sana-mcp uninstall` (same flags).
 
 ## Use as an MCP server
 
@@ -76,7 +76,7 @@ absolute path to your clone):
 ```json
 {
   "mcpServers": {
-    "meeting-transcripts": {
+    "sana-mcp": {
       "command": "node",
       "args": ["/absolute/path/to/sana-ai-mcp/dist/mcp.js"]
     }
@@ -91,18 +91,18 @@ automatically on first use.
 ## Use from the CLI
 
 ```bash
-node dist/cli.js login --email you@example.com
-node dist/cli.js login --email you@example.com --code 123456
-node dist/cli.js status
-node dist/cli.js list --limit 20
-node dist/cli.js read --id <meeting-id>
-node dist/cli.js search --query pricing
-node dist/cli.js daemon          # run the sync daemon in the foreground
-node dist/cli.js install         # register sana-mcp with your AI clients
-node dist/cli.js uninstall       # remove sana-mcp from your AI clients
+sana-mcp login --email you@example.com
+sana-mcp login --email you@example.com --code 123456
+sana-mcp status
+sana-mcp list --limit 20
+sana-mcp read --id <meeting-id>
+sana-mcp search --query pricing
+sana-mcp daemon          # run the sync daemon in the foreground
+sana-mcp install         # register sana-mcp with your AI clients
+sana-mcp uninstall       # remove sana-mcp from your AI clients
 ```
 
-During development you can swap `node dist/cli.js` for `npm run cli --`.
+During development you can swap `sana-mcp` for `npm run cli --`.
 
 ## How sync works
 
@@ -126,7 +126,7 @@ fused by Reciprocal Rank Fusion:
 
 ```bash
 npm install                       # pulls the optional deps (transformers.js, sqlite-vec)
-SANA_SEMANTIC=1 node dist/cli.js daemon
+SANA_SEMANTIC=1 sana-mcp daemon
 # set SANA_SEMANTIC=1 for the MCP server process too
 ```
 
