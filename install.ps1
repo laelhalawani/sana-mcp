@@ -37,9 +37,12 @@ if (($userPath -split ';') -notcontains $installDir) {
 if (($env:Path -split ';') -notcontains $installDir) { $env:Path = "$env:Path;$installDir" }
 
 # --- register with detected AI clients (unless opted out) ---
+# The installer usually runs via `irm ... | iex`, which has no interactive
+# stdin for a picker, so register with all detected clients. Re-run
+# `sana-mcp install` yourself to change the selection.
 if ($env:SANA_MCP_NO_REGISTER -ne "1") {
   Write-Host ""
-  & $dest install
+  & $dest install --yes
 }
 
 Write-Host ""
