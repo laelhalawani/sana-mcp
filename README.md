@@ -21,6 +21,10 @@ Windows (PowerShell):
 irm https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
 ```
 
+The installer puts `sana-mcp` on your `PATH` and registers it with the AI clients
+it detects. Then sign in - `sana-mcp login --email you@example.com` - or just ask
+your agent to use the transcripts and it will walk you through the email code.
+
 ## What it does
 
 Sana has no public API for meetings. `sana-mcp` drives the same web backend the
@@ -48,7 +52,8 @@ headless on macOS, Linux, Windows, and WSL.
 - **Automatic sync** - the daemon polls for new meetings and pulls them in the
   background; failed downloads are retried then marked, never blocking the rest.
 - **Works with your client** - auto-registers with Claude Desktop, Claude Code,
-  Cursor, Codex, Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q, Continue.
+  Cursor, VS Code, Codex, Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q,
+  Continue, opencode.
 - **Local-first & private** - no data leaves your machine except authenticated
   requests to Sana.
 
@@ -116,7 +121,8 @@ Subcommands:
 
 ## Register with an AI client
 
-After installing the binary, register it with your AI clients:
+The one-line installer runs this for you. To change your selection later, or if
+you installed the binary manually, run:
 
 ```bash
 sana-mcp install      # detect installed clients, register sana-mcp with your picks
@@ -126,9 +132,9 @@ sana-mcp install      # detect installed clients, register sana-mcp with your pi
 `sana-mcp` with the ones you choose. Each client's config is written safely -
 your existing servers are preserved - and the operation is idempotent.
 
-- **Detects:** Claude Desktop, Claude Code, Cursor, Codex, Gemini CLI, Windsurf,
-  Zed, Cline, Roo Code, Amazon Q, and Continue. Detected clients are
-  pre-selected; you can add any other supported client too.
+- **Detects:** Claude Desktop, Claude Code, Cursor, VS Code (Copilot), Codex,
+  Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q, Continue, and opencode.
+  Detected clients are pre-selected; you can add any other supported client too.
 - **Flags:** `--dry-run` (show what would change), `--yes` (register with all
   detected clients, no prompt), `--name <name>` (server name; default `sana-mcp`).
 - After registering, most clients need a restart or a session reload to pick up

@@ -2,6 +2,7 @@
 // public facts, re-authored from official docs - not copied from any library).
 import path from "node:path";
 import type { ServerTarget } from "./server-target.js";
+import type { EntryBuilder } from "./writers.js";
 import {
   home,
   appData,
@@ -15,6 +16,7 @@ import {
 
 export type InstallKind =
   | { kind: "file-json"; path: () => string | null; topKey: string }
+  | { kind: "file-jsonc"; path: () => string | null; topKey: string; build: EntryBuilder }
   | { kind: "file-toml"; path: () => string | null }
   | { kind: "file-yaml-list"; path: () => string | null }
   | {
@@ -23,6 +25,26 @@ export type InstallKind =
       buildArgs: (name: string, entry: ServerTarget) => string[];
       removeArgs?: (name: string) => string[];
     };
+
+// ---- per-client entry shapes (for JSONC clients with non-standard fields) --
+
+/** opencode: top-level `mcp`, type "local", command as a single array. */
+const opencodeEntry: EntryBuilder = (e) => {
+  const o: Record<string, unknown> = {
+    type: "local",
+    command: [e.command, ...e.args],
+    enabled: true,
+  };
+  if (e.env && Object.keys(e.env).length) o.environment = e.env;
+  return o;
+};
+
+/** VS Code: top-level `servers`, type "stdio", command + args. */
+const vscodeEntry: EntryBuilder = (e) => {
+  const o: Record<string, unknown> = { type: "stdio", command: e.command, args: e.args };
+  if (e.env && Object.keys(e.env).length) o.env = e.env;
+  return o;
+};
 
 export interface ClientDef {
   id: string;
@@ -91,6 +113,32 @@ function zedConfig(): string | null {
     return a ? path.join(a, "Zed", "settings.json") : null;
   }
   return path.join(xdgConfig(), "zed", "settings.json");
+}
+
+function opencodeDir(): string {
+  // opencode uses XDG on all platforms (incl. Windows via %APPDATA% fallback).
+  if (process.platform === "win32") {
+    const a = appData();
+    return a ? path.join(a, "opencode") : path.join(xdgConfig(), "opencode");
+  }
+  return path.join(xdgConfig(), "opencode");
+}
+
+function opencodeConfig(): string {
+  // Prefer an existing opencode.jsonc; otherwise write opencode.json.
+  const dir = opencodeDir();
+  const jsonc = path.join(dir, "opencode.jsonc");
+  return exists(jsonc) ? jsonc : path.join(dir, "opencode.json");
+}
+
+function vscodeUserConfig(): string | null {
+  // VS Code user profile mcp.json (Copilot agent mode).
+  if (process.platform === "darwin") return appSupport("Code", "User", "mcp.json");
+  if (process.platform === "win32") {
+    const a = appData();
+    return a ? path.join(a, "Code", "User", "mcp.json") : null;
+  }
+  return path.join(xdgConfig(), "Code", "User", "mcp.json");
 }
 
 // ---- detection helpers ---------------------------------------------------
@@ -220,5 +268,29 @@ export const CLIENTS: ClientDef[] = [
     },
     install: { kind: "file-yaml-list", path: continueConfig },
     reloadHint: "reload Continue config",
+  },
+  {
+    id: "opencode",
+    name: "opencode",
+    detect() {
+      return which("opencode") !== null || exists(opencodeDir());
+    },
+    install: { kind: "file-jsonc", path: opencodeConfig, topKey: "mcp", build: opencodeEntry },
+    reloadHint: "restart opencode",
+  },
+  {
+    id: "vscode",
+    name: "VS Code (Copilot)",
+    detect() {
+      const lad = localAppData();
+      return (
+        which("code") !== null ||
+        exists(vscodeUserConfig()) ||
+        appBundle("Visual Studio Code.app") ||
+        (lad ? exists(path.join(lad, "Programs", "Microsoft VS Code")) : false)
+      );
+    },
+    install: { kind: "file-jsonc", path: vscodeUserConfig, topKey: "servers", build: vscodeEntry },
+    reloadHint: "reload VS Code (or restart Copilot chat)",
   },
 ];
