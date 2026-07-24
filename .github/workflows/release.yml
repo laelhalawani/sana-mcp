@@ -83,12 +83,30 @@ jobs:
             --outfile sana-mcp-${{ matrix.target }}${{ matrix.ext }}
       - name: Checksum
         run: sha256sum "sana-mcp-${{ matrix.target }}${{ matrix.ext }}" > "sana-mcp-${{ matrix.target }}${{ matrix.ext }}.sha256"
-      - name: Attach to release
+      # Upload as a workflow artifact; a single downstream job publishes the
+      # release so the 6 parallel builds don't race to create it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sana-mcp-${{ matrix.target }}
+          path: |
+            sana-mcp-${{ matrix.target }}${{ matrix.ext }}
+            sana-mcp-${{ matrix.target }}${{ matrix.ext }}.sha256
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-assets
+          merge-multiple: true
+      - name: Publish release (single writer, no race)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
-          files: |
-            sana-mcp-${{ matrix.target }}${{ matrix.ext }}
-            sana-mcp-${{ matrix.target }}${{ matrix.ext }}.sha256
+          files: dist-assets/*
           prerelease: ${{ contains(needs.resolve.outputs.tag, '-') }}
           fail_on_unmatched_files: true
