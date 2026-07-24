@@ -69,8 +69,14 @@ try { Download-WithProgress $url $tmp }
 catch { Write-Error "Download failed from $url : $_"; if (Test-Path $tmp) { Remove-Item $tmp -Force }; exit 1 }
 
 # --- verify SHA-256 against the published .sha256 (skip if not available) ---
+# Invoke-RestMethod returns the body as text; pull the first 64-hex-char token
+# (the ".sha256" file is "<hash>  <filename>"). Avoids byte-array quirks.
 $expected = $null
-try { $expected = ((Invoke-WebRequest "$url.sha256" -UseBasicParsing).Content -split '\s+')[0] } catch { $expected = $null }
+try {
+  $body = [string](Invoke-RestMethod "$url.sha256" -UseBasicParsing)
+  $m = [regex]::Match($body, '[0-9a-fA-F]{64}')
+  if ($m.Success) { $expected = $m.Value }
+} catch { $expected = $null }
 if ($expected) {
   $actual = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
   if ($actual -ne $expected.ToLower()) {
