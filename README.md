@@ -21,9 +21,11 @@ Windows (PowerShell):
 irm https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
 ```
 
-The installer puts `sana-mcp` on your `PATH` and registers it with the AI clients
-it detects. Then sign in - `sana-mcp login --email you@example.com` - or just ask
-your agent to use the transcripts and it will walk you through the email code.
+The installer puts `sana-mcp` on your `PATH`, then opens an interactive
+configurer: it detects your AI clients, lets you toggle which ones to connect
+(space to toggle, `v` to reveal undetected clients, enter to confirm), and offers
+to sign you in. Run `sana-mcp` anytime to reopen it and change what's connected or
+sign in later.
 
 ## What it does
 

@@ -5,6 +5,9 @@ import { DATA_DIR } from "../config.js";
 
 // A daemon is considered alive if it wrote a heartbeat recently AND its PID
 // still exists. Heartbeats are written every few seconds by the running daemon.
+// Note: PID reuse (an unrelated process inheriting a dead daemon's PID within
+// the stale window) is a known, very-low-probability edge that could briefly
+// wedge respawns; the heartbeat staleness check bounds it to ~STALE_MS.
 const STALE_MS = 30_000;
 
 const LOCK_FILE = path.join(DATA_DIR, "daemon.lock");

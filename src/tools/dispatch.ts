@@ -30,6 +30,16 @@ function estimateMinutes(remaining: number): number {
   return Math.max(1, Math.ceil((remaining * 0.5) / 60));
 }
 
+/**
+ * Coerce a pagination arg to a positive integer, tolerating agents that pass
+ * numbers as strings (e.g. "10"). Non-numeric/garbage falls back to `dflt`
+ * rather than producing NaN, which would crash a strict SQLite LIMIT binding.
+ */
+function posInt(v: unknown, dflt: number): number {
+  const n = typeof v === "string" || typeof v === "number" ? Number(v) : NaN;
+  return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : dflt;
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // The meeting count only appears after the daemon's brief "listing" phase.
@@ -125,7 +135,10 @@ async function handleLogin(args: Record<string, unknown>): Promise<string> {
       // Every login triggers a fresh catch-up sync; block data tools until done.
       // Reset failure counters so previously-failed transcripts are retried.
       store.resetFailures();
-      store.updateSyncState({ blocking: 1 });
+      // Stamp the catch-up request so the daemon only clears `blocking` after a
+      // sync cycle that STARTED at/after this login (not an in-flight one that
+      // listed before this login's new meetings existed).
+      store.updateSyncState({ blocking: 1, catchup_epoch_ms: Date.now() });
       ensureDaemonRunning();
 
       const head = `Logged in as ${user.email}${client.workspaceId ? ` (workspace ${client.workspaceId})` : ""}.`;
@@ -228,8 +241,8 @@ function rowStatus(r: { has_transcript: number; attempts: number; processing_pha
 }
 
 function handleListMeetings(store: SanaStore, args: Record<string, unknown>): string {
-  const limit = Math.max(1, Number(args.limit ?? 50));
-  const page = Math.max(1, Number(args.page ?? 1));
+  const limit = posInt(args.limit, 50);
+  const page = posInt(args.page, 1);
   const offset = (page - 1) * limit;
   const query = typeof args.query === "string" ? args.query : undefined;
   const sort: MeetingListOpts["sort"] = args.sort === "oldest" ? "oldest" : "newest";
@@ -463,8 +476,8 @@ async function handleSearch(store: SanaStore, args: Record<string, unknown>): Pr
   const match = terms.map((t) => `"${t}"`).join(" ");
   const anchor = terms[0] ?? query;
 
-  const limit = Math.min(Math.max(Number(args.limit ?? 10), 1), 100);
-  const page = Math.max(1, Number(args.page ?? 1));
+  const limit = Math.min(posInt(args.limit, 10), 100);
+  const page = posInt(args.page, 1);
   const offset = (page - 1) * limit;
   const sort = args.sort === "newest" || args.sort === "oldest" ? args.sort : "best";
   const { dateFrom, dateTo } = parseFilters(args);

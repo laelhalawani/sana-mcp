@@ -81,10 +81,14 @@ jobs:
             --external @huggingface/transformers \
             --external sqlite-vec \
             --outfile sana-mcp-${{ matrix.target }}${{ matrix.ext }}
+      - name: Checksum
+        run: sha256sum "sana-mcp-${{ matrix.target }}${{ matrix.ext }}" > "sana-mcp-${{ matrix.target }}${{ matrix.ext }}.sha256"
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
-          files: sana-mcp-${{ matrix.target }}${{ matrix.ext }}
+          files: |
+            sana-mcp-${{ matrix.target }}${{ matrix.ext }}
+            sana-mcp-${{ matrix.target }}${{ matrix.ext }}.sha256
           prerelease: ${{ contains(needs.resolve.outputs.tag, '-') }}
           fail_on_unmatched_files: true

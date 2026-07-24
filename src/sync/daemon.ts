@@ -42,6 +42,10 @@ function markNeedsLogin(store: SanaStore): void {
 /** One sync cycle: refresh the meeting list, then download missing transcripts. */
 async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
   const firstEver = store.getSyncState().last_full_sync_ms == null;
+  // When this cycle began. We only release the login block if this cycle
+  // started at/after the last catch-up request (see `caughtUp` below), so a
+  // login that races an in-flight cycle isn't prematurely reported complete.
+  const cycleStart = Date.now();
 
   // --- refresh meeting list (stop early once a page is fully known, unless
   //     this is the very first sync where we want everything). ---
@@ -134,7 +138,12 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
   }
 
   // --- semantic embeddings (required for hybrid search when enabled) ---
-  if (semanticEnabled()) {
+  // If the embedding runtime/deps are unavailable (e.g. the compiled binary was
+  // built with them --external), we do NOT fail the whole sync: we skip
+  // embeddings for this run so the login block can still clear and keyword
+  // search keeps working. Only a genuinely available-but-failing model retries.
+  let semanticUsable = semanticEnabled();
+  if (semanticUsable) {
     const needEmbed = store.meetingsMissingEmbedding();
     if (needEmbed.length) {
       store.updateSyncState({
@@ -155,8 +164,11 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
         emb++;
       } catch (e) {
         if (e instanceof SemanticUnavailableError) {
-          store.updateSyncState({ phase: "error", error: e.message });
-          throw e; // semantic is enabled but cannot run; surface and stop
+          // Embeddings can't run in this environment; degrade to keyword-only
+          // for the rest of this process and stop trying to embed.
+          semanticUsable = false;
+          log("semantic search unavailable, continuing with keyword search:", e.message);
+          break;
         }
         store.recordFailure(id, (e as Error).message);
       }
@@ -168,20 +180,22 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
   }
 
   const now = Date.now();
-  const caughtUp =
+  const workDone =
     store.meetingsIncomplete().length === 0 &&
-    (!semanticEnabled() || store.meetingsMissingEmbedding().length === 0);
-  store.updateSyncState({
-    phase: "synced",
+    (!semanticUsable || store.meetingsMissingEmbedding().length === 0);
+  // Finalize atomically: clear the login block only if this cycle both did all
+  // its work AND started at/after the pending catch-up request (see
+  // finishSyncCycle) - a single SQL statement, so a login committing
+  // blocking:1 mid-cycle is never clobbered by a stale read here.
+  store.finishSyncCycle({
     message: `Up to date - ${total} meetings, ${store.countComplete()} complete.`,
     meetings_total: total,
     transcripts_total: total,
     transcripts_done: store.countComplete(),
     last_full_sync_ms: firstEver ? now : store.getSyncState().last_full_sync_ms,
     last_incremental_ms: now,
-    // Release the login-triggered block only once nothing is left to download.
-    blocking: caughtUp ? 0 : store.getSyncState().blocking,
-    error: null,
+    workDone,
+    cycleStart,
   });
   if (discovered > 0 || done > 0) log(`sync: +${discovered} meetings, +${done} transcripts`);
 }

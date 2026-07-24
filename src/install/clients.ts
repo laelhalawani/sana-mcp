@@ -28,12 +28,14 @@ export type InstallKind =
 
 // ---- per-client entry shapes (for JSONC clients with non-standard fields) --
 
-/** opencode: top-level `mcp`, type "local", command as a single array. */
+/** opencode: top-level `mcp`, type "local", command as a single array.
+ * `enabled` is intentionally omitted: opencode treats an absent value as
+ * enabled, and omitting it preserves a user's explicit `enabled:false` across
+ * re-runs (the writer merges our fields onto the existing entry). */
 const opencodeEntry: EntryBuilder = (e) => {
   const o: Record<string, unknown> = {
     type: "local",
     command: [e.command, ...e.args],
-    enabled: true,
   };
   if (e.env && Object.keys(e.env).length) o.environment = e.env;
   return o;

@@ -33,12 +33,18 @@ export function ensureDaemonRunning(): { alreadyRunning: boolean; spawned: boole
   }
 
   const logFd = fs.openSync(path.join(DATA_DIR, "daemon.log"), "a");
-  const child = spawn(command, args, {
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    env: process.env,
-    windowsHide: true,
-  });
-  child.unref();
+  try {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      env: process.env,
+      windowsHide: true,
+    });
+    child.unref();
+  } finally {
+    // The child dup'd the fd; close our copy so the parent (long-lived MCP
+    // server) doesn't leak one handle per respawn.
+    fs.closeSync(logFd);
+  }
   return { alreadyRunning: false, spawned: true };
 }

@@ -1,9 +1,14 @@
-// `sana-mcp install`: detect installed MCP clients, let the user pick, and
-// register this server with each chosen client (idempotent, non-destructive).
-import { execFileSync } from "node:child_process";
-import { checkbox } from "@inquirer/prompts";
+// `sana-mcp` configurer: detect installed MCP clients, show a toggle wizard
+// reflecting each client's current registration, apply the diff (enable /
+// disable), then optionally sign in. `--yes` is an opt-in unattended mode.
+import { execFileSync, execSync } from "node:child_process";
+import { checkbox, confirm, input } from "@inquirer/prompts";
 import { CLIENTS, type ClientDef } from "./clients.js";
 import { serverTarget, type ServerTarget } from "./server-target.js";
+import { isRegistered } from "./status.js";
+import { which } from "./detect.js";
+import { wizardPrompt, type WizardRow, type WizardResult } from "./wizard-prompt.js";
+import { sana } from "../tools/dispatch.js";
 import {
   upsertJsonServer,
   upsertJsoncServer,
@@ -33,6 +38,21 @@ function safeDetect(c: ClientDef): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Run a command-based client's CLI (e.g. `claude mcp add ...`). On Windows the
+ * target is usually a `.cmd`/`.ps1` shim, which CreateProcess cannot exec
+ * directly, so we run it through cmd.exe and quote each argument. On POSIX we
+ * exec directly with an args array (no shell, so no quoting concerns).
+ */
+function runCommandClient(bin: string, args: string[]): void {
+  if (process.platform === "win32") {
+    const line = [bin, ...args].map((a) => `"${String(a).replace(/"/g, '""')}"`).join(" ");
+    execSync(line, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    return;
+  }
+  execFileSync(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
 }
 
 function mapWrite(res: WriteResult, file: string, dryRun: boolean): ApplyResult {
@@ -74,10 +94,12 @@ function applyClient(
     return mapWrite(upsertYamlServerList(file, name, entry, dryRun), file, dryRun);
   }
   // command-based (e.g. claude-code shells out to `claude mcp add`)
+  if (which(inst.bin) === null)
+    return { status: "skipped", detail: `${inst.bin} CLI not found on PATH` };
   const args = inst.buildArgs(name, entry);
   if (dryRun) return { status: "ok", detail: `would run: ${inst.bin} ${args.join(" ")}` };
   try {
-    execFileSync(inst.bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    runCommandClient(inst.bin, args);
     return { status: "ok" };
   } catch (e) {
     return { status: "failed", detail: (e as Error).message.split("\n")[0] };
@@ -97,53 +119,175 @@ function describe(r: ApplyResult): string {
   }
 }
 
+const C = {
+  dim: (s: string) => `\x1b[2m${s}\x1b[22m`,
+  bold: (s: string) => `\x1b[1m${s}\x1b[22m`,
+  green: (s: string) => `\x1b[32m${s}\x1b[39m`,
+  yellow: (s: string) => `\x1b[33m${s}\x1b[39m`,
+  red: (s: string) => `\x1b[31m${s}\x1b[39m`,
+  cyan: (s: string) => `\x1b[36m${s}\x1b[39m`,
+};
+
+/**
+ * The interactive configurer, launched by `sana-mcp` (no args) or
+ * `sana-mcp install`. Shows detected clients as toggles seeded from their
+ * current registration, applies the diff, then offers sign-in.
+ * `--yes` runs unattended: register with every detected client.
+ */
 export async function runInstall(opts: InstallOpts = {}): Promise<void> {
   const serverName = opts.name ?? "sana-mcp";
   const entry = serverTarget();
   const dryRun = !!opts.dryRun;
 
   const detected = CLIENTS.filter(safeDetect);
-  const others = CLIENTS.filter((c) => !safeDetect(c));
 
-  console.log(`sana-mcp installer - registering server "${serverName}"`);
-  console.log(`  command: ${entry.command} ${entry.args.join(" ")}\n`);
-
-  let chosen: ClientDef[];
+  // --- unattended path ---
   if (opts.yes) {
-    chosen = detected;
-    if (chosen.length === 0) {
-      console.log("No supported clients detected. Re-run without --yes to pick manually.");
+    if (detected.length === 0) {
+      console.log("No supported AI clients detected.");
       return;
     }
-  } else {
-    if (detected.length === 0 && others.length === 0) {
-      console.log("No supported clients known for this platform.");
-      return;
+    console.log(C.bold(`Registering sana-mcp with ${detected.length} detected client(s):`));
+    for (const c of detected) {
+      const r = applyClient(c, serverName, entry, dryRun);
+      console.log(`  ${statusIcon(r)} ${c.name}: ${describe(r)}`);
     }
-    const choices = [
-      ...detected.map((c) => ({ name: `${c.name} (detected)`, value: c.id, checked: true })),
-      ...others.map((c) => ({ name: c.name, value: c.id, checked: false })),
-    ];
-    const ids = await checkbox<string>({
-      message: "Select clients to register sana-mcp with:",
-      choices,
-      pageSize: 15,
-    });
-    chosen = CLIENTS.filter((c) => ids.includes(c.id));
-  }
-
-  if (chosen.length === 0) {
-    console.log("Nothing selected; no changes made.");
+    console.log(`\nRun ${C.cyan("sana-mcp")} anytime to change this or sign in.`);
     return;
   }
 
-  if (dryRun) console.log("Dry run - no files will be changed.\n");
-  for (const c of chosen) {
-    const r = applyClient(c, serverName, entry, dryRun);
-    const tail = c.reloadHint ? ` -> ${c.reloadHint}` : "";
-    console.log(`  ${c.name}: ${describe(r)}${tail}`);
+  // --- interactive wizard ---
+  if (detected.length === 0) {
+    console.log("No supported AI clients detected on this machine.");
+    console.log(
+      `Install one (Claude Desktop, Cursor, VS Code, ...) then run ${C.cyan("sana-mcp")} again.`
+    );
+    return;
   }
-  console.log("\nDone.");
+
+  const rows: WizardRow[] = CLIENTS.map((c) => {
+    const det = detected.includes(c);
+    return {
+      id: c.id,
+      name: c.name,
+      detected: det,
+      current: det ? isRegistered(c, serverName) : false,
+      hint: c.reloadHint,
+    };
+  });
+
+  if (!process.stdin.isTTY) {
+    console.log(
+      "sana-mcp needs an interactive terminal to configure clients. Run `sana-mcp` in a terminal, or use `sana-mcp install --yes` to register with all detected clients."
+    );
+    return;
+  }
+
+  let result: WizardResult;
+  try {
+    result = await wizardPrompt({
+      message: "Configure sana-mcp for your AI clients",
+      rows,
+      serverName,
+    });
+  } catch {
+    console.log(
+      "sana-mcp needs an interactive terminal to configure clients. Run `sana-mcp` in a terminal, or use `sana-mcp install --yes` to register with all detected clients."
+    );
+    return;
+  }
+
+  if (!result.submitted) {
+    console.log("\nCancelled - no changes made.");
+    return;
+  }
+
+  // Act on every detected client whose desired state is ON (upsert is
+  // idempotent and self-refreshing: it rewrites a stale command path and
+  // returns "noop" when nothing changed), plus clients being turned off.
+  // Clients that were off and stay off are skipped silently.
+  const acted: ClientDef[] = [];
+  const results: ApplyResult[] = [];
+  for (const c of detected) {
+    const want = result.desired[c.id];
+    const cur = rows.find((r) => r.id === c.id)?.current ?? false;
+    if (want) {
+      acted.push(c);
+      results.push(applyClient(c, serverName, entry, dryRun));
+    } else if (cur) {
+      acted.push(c);
+      results.push(applyRemove(c, serverName, dryRun));
+    }
+    // else: was off, stays off -> skip silently
+  }
+
+  if (acted.length === 0) {
+    console.log("\nNo changes to apply.");
+  } else {
+    console.log("");
+    acted.forEach((c, i) => {
+      const r = results[i]!;
+      const want = result.desired[c.id];
+      const verb = want ? describe(r) : describeRemove(r, dryRun);
+      const tail = r.status === "ok" && c.reloadHint ? C.dim(` (${c.reloadHint})`) : "";
+      console.log(`  ${statusIcon(r, want)} ${c.name}: ${verb}${tail}`);
+    });
+  }
+
+  // --- optional sign-in ---
+  await maybeLogin();
+
+  console.log(`\nAll set. Run ${C.cyan("sana-mcp")} anytime to reconfigure clients or sign in.`);
+}
+
+function statusIcon(r: ApplyResult, enabling = true): string {
+  if (r.status === "ok") return enabling ? C.green("+") : C.yellow("-");
+  if (r.status === "noop") return C.dim("=");
+  if (r.status === "failed") return C.red("x");
+  return C.dim("~");
+}
+
+/** Offer an optional email-code sign-in as part of the configurer. */
+async function maybeLogin(): Promise<void> {
+  let loggedIn = false;
+  try {
+    // `status` returns the "not logged in" explainer when there's no session.
+    const s = await sana("status");
+    loggedIn = !/not logged in|to sign in|has expired|to login again/i.test(s);
+  } catch {
+    loggedIn = false;
+  }
+  if (loggedIn) {
+    console.log(C.dim("\nAlready signed in to Sana."));
+    return;
+  }
+
+  const wantLogin = await confirm({
+    message: "Sign in to Sana now? (you can also let your agent do it later)",
+    default: true,
+  }).catch(() => false);
+  if (!wantLogin) {
+    console.log(
+      C.dim("Skipped. Your agent will ask for your email + code the first time it needs them.")
+    );
+    return;
+  }
+
+  const email = (await input({ message: "Email for your Sana account:" }).catch(() => "")).trim();
+  if (!email) {
+    console.log(C.dim("No email entered - skipping sign-in."));
+    return;
+  }
+  console.log(await sana("login", { email }));
+
+  const code = (
+    await input({ message: "Enter the 6-digit code from your email:" }).catch(() => "")
+  ).trim();
+  if (!code) {
+    console.log(C.dim("No code entered - run `sana-mcp login --email you@example.com --code <code>` later."));
+    return;
+  }
+  console.log(await sana("login", { email, confirmation_code: code }));
 }
 
 function applyRemove(c: ClientDef, name: string, dryRun: boolean): ApplyResult {
@@ -170,10 +314,12 @@ function applyRemove(c: ClientDef, name: string, dryRun: boolean): ApplyResult {
   }
   if (!inst.removeArgs)
     return { status: "skipped", detail: "no automated removal for this client" };
+  if (which(inst.bin) === null)
+    return { status: "skipped", detail: `${inst.bin} CLI not found on PATH` };
   const args = inst.removeArgs(name);
   if (dryRun) return { status: "ok", detail: `would run: ${inst.bin} ${args.join(" ")}` };
   try {
-    execFileSync(inst.bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    runCommandClient(inst.bin, args);
     return { status: "ok" };
   } catch (e) {
     return { status: "failed", detail: (e as Error).message.split("\n")[0] };

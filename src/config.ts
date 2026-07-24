@@ -20,10 +20,14 @@ export function isCompiledBinary(): boolean {
     (Bun as { isStandaloneExecutable?: boolean }).isStandaloneExecutable === true
   )
     return true;
-  // Bun <= 1.3.x doesn't set isStandaloneExecutable, and its standalone-EXE
-  // virtual filesystem path differs by OS (/$bunfs on unix, ~BUN on Windows),
-  // so import.meta.url heuristics aren't portable. Instead: a compiled binary's
-  // process.execPath is our app binary, not the bun/node interpreter.
+  // Bun <= 1.3.x doesn't set isStandaloneExecutable. Its standalone-EXE bundles
+  // run modules from a virtual filesystem root (/$bunfs on unix, ~BUN / B:\~BUN
+  // on Windows); that's a reliable signal that survives renaming the binary.
+  const url = import.meta.url;
+  if (url.includes("/$bunfs/") || /(?:^|\/|\\)~BUN(?:\/|\\)/i.test(url) || url.includes("B:\\~BUN"))
+    return true;
+  // Fallback: a compiled binary's process.execPath is our app binary, not the
+  // bun/node interpreter. (Misfires only if a user renames it to node/bun.)
   return !/^(node|bun)(\.exe)?$/i.test(path.basename(process.execPath));
 }
 
