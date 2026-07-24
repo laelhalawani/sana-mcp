@@ -68,6 +68,10 @@ export interface SyncState {
   // 1 while a login-triggered catch-up sync is running; data tools are blocked
   // until it clears. Set on login, cleared by the daemon once fully caught up.
   blocking: number;
+  // Timestamp of the most recent catch-up request (set on login). The daemon
+  // only clears `blocking` if the sync cycle it is finishing STARTED at/after
+  // this time, so a login racing an in-flight cycle isn't reported "complete".
+  catchup_epoch_ms: number | null;
   error: string | null;
   updated_ms: number;
 }
@@ -151,6 +155,7 @@ export class SanaStore {
         daemon_pid INTEGER,
         daemon_heartbeat_ms INTEGER,
         blocking INTEGER NOT NULL DEFAULT 1,
+        catchup_epoch_ms INTEGER,
         error TEXT,
         updated_ms INTEGER NOT NULL
       );
@@ -164,6 +169,8 @@ export class SanaStore {
       );
     if (!hasCol("sync_state", "blocking"))
       this.db.exec(`ALTER TABLE sync_state ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1`);
+    if (!hasCol("sync_state", "catchup_epoch_ms"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN catchup_epoch_ms INTEGER`);
     if (!hasCol("meetings", "processing_phase"))
       this.db.exec(`ALTER TABLE meetings ADD COLUMN processing_phase TEXT`);
     if (!hasCol("meeting_metadata", "has_recording"))
@@ -549,7 +556,7 @@ export class SanaStore {
   private static readonly SYNC_COLS = [
     "phase", "message", "meetings_total", "transcripts_done", "transcripts_total",
     "last_full_sync_ms", "last_incremental_ms", "daemon_pid", "daemon_heartbeat_ms",
-    "blocking", "error",
+    "blocking", "catchup_epoch_ms", "error",
   ] as const;
 
   updateSyncState(patch: Partial<Omit<SyncState, "updated_ms">>): void {
@@ -562,6 +569,54 @@ export class SanaStore {
       }
     }
     this.db.prepare(`UPDATE sync_state SET ${sets.join(", ")} WHERE id = 1`).run(params);
+  }
+
+  /**
+   * Finalize a sync cycle and, atomically, clear the login block ONLY if the
+   * cycle both finished its work and started at/after the pending catch-up
+   * request. Doing the epoch comparison and the `blocking` write in one SQL
+   * statement closes the cross-process read-modify-write window against a login
+   * that commits `blocking:1` mid-cycle.
+   */
+  finishSyncCycle(patch: {
+    message: string;
+    meetings_total: number;
+    transcripts_total: number;
+    transcripts_done: number;
+    last_full_sync_ms: number | null;
+    last_incremental_ms: number;
+    workDone: boolean;
+    cycleStart: number;
+  }): void {
+    this.db
+      .prepare(
+        `UPDATE sync_state SET
+           phase = 'synced',
+           message = @message,
+           meetings_total = @meetings_total,
+           transcripts_total = @transcripts_total,
+           transcripts_done = @transcripts_done,
+           last_full_sync_ms = @last_full_sync_ms,
+           last_incremental_ms = @last_incremental_ms,
+           blocking = CASE
+             WHEN @workDone = 1
+               AND (catchup_epoch_ms IS NULL OR catchup_epoch_ms <= @cycleStart)
+             THEN 0 ELSE blocking END,
+           error = NULL,
+           updated_ms = @updated_ms
+         WHERE id = 1`
+      )
+      .run({
+        message: patch.message,
+        meetings_total: patch.meetings_total,
+        transcripts_total: patch.transcripts_total,
+        transcripts_done: patch.transcripts_done,
+        last_full_sync_ms: patch.last_full_sync_ms,
+        last_incremental_ms: patch.last_incremental_ms,
+        workDone: patch.workDone ? 1 : 0,
+        cycleStart: patch.cycleStart,
+        updated_ms: Date.now(),
+      });
   }
 
   close(): void {

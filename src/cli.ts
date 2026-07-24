@@ -56,7 +56,7 @@ program
   });
 
 program
-  .argument("[tool]", "tool name (help, login, status, list, read)", "help")
+  .argument("[tool]", "tool name (help, login, status, list, read)")
   .argument("[json]", "optional JSON args, e.g. '{\"limit\":10}'")
   .option("--email <email>")
   .option("--code <code>", "confirmation code for login step 2")
@@ -64,7 +64,23 @@ program
   .option("--limit <n>", "list limit")
   .option("--query <q>", "filter meetings by title")
   .option("--no-timestamps", "omit timestamps in transcript")
-  .action(async (tool: string, json: string | undefined, opts: Record<string, unknown>) => {
+  .action(async (tool: string | undefined, json: string | undefined, opts: Record<string, unknown>) => {
+    // Bare `sana-mcp` (no tool, no flags) opens the interactive configurer.
+    const bareInvocation =
+      !tool &&
+      !json &&
+      !opts.email &&
+      !opts.code &&
+      !opts.id &&
+      !opts.limit &&
+      !opts.query &&
+      opts.timestamps !== false;
+    if (bareInvocation) {
+      const { runInstall } = await import("./install/install.js");
+      await runInstall();
+      process.exit(0);
+    }
+
     let args: Record<string, unknown> = {};
     if (json) {
       try {
@@ -81,7 +97,7 @@ program
     if (opts.query) args.query = opts.query;
     if (opts.timestamps === false) args.timestamps = false;
 
-    const out = await sana(tool, args);
+    const out = await sana(tool ?? "help", args);
     console.log(out);
     process.exit(0);
   });

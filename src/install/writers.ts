@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import * as TOML from "@iarna/toml";
-import { Document, parseDocument } from "yaml";
+import { Document, parseDocument, isSeq } from "yaml";
 import { parse as parseJsonc, modify, applyEdits, type ParseError } from "jsonc-parser";
 import type { ServerTarget } from "./server-target.js";
 
@@ -17,6 +17,60 @@ function entryObject(entry: ServerTarget): Record<string, unknown> {
   const o: Record<string, unknown> = { command: entry.command, args: entry.args };
   if (entry.env && Object.keys(entry.env).length) o.env = entry.env;
   return o;
+}
+
+/**
+ * Write `content` to `file` atomically: write a sibling temp file, then rename
+ * over the target. A crash mid-write leaves the original intact instead of a
+ * truncated config. `mkdirSync` first so a fresh file's parent dir exists.
+ */
+function atomicWrite(file: string, content: string): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.sana-mcp.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, content);
+  try {
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // Windows can't always rename over an existing file. Fall back to replace,
+    // but first stash the original so a failed second rename can't lose it.
+    if ((e as NodeJS.ErrnoException).code === "EEXIST" || (e as NodeJS.ErrnoException).code === "EPERM") {
+      const bak = `${file}.sana-mcp.${process.pid}.bak`;
+      let stashed = false;
+      try {
+        fs.renameSync(file, bak); // move original aside (no data lost yet)
+        stashed = true;
+      } catch {
+        /* original may not exist / not movable; proceed */
+      }
+      try {
+        fs.renameSync(tmp, file);
+        if (stashed) fs.rmSync(bak, { force: true }); // success: drop the backup
+      } catch (e2) {
+        // Restore the original so the config is never left missing.
+        if (stashed) {
+          try {
+            fs.rmSync(file, { force: true });
+            fs.renameSync(bak, file);
+          } catch {
+            /* best effort restore */
+          }
+        }
+        try {
+          fs.rmSync(tmp, { force: true });
+        } catch {
+          /* ignore */
+        }
+        throw e2;
+      }
+    } else {
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        /* ignore cleanup failure */
+      }
+      throw e;
+    }
+  }
 }
 
 // ---- JSON (mcpServers / context_servers / ...) --------------------------
@@ -61,8 +115,7 @@ export function upsertJsonServer(
   if (dryRun) return "ok";
   servers[name] = { ...cur, ...obj };
   data[topKey] = servers;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+  atomicWrite(file, JSON.stringify(data, null, 2) + "\n");
   return "ok";
 }
 
@@ -101,8 +154,7 @@ export function upsertTomlServer(
   if (raw === null) {
     if (dryRun) return "ok";
     const doc = { mcp_servers: { [name]: obj } } as unknown as TOML.JsonMap;
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, TOML.stringify(doc));
+    atomicWrite(file, TOML.stringify(doc));
     return "ok";
   }
 
@@ -124,17 +176,25 @@ export function upsertTomlServer(
   } else {
     // Present but different: full rewrite (loses comments; rare).
     doc.mcp_servers = { ...servers, [name]: obj };
-    fs.writeFileSync(file, TOML.stringify(doc as unknown as TOML.JsonMap));
+    atomicWrite(file, TOML.stringify(doc as unknown as TOML.JsonMap));
   }
   return "ok";
 }
 
 // ---- YAML list (Continue ~/.continue/config.yaml -> mcpServers: [...]) ----
 
+interface YamlSeq {
+  items: unknown[];
+}
 interface YamlMap {
-  get: (k: string) => { items: unknown[] } | null;
+  get: (k: string) => unknown;
   set: (k: string, v: unknown) => void;
   delete: (k: string) => void;
+}
+/** A YAML node is our mcpServers list only if it's a real sequence (not a map,
+ * whose `.items` are Pairs). */
+function asSeq(node: unknown): YamlSeq | null {
+  return isSeq(node) ? (node as unknown as YamlSeq) : null;
 }
 interface YamlDoc {
   contents: YamlMap | null;
@@ -186,10 +246,13 @@ export function upsertYamlServerList(
 ): WriteResult {
   const { fresh, doc } = readYamlDoc(file);
   if (!doc || !doc.contents) return "skipped-unparseable";
-  let list = doc.contents.get("mcpServers");
-  if (!list || !Array.isArray(list.items)) {
+  const existing = doc.contents.get("mcpServers");
+  // If mcpServers exists but is not a sequence (e.g. a map), don't corrupt it.
+  if (existing != null && !isSeq(existing)) return "skipped-unparseable";
+  let list = asSeq(existing);
+  if (!list) {
     doc.contents.set("mcpServers", doc.createNode([]));
-    list = doc.contents.get("mcpServers");
+    list = asSeq(doc.contents.get("mcpServers"));
   }
   if (!list) return "skipped-unparseable";
   const obj = continueEntry(name, entry);
@@ -199,22 +262,21 @@ export function upsertYamlServerList(
   const node = doc.createNode(obj);
   if (idx >= 0) list.items[idx] = node;
   else list.items.push(node);
-  if (fresh) fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, doc.toString());
+  atomicWrite(file, doc.toString());
   return "ok";
 }
 
 export function removeYamlServerList(file: string, name: string, dryRun = false): WriteResult {
   const { fresh, doc } = readYamlDoc(file);
   if (!doc || !doc.contents || fresh) return "noop";
-  const list = doc.contents.get("mcpServers");
-  if (!list || !Array.isArray(list.items)) return "noop";
+  const list = asSeq(doc.contents.get("mcpServers"));
+  if (!list) return "noop";
   const before = list.items.length;
   list.items = list.items.filter((it) => yEntry(it)?.name !== name);
   if (list.items.length === before) return "noop";
   if (dryRun) return "ok";
   if (list.items.length === 0) doc.contents.delete("mcpServers");
-  fs.writeFileSync(file, doc.toString());
+  atomicWrite(file, doc.toString());
   return "ok";
 }
 
@@ -235,7 +297,7 @@ export function removeJsonServer(
   delete servers[name];
   if (Object.keys(servers).length) data[topKey] = servers;
   else delete data[topKey];
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+  atomicWrite(file, JSON.stringify(data, null, 2) + "\n");
   return "ok";
 }
 
@@ -259,7 +321,7 @@ export function removeTomlServer(file: string, name: string, dryRun = false): Wr
   delete servers[name];
   if (Object.keys(servers).length) doc.mcp_servers = servers;
   else delete doc.mcp_servers;
-  fs.writeFileSync(file, TOML.stringify(doc as unknown as TOML.JsonMap));
+  atomicWrite(file, TOML.stringify(doc as unknown as TOML.JsonMap));
   return "ok";
 }
 
@@ -322,8 +384,7 @@ export function upsertJsoncServer(
     formattingOptions: { insertSpaces: true, tabSize: 2 },
   });
   const out = applyEdits(text, edits);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, out.endsWith("\n") ? out : out + "\n");
+  atomicWrite(file, out.endsWith("\n") ? out : out + "\n");
   return "ok";
 }
 
@@ -344,6 +405,57 @@ export function removeJsoncServer(
   const edits = modify(text, [topKey, name], undefined, {
     formattingOptions: { insertSpaces: true, tabSize: 2 },
   });
-  fs.writeFileSync(file, applyEdits(text, edits));
+  atomicWrite(file, applyEdits(text, edits));
   return "ok";
+}
+
+// ---- read-only status checks (is our server registered?) -----------------
+
+/** Whether `topKey[name]` exists in a plain-JSON config. */
+export function hasJsonServer(file: string, topKey: string, name: string): boolean {
+  try {
+    const { data } = readJsonTolerant(file);
+    if (!data) return false;
+    const servers = data[topKey];
+    return !!servers && typeof servers === "object" && !Array.isArray(servers) && name in servers;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `topKey[name]` exists in a JSONC config (opencode / VS Code). */
+export function hasJsoncServer(file: string, topKey: string, name: string): boolean {
+  const { text } = readJsoncTolerant(file);
+  if (text == null) return false;
+  const data = parseJsoncSafe(text);
+  if (!data) return false;
+  const servers = data[topKey];
+  return !!servers && typeof servers === "object" && !Array.isArray(servers) && name in servers;
+}
+
+/** Whether `[mcp_servers.name]` exists in a Codex TOML config. */
+export function hasTomlServer(file: string, name: string): boolean {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return false;
+  }
+  let doc: Record<string, unknown>;
+  try {
+    doc = raw.trim() ? (TOML.parse(raw) as Record<string, unknown>) : {};
+  } catch {
+    return false;
+  }
+  const servers = doc.mcp_servers as Record<string, unknown> | undefined;
+  return !!servers && name in servers;
+}
+
+/** Whether a Continue YAML mcpServers list contains an item named `name`. */
+export function hasYamlServer(file: string, name: string): boolean {
+  const { doc } = readYamlDoc(file);
+  if (!doc || !doc.contents) return false;
+  const list = asSeq(doc.contents.get("mcpServers"));
+  if (!list) return false;
+  return list.items.some((it) => yEntry(it)?.name === name);
 }
