@@ -43,10 +43,16 @@ export function isRegistered(c: ClientDef, name: string): boolean {
         // On Windows `claude` is a .cmd shim, so go through the shell there.
         try {
           if (process.platform === "win32") {
-            const line = [inst.bin, "mcp", "get", name]
-              .map((a) => `"${String(a).replace(/"/g, '""')}"`)
-              .join(" ");
-            execSync(line, { stdio: ["ignore", "ignore", "ignore"], timeout: 4000, windowsHide: true });
+            // Use the full resolved path (via which/where) + cmd.exe so we don't
+            // depend on cmd's PATH/PATHEXT resolution; quote path and args.
+            const resolved = which(inst.bin) ?? inst.bin;
+            const q = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
+            const line = `${q(resolved)} ${["mcp", "get", name].map(q).join(" ")}`;
+            execSync(line, {
+              stdio: ["ignore", "ignore", "ignore"],
+              timeout: 4000,
+              windowsHide: true,
+            });
           } else {
             execFileSync(inst.bin, ["mcp", "get", name], {
               stdio: ["ignore", "ignore", "ignore"],
