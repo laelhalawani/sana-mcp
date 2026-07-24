@@ -1,16 +1,18 @@
+// MCP/agent-facing dispatcher. Every handler renders LLM-facing strings from
+// the presentation-agnostic core (src/core/*). The wording here is deliberately
+// agent-oriented (it coaches an LLM to call meeting_transcripts(...)); the human
+// CLI has its own renderers and must never reuse these strings.
 import { SanaClient } from "../sana/client.js";
-import { SessionExpiredError } from "../sana/types.js";
-import { SanaStore, type SyncState, type MeetingListOpts } from "../store/db.js";
+import { SanaStore } from "../store/db.js";
 import { ensureDaemonRunning } from "../sync/spawn.js";
-import { transcriptLines, renderLines } from "../sana/transcript.js";
+import { renderLines } from "../sana/transcript.js";
 import { renderHelp, toolListLine } from "./help.js";
-import { MAX_TRANSCRIPT_ATTEMPTS } from "../config.js";
-import {
-  semanticEnabled,
-  embedQuery,
-  searchKnn,
-  SemanticUnavailableError,
-} from "../semantic/semantic.js";
+import { semanticEnabled } from "../semantic/semantic.js";
+import { argMeetingId, fmtDate, fmtDateTime, estimateMinutes } from "../core/args.js";
+import { requestCode, verifyCode, waitForSync, COUNT_WAIT_MS } from "../core/login.js";
+import { sessionInfo, isBlocking, computeStatus } from "../core/status.js";
+import { queryMeetings, getTranscriptView, getSummaryView, getParticipants, getRecordingLink, rowStatus } from "../core/meetings.js";
+import { runSearch, snippetAround, type SearchRow, type SearchResult } from "../core/search.js";
 
 const LOGIN_HINT = 'Run meeting_transcripts("login", {"email":"you@example.com"}) to sign in.';
 const EXPIRED_MSG = `Your login has expired. To login again run meeting_transcripts("login", {"email":"you@example.com"}).`;
@@ -21,70 +23,7 @@ const LOGIN_EXPLAINER = [
   'then call meeting_transcripts("login", {"email":"you@example.com", "confirmation_code": <the 6 digits>}).',
 ].join("\n");
 
-function fmtDate(ms: number): string {
-  return new Date(ms).toISOString().slice(0, 10);
-}
-
-function estimateMinutes(remaining: number): number {
-  // ~0.5s per transcript (request + polite delay); round up to a minute.
-  return Math.max(1, Math.ceil((remaining * 0.5) / 60));
-}
-
-/**
- * Coerce a pagination arg to a positive integer, tolerating agents that pass
- * numbers as strings (e.g. "10"). Non-numeric/garbage falls back to `dflt`
- * rather than producing NaN, which would crash a strict SQLite LIMIT binding.
- */
-function posInt(v: unknown, dflt: number): number {
-  const n = typeof v === "string" || typeof v === "number" ? Number(v) : NaN;
-  return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : dflt;
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// The meeting count only appears after the daemon's brief "listing" phase.
-// Wait up to half the 60s MCP default so login can report it, but never risk
-// the client's request timeout.
-const COUNT_WAIT_MS = Number(process.env.SANA_COUNT_WAIT_MS ?? 30_000);
-
-/**
- * Wait (up to timeoutMs) for the login-triggered sync to finish, tracking how
- * many items remain. Returns done=true if it completes in time, otherwise the
- * last-known remaining count (or null if not even that resolved).
- */
-async function waitForSync(
-  store: SanaStore,
-  timeoutMs: number
-): Promise<{ done: boolean; count: number | null }> {
-  const end = Date.now() + timeoutMs;
-  let count: number | null = null;
-  for (;;) {
-    const s = store.getSyncState();
-    if (!syncBlocking(s)) return { done: true, count: 0 };
-    if (s.phase === "downloading" || s.phase === "synced")
-      count = Math.max(0, s.transcripts_total - s.transcripts_done);
-    if (s.phase === "needs_login" || s.phase === "error") return { done: false, count };
-    if (Date.now() >= end) return { done: false, count };
-    await sleep(300);
-  }
-}
-
-/** Whether the session looks usable without doing a network call. */
-function sessionUsable(client: SanaClient, s: SyncState): boolean {
-  return client.hasAuthCookie() && s.phase !== "needs_login";
-}
-
-/**
- * Data tools are blocked while a login-triggered catch-up sync runs. This is
- * set on every login and cleared by the daemon once fully caught up, so a
- * returning user always gets fresh content before tools respond. Ongoing
- * incremental syncs do NOT set this and stay invisible to the agent.
- */
-function syncBlocking(s: SyncState): boolean {
-  return s.blocking === 1;
-}
-
-function syncBlockedMessage(s: SyncState): string {
+function syncBlockedMessage(s: { transcripts_total: number; transcripts_done: number }): string {
   const remaining = Math.max(0, s.transcripts_total - s.transcripts_done);
   const detail =
     s.transcripts_total > 0
@@ -97,10 +36,6 @@ function syncBlockedMessage(s: SyncState): string {
   );
 }
 
-function fmtDateTime(ms: number): string {
-  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
-}
-
 async function handleLogin(args: Record<string, unknown>): Promise<string> {
   const email = typeof args.email === "string" ? args.email.trim() : "";
   if (!email) {
@@ -111,8 +46,7 @@ async function handleLogin(args: Record<string, unknown>): Promise<string> {
 
   if (codeRaw === undefined || codeRaw === null || `${codeRaw}` === "") {
     try {
-      await client.requestSignInCode(email, args.workspace_id as string | undefined);
-      client.save();
+      await requestCode(client, email, args.workspace_id as string | undefined);
     } catch (e) {
       return `Could not start sign-in for ${email}: ${(e as Error).message}`;
     }
@@ -126,73 +60,55 @@ async function handleLogin(args: Record<string, unknown>): Promise<string> {
     ].join("\n");
   }
 
+  const store = new SanaStore();
   try {
-    const user = await client.submitSignInCode(email, `${codeRaw}`);
-    client.save();
+    const { user } = await verifyCode(client, store, email, `${codeRaw}`);
 
-    const store = new SanaStore();
-    try {
-      // Every login triggers a fresh catch-up sync; block data tools until done.
-      // Reset failure counters so previously-failed transcripts are retried.
-      store.resetFailures();
-      // Stamp the catch-up request so the daemon only clears `blocking` after a
-      // sync cycle that STARTED at/after this login (not an in-flight one that
-      // listed before this login's new meetings existed).
-      store.updateSyncState({ blocking: 1, catchup_epoch_ms: Date.now() });
-      ensureDaemonRunning();
+    const head = `Logged in as ${user.email}${client.workspaceId ? ` (workspace ${client.workspaceId})` : ""}.`;
+    const tail = [
+      ``,
+      `Available tools: ${toolListLine()}.`,
+      `Use meeting_transcripts("help", {"tool":"<name>"}) for details.`,
+    ];
+    const blockedLine = `Meeting tools are unavailable until it completes. Check progress with meeting_transcripts("status").`;
 
-      const head = `Logged in as ${user.email}${client.workspaceId ? ` (workspace ${client.workspaceId})` : ""}.`;
-      const tail = [
-        ``,
-        `Available tools: ${toolListLine()}.`,
-        `Use meeting_transcripts("help", {"tool":"<name>"}) for details.`,
-      ];
-      const blockedLine =
-        `Meeting tools are unavailable until it completes. Check progress with meeting_transcripts("status").`;
-
-      const res = await waitForSync(store, COUNT_WAIT_MS);
-      if (res.done) {
-        return [head, `Sync complete. Your transcripts are up to date and all tools are available.`, ...tail].join("\n");
-      }
-      if (res.count != null) {
-        return [
-          head,
-          `Sync in progress: ${res.count} item(s) to download (about ${estimateMinutes(res.count)} min).`,
-          blockedLine,
-          ...tail,
-        ].join("\n");
-      }
-      return [head, `Sync in progress.`, blockedLine, ...tail].join("\n");
-    } finally {
-      store.close();
+    const res = await waitForSync(store, COUNT_WAIT_MS);
+    if (res.done) {
+      return [head, `Sync complete. Your transcripts are up to date and all tools are available.`, ...tail].join("\n");
     }
+    if (res.count != null) {
+      return [
+        head,
+        `Sync in progress: ${res.count} item(s) to download (about ${estimateMinutes(res.count)} min).`,
+        blockedLine,
+        ...tail,
+      ].join("\n");
+    }
+    return [head, `Sync in progress.`, blockedLine, ...tail].join("\n");
   } catch (e) {
     return `Sign-in failed: ${(e as Error).message}. Double-check the code, or request a new one with meeting_transcripts("login", {"email":"${email}"}).`;
+  } finally {
+    store.close();
   }
 }
 
-function handleStatus(store: SanaStore): string {
-  const s = store.getSyncState();
+function handleStatus(client: SanaClient, store: SanaStore): string {
+  const st = computeStatus(client, store);
   const lines: string[] = [];
-  if (syncBlocking(s)) {
-    const remaining = Math.max(0, s.transcripts_total - s.transcripts_done);
+  if (st.blocking) {
     lines.push(
-      s.transcripts_total > 0
-        ? `Sync in progress: ${s.transcripts_done}/${s.transcripts_total} transcripts (~${estimateMinutes(
-            remaining
-          )} min remaining).`
+      st.transcriptsTotal > 0
+        ? `Sync in progress: ${st.transcriptsDone}/${st.transcriptsTotal} transcripts (~${st.etaMinutes} min remaining).`
         : `Sync in progress: building the meeting list.`
     );
     lines.push("Meeting tools are unavailable until it completes.");
   } else {
-    lines.push(
-      `Up to date. ${store.countMeetings()} meetings, ${store.countTranscripts()} transcripts stored.`
-    );
+    lines.push(`Up to date. ${st.meetings} meetings, ${st.transcripts} transcripts stored.`);
     lines.push("New meetings sync automatically shortly after they end.");
   }
-  if (s.last_full_sync_ms) lines.push(`Last sync: ${new Date(s.last_full_sync_ms).toISOString()}.`);
-  if (semanticEnabled())
-    lines.push(`Semantic search: on (${store.countEmbedded()}/${store.countTranscripts()} transcripts embedded).`);
+  if (st.lastFullSyncMs) lines.push(`Last sync: ${new Date(st.lastFullSyncMs).toISOString()}.`);
+  if (st.semantic.enabled)
+    lines.push(`Semantic search: on (${st.semantic.embedded}/${st.semantic.total} transcripts embedded).`);
   return lines.join("\n");
 }
 
@@ -201,139 +117,76 @@ function escCell(s: string): string {
   return s.replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
 }
 
-/** Accept an ISO date/datetime string or an epoch-ms number. */
-function parseDateMs(v: unknown, endOfDay = false): number | undefined {
-  if (v == null) return undefined;
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(v);
-    const ms = Date.parse(dateOnly ? `${v}T00:00:00Z` : v);
-    if (Number.isNaN(ms)) return undefined;
-    return endOfDay && dateOnly ? ms + 86_400_000 - 1 : ms;
-  }
-  return undefined;
-}
-
-/** Extract sort/filter (date range, status) from a tool's args dict. */
-function parseFilters(args: Record<string, unknown>): {
-  status?: MeetingListOpts["status"];
-  dateFrom?: number;
-  dateTo?: number;
-} {
-  const filter =
-    args.filter && typeof args.filter === "object" ? (args.filter as Record<string, unknown>) : {};
-  const status =
-    filter.status === "ready" || filter.status === "downloading" || filter.status === "failed"
-      ? filter.status
-      : undefined;
-  const date = filter.date && typeof filter.date === "object" ? (filter.date as Record<string, unknown>) : {};
-  return {
-    status,
-    dateFrom: parseDateMs(date.from),
-    dateTo: parseDateMs(date.to, true),
-  };
-}
-
-function rowStatus(r: { has_transcript: number; attempts: number; processing_phase: string | null }): string {
-  if (r.has_transcript) return "ready";
-  if (r.processing_phase && r.processing_phase !== "done") return "processing";
-  return r.attempts >= MAX_TRANSCRIPT_ATTEMPTS ? "failed" : "downloading";
-}
-
 function handleListMeetings(store: SanaStore, args: Record<string, unknown>): string {
-  const limit = posInt(args.limit, 50);
-  const page = posInt(args.page, 1);
-  const offset = (page - 1) * limit;
-  const query = typeof args.query === "string" ? args.query : undefined;
-  const sort: MeetingListOpts["sort"] = args.sort === "oldest" ? "oldest" : "newest";
-  const { status, dateFrom, dateTo } = parseFilters(args);
-  const filter: MeetingListOpts = { query, sort, status, dateFrom, dateTo };
-
-  const rows = store.listMeetings({ ...filter, limit, offset });
-  const total = store.countMeetings(filter);
-  if (rows.length === 0) {
-    if (total === 0) return "No meetings match those criteria.";
-    return `No meetings on page ${page} (${total} match; ${Math.ceil(total / limit)} page(s)).`;
+  const p = queryMeetings(store, args);
+  if (p.rows.length === 0) {
+    if (p.total === 0) return "No meetings match those criteria.";
+    return `No meetings on page ${p.page} (${p.total} match; ${Math.ceil(p.total / p.limit)} page(s)).`;
   }
 
-  const n = rows.length;
+  const n = p.rows.length;
   const before =
-    n === total
+    n === p.total
       ? `Showing ${n} meeting transcripts.`
-      : `Showing ${n} out of ${total} meeting transcripts.`;
+      : `Showing ${n} out of ${p.total} meeting transcripts.`;
 
   const table = [
     `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | status (ready/downloading/processing/failed) | title (string) |`,
     `|---|---|---|---|`,
-    ...rows.map(
+    ...p.rows.map(
       (r) => `| ${fmtDateTime(r.created_at_ms)} | ${r.id} | ${rowStatus(r)} | ${escCell(r.name)} |`
     ),
   ];
 
   const out = [before, "", ...table];
-  if (offset + n < total) {
-    out.push("", `Use meeting_transcripts("list", {"page":${page + 1}}) to see the next page.`);
+  if (p.hasMore) {
+    out.push("", `Use meeting_transcripts("list", {"page":${p.page + 1}}) to see the next page.`);
   }
-  out.push(
-    "",
-    `Per meeting (by id): read (transcript), summary, participants, recording.`
-  );
+  out.push("", `Per meeting (by id): read (transcript), summary, participants, recording.`);
   return out.join("\n");
 }
 
 function handleReadTranscript(store: SanaStore, args: Record<string, unknown>): string {
-  const id = typeof args.meeting_id === "string" ? args.meeting_id : typeof args.id === "string" ? args.id : "";
+  const id = argMeetingId(args);
   if (!id)
     return 'Provide a meeting id: meeting_transcripts("read", {"meeting_id":"..."}). Get ids from meeting_transcripts("list") or "search".';
-  const meeting = store.getMeeting(id);
-  const t = store.getTranscript(id);
-  if (!meeting && !t) {
-    const s = store.getSyncState();
-    if (s.phase === "listing" || s.phase === "idle")
-      return "Still syncing the meeting list. Try again in a few seconds.";
-    return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
-  }
-  if (!t) {
-    const s = store.getSyncState();
-    const remaining = Math.max(0, s.transcripts_total - s.transcripts_done);
-    if (s.phase === "downloading")
-      return `The transcript for "${meeting?.name ?? id}" hasn't been downloaded yet (${s.transcripts_done}/${s.transcripts_total} done). Check back in ~${estimateMinutes(
-        remaining
-      )} min.`;
-    return `No transcript available for "${meeting?.name ?? id}".`;
-  }
+  const v = getTranscriptView(store, id);
+  if (v.kind === "still-listing") return "Still syncing the meeting list. Try again in a few seconds.";
+  if (v.kind === "no-meeting") return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
+  if (v.kind === "not-downloaded")
+    return `The transcript for "${v.name}" hasn't been downloaded yet (${v.done}/${v.total} done). Check back in ~${v.etaMinutes} min.`;
+  if (v.kind === "no-transcript") return `No transcript available for "${v.name}".`;
 
-  const lines = transcriptLines(JSON.parse(t.json));
   const withTs = args.timestamps === undefined ? true : Boolean(args.timestamps);
-  const title = meeting?.name ?? id;
-  const dateStr = meeting ? fmtDate(meeting.created_at_ms) : "";
-
-  const header = `# ${title}\n${dateStr} | ${lines.length} lines | ${t.word_count} words`;
+  const dateStr = v.dateMs != null ? fmtDate(v.dateMs) : "";
+  const header = `# ${v.name}\n${dateStr} | ${v.lineCount} lines | ${v.wordCount} words`;
 
   const full = args.full === true;
-  const range = Array.isArray(args.lines) ? (args.lines as unknown[]).map(Number).filter((n) => Number.isFinite(n)) : null;
+  const range = Array.isArray(args.lines)
+    ? (args.lines as unknown[]).map(Number).filter((n) => Number.isFinite(n))
+    : null;
 
   // No selection -> don't dump; report size and offer options.
   if (!full && (!range || range.length === 0)) {
     return [
       header,
       "",
-      `This transcript has ${lines.length} lines. Choose how to read it:`,
+      `This transcript has ${v.lineCount} lines. Choose how to read it:`,
       `- Whole thing:  meeting_transcripts("read", {"meeting_id":"${id}", "full":true})`,
       `- A range:      meeting_transcripts("read", {"meeting_id":"${id}", "lines":[start, end]})`,
       `  (one line = one thing said by a person; line numbers come from "search" or a prior read)`,
     ].join("\n");
   }
 
-  let selected = lines;
+  let selected = v.lines;
   let rangeNote = "all lines";
   if (!full && range && range.length > 0) {
     const start = Math.max(1, range[0]);
     const end = range.length >= 2 ? Math.max(start, range[1]) : start;
-    selected = lines.filter((l) => l.n >= start && l.n <= end);
+    selected = v.lines.filter((l) => l.n >= start && l.n <= end);
     rangeNote = `lines ${start}-${end}`;
     if (selected.length === 0)
-      return `${header}\n\nNo lines in ${rangeNote}. Valid range is 1-${lines.length}.`;
+      return `${header}\n\nNo lines in ${rangeNote}. Valid range is 1-${v.lineCount}.`;
   }
 
   return `${header} | showing ${rangeNote}\n\n${renderLines(selected, {
@@ -342,119 +195,77 @@ function handleReadTranscript(store: SanaStore, args: Record<string, unknown>): 
   })}`;
 }
 
-function argMeetingId(args: Record<string, unknown>): string {
-  return typeof args.meeting_id === "string" ? args.meeting_id : typeof args.id === "string" ? args.id : "";
-}
-
 function handleSummary(store: SanaStore, args: Record<string, unknown>): string {
   const id = argMeetingId(args);
   if (!id) return 'Provide a meeting id: meeting_transcripts("summary", {"meeting_id":"..."}).';
-  const meeting = store.getMeeting(id);
-  const meta = store.getMetadata(id);
-  if (!meeting && !meta) return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
-  if (!meta) return `No summary available yet for "${meeting?.name ?? id}".`;
+  const r = getSummaryView(store, id);
+  if (r.kind === "no-meeting") return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
+  if (r.kind === "none") return `No summary available yet for "${r.name}".`;
+  const v = r.view;
 
-  const out: string[] = [`# ${meeting?.name ?? id}`, meeting ? fmtDate(meeting.created_at_ms) : ""];
-  if (meta.summary_short) out.push("", `Short summary: ${meta.summary_short}`);
-  if (meta.summary) out.push("", "Summary:", meta.summary);
-  if (meta.notes_json) {
-    try {
-      const parsed = JSON.parse(meta.notes_json) as {
-        notes?: { topic?: string; notes?: string[] }[] | null;
-        actionItems?: { assignedTo?: string | null; action?: string; dueDate?: string | null }[] | null;
-      };
-      const ai = Array.isArray(parsed.actionItems) ? parsed.actionItems : [];
-      if (ai.length) {
-        out.push("", "Action items:");
-        for (const a of ai) {
-          const tags = [a.assignedTo ? `assignee: ${a.assignedTo}` : "", a.dueDate ? `due: ${a.dueDate}` : ""]
-            .filter(Boolean)
-            .join("; ");
-          out.push(`- ${a.action ?? ""}${tags ? ` (${tags})` : ""}`);
-        }
-      }
-      const notes = Array.isArray(parsed.notes) ? parsed.notes : [];
-      if (notes.length) {
-        out.push("", "Notes:");
-        for (const nt of notes) {
-          out.push(`- ${nt.topic ?? "Topic"}: ${Array.isArray(nt.notes) ? nt.notes.join(" ") : ""}`);
-        }
-      }
-    } catch {
-      // ignore malformed metadata
+  const out: string[] = [`# ${v.name}`, v.dateMs != null ? fmtDate(v.dateMs) : ""];
+  if (v.summaryShort) out.push("", `Short summary: ${v.summaryShort}`);
+  if (v.summary) out.push("", "Summary:", v.summary);
+  if (v.actionItems.length) {
+    out.push("", "Action items:");
+    for (const a of v.actionItems) {
+      const tags = [a.assignedTo ? `assignee: ${a.assignedTo}` : "", a.dueDate ? `due: ${a.dueDate}` : ""]
+        .filter(Boolean)
+        .join("; ");
+      out.push(`- ${a.action ?? ""}${tags ? ` (${tags})` : ""}`);
     }
   }
-  if (out.filter((l) => l).length <= 2) return `No summary available for "${meeting?.name ?? id}".`;
+  if (v.notes.length) {
+    out.push("", "Notes:");
+    for (const nt of v.notes) out.push(`- ${nt.topic}: ${nt.notes.join(" ")}`);
+  }
   return out.join("\n");
 }
 
 function handleParticipants(store: SanaStore, args: Record<string, unknown>): string {
   const id = argMeetingId(args);
   if (!id) return 'Provide a meeting id: meeting_transcripts("participants", {"meeting_id":"..."}).';
-  const meeting = store.getMeeting(id);
-  const meta = store.getMetadata(id);
-  if (!meeting && !meta) return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
-  let ps: { displayName?: string; email?: string; isHost?: boolean }[] = [];
-  try {
-    ps = meta?.participants_json ? JSON.parse(meta.participants_json) : [];
-  } catch {
-    ps = [];
-  }
-  if (!ps.length) return `No participant information for "${meeting?.name ?? id}".`;
+  const r = getParticipants(store, id);
+  if (r.kind === "no-meeting") return `No meeting with id "${id}". Use meeting_transcripts("list") to find valid ids.`;
+  if (r.kind === "none") return `No participant information for "${r.name}".`;
   const table = [
-    `Participants for "${meeting?.name ?? id}" (${ps.length}):`,
+    `Participants for "${r.name}" (${r.participants.length}):`,
     "",
     `| name (string) | email (string) | host (yes/no) |`,
     `|---|---|---|`,
-    ...ps.map(
+    ...r.participants.map(
       (p) => `| ${escCell(p.displayName || "")} | ${escCell(p.email || "")} | ${p.isHost ? "yes" : "no"} |`
     ),
   ];
   return table.join("\n");
 }
 
-function snippetAround(text: string, query: string, pad = 80): string {
-  const i = text.toLowerCase().indexOf(query.toLowerCase());
-  if (i < 0) return text.slice(0, pad * 2).replace(/\s+/g, " ").trim();
-  const start = Math.max(0, i - pad);
-  const end = Math.min(text.length, i + query.length + pad);
-  const core = text.slice(start, end).replace(/\s+/g, " ").trim();
-  return `${start > 0 ? "..." : ""}${core}${end < text.length ? "..." : ""}`;
-}
-
-interface SearchRow {
-  meeting_id: string;
-  line_no: number;
-  text: string;
-  created_at_ms: number;
-  name: string;
-}
-
-function renderSearchResults(
-  query: string,
-  anchor: string,
-  pageItems: SearchRow[],
-  total: number,
-  page: number,
-  offset: number,
-  label: string
-): string {
+function renderSearchResults(res: Extract<SearchResult, { kind: "ok" }>): string {
+  const label =
+    res.mode === "keyword"
+      ? res.sort === "best"
+        ? "keyword, ranked by relevance"
+        : `keyword, ${res.sort}`
+      : res.sort === "best"
+        ? "hybrid: keyword + semantic"
+        : `hybrid, ${res.sort}`;
+  const { query, anchor, rows, total, page, offset } = res;
   const before =
-    pageItems.length === total
+    rows.length === total
       ? `Showing ${total} matching lines for "${query}" (${label}).`
-      : `Showing ${pageItems.length} out of ${total} matching lines for "${query}" (${label}).`;
+      : `Showing ${rows.length} out of ${total} matching lines for "${query}" (${label}).`;
   const table = [
     `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | line (int) | title (string) | snippet (string) |`,
     `|---|---|---|---|---|`,
-    ...pageItems.map(
-      (r) =>
+    ...rows.map(
+      (r: SearchRow) =>
         `| ${fmtDateTime(r.created_at_ms)} | ${r.meeting_id} | ${r.line_no} | ${escCell(r.name)} | ${escCell(
           snippetAround(r.text, anchor)
         )} |`
     ),
   ];
   const out = [before, ``, ...table];
-  if (offset + pageItems.length < total) {
+  if (offset + rows.length < total) {
     out.push(
       ``,
       `Use meeting_transcripts("search", {"query":"${query.replace(/"/g, '\\"')}", "page":${page + 1}}) to see the next page.`
@@ -465,136 +276,45 @@ function renderSearchResults(
 }
 
 async function handleSearch(store: SanaStore, args: Record<string, unknown>): Promise<string> {
-  const query = typeof args.query === "string" ? args.query.trim() : "";
-  if (!query) {
-    return 'Provide a search query: meeting_transcripts("search", {"query":"..."}). Optional: page, limit, sort, filter.';
-  }
-  // Tokenize into unicode word terms, AND-ed as quoted FTS terms (safe from
-  // FTS5 operator syntax; matches whole words).
-  const terms = query.match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (terms.length === 0) return `No searchable words in "${query}".`;
-  const match = terms.map((t) => `"${t}"`).join(" ");
-  const anchor = terms[0] ?? query;
-
-  const limit = Math.min(posInt(args.limit, 10), 100);
-  const page = posInt(args.page, 1);
-  const offset = (page - 1) * limit;
-  const sort = args.sort === "newest" || args.sort === "oldest" ? args.sort : "best";
-  const { dateFrom, dateTo } = parseFilters(args);
-
-  // --- keyword-only (BM25) when semantic search is disabled ---
-  if (!semanticEnabled()) {
-    let rows: SearchRow[], total: number;
-    try {
-      total = store.countLineMatches(match, { dateFrom, dateTo });
-      rows = store.searchLines(match, { limit, offset, sort, dateFrom, dateTo });
-    } catch (e) {
-      return `Could not run search for "${query}": ${(e as Error).message}`;
-    }
-    if (rows.length === 0) {
-      if (total === 0) return `No transcript lines match "${query}".`;
-      return `No results on page ${page} (${total} match; ${Math.ceil(total / limit)} page(s)).`;
-    }
-    const label = sort === "best" ? "keyword, ranked by relevance" : `keyword, ${sort}`;
-    return renderSearchResults(query, anchor, rows, total, page, offset, label);
-  }
-
-  // --- hybrid (BM25 + semantic vectors, fused via Reciprocal Rank Fusion) ---
-  const POOL = 60;
-  const RRF_K = 60;
-  let kw: SearchRow[];
-  try {
-    kw = store.searchLines(match, { limit: POOL, offset: 0, sort: "best", dateFrom, dateTo });
-  } catch (e) {
-    return `Could not run search for "${query}": ${(e as Error).message}`;
-  }
-
-  const meetingCache = new Map<string, ReturnType<typeof store.getMeeting>>();
-  const linesCache = new Map<string, { n: number; text: string }[]>();
-  const resolve = (mid: string, ln: number): SearchRow | null => {
-    let m = meetingCache.get(mid);
-    if (m === undefined) {
-      m = store.getMeeting(mid);
-      meetingCache.set(mid, m);
-    }
-    if (!m) return null;
-    let lines = linesCache.get(mid);
-    if (!lines) {
-      const t = store.getTranscript(mid);
-      try {
-        lines = t ? transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text })) : [];
-      } catch {
-        lines = [];
+  const res = await runSearch(store, args);
+  switch (res.kind) {
+    case "no-query":
+      return 'Provide a search query: meeting_transcripts("search", {"query":"..."}). Optional: page, limit, sort, filter.';
+    case "no-terms":
+      return `No searchable words in "${res.query}".`;
+    case "error":
+      return `Could not run search for "${res.query}": ${res.message}`;
+    case "semantic-unavailable":
+      return `Semantic search is enabled but unavailable: ${res.message} Set SANA_SEMANTIC=0 to use keyword search.`;
+    case "ok": {
+      if (res.rows.length === 0) {
+        if (res.total === 0) return `No transcript lines match "${res.query}".`;
+        return `No results on page ${res.page} (${res.total} match${
+          res.mode === "keyword" ? `; ${Math.ceil(res.total / res.limit)} page(s)` : ""
+        }).`;
       }
-      linesCache.set(mid, lines);
+      return renderSearchResults(res);
     }
-    const line = lines.find((l) => l.n === ln);
-    return line
-      ? { meeting_id: mid, line_no: ln, text: line.text, created_at_ms: m.created_at_ms, name: m.name }
-      : null;
-  };
-
-  const fused = new Map<string, { row: SearchRow; score: number }>();
-  const add = (row: SearchRow, rank: number) => {
-    const key = `${row.meeting_id}:${row.line_no}`;
-    const inc = 1 / (RRF_K + rank);
-    const cur = fused.get(key);
-    if (cur) cur.score += inc;
-    else fused.set(key, { row, score: inc });
-  };
-  kw.forEach((r, i) => add(r, i));
-
-  try {
-    const qv = await embedQuery(query);
-    const knn = await searchKnn(store.db, qv, { k: POOL, dateFrom, dateTo });
-    knn.forEach((h, i) => {
-      const row = resolve(h.meeting_id, h.line_no);
-      if (row) add(row, i);
-    });
-  } catch (e) {
-    if (e instanceof SemanticUnavailableError) {
-      return `Semantic search is enabled but unavailable: ${e.message} Set SANA_SEMANTIC=0 to use keyword search.`;
-    }
-    // Any other embedding error: fall back to the keyword results already fused.
   }
-
-  const items = [...fused.values()];
-  if (items.length === 0) return `No transcript lines match "${query}".`;
-  items.sort((a, b) =>
-    sort === "newest"
-      ? b.row.created_at_ms - a.row.created_at_ms
-      : sort === "oldest"
-        ? a.row.created_at_ms - b.row.created_at_ms
-        : b.score - a.score
-  );
-  const total = items.length;
-  const pageItems = items.slice(offset, offset + limit).map((x) => x.row);
-  if (pageItems.length === 0) return `No results on page ${page} (${total} match).`;
-  const label = sort === "best" ? "hybrid: keyword + semantic" : `hybrid, ${sort}`;
-  return renderSearchResults(query, anchor, pageItems, total, page, offset, label);
 }
 
-/**
- * Fetch a fresh, temporary recording link on demand. This is the only data
- * tool that hits the network (recording URLs are signed and expire), keeping
- * read/list/search fully local.
- */
 async function handleRecording(
   client: SanaClient,
   store: SanaStore,
   args: Record<string, unknown>
 ): Promise<string> {
-  const id = typeof args.meeting_id === "string" ? args.meeting_id : typeof args.id === "string" ? args.id : "";
+  const id = argMeetingId(args);
   if (!id) return 'Provide a meeting id: meeting_transcripts("recording", {"meeting_id":"..."}).';
-  const name = store.getMeeting(id)?.name ?? id;
-  try {
-    const info = await client.getMeetingById(id);
-    const url = info?.recordingUrl || info?.fallbackRecordingUrl;
-    if (!url) return `No recording available for "${name}".`;
-    return `Recording for "${name}" (temporary signed URL, expires in a few hours):\n${url}`;
-  } catch (e) {
-    if (e instanceof SessionExpiredError) return EXPIRED_MSG;
-    return `Could not fetch the recording link: ${(e as Error).message}`;
+  const r = await getRecordingLink(client, store, id);
+  switch (r.kind) {
+    case "ok":
+      return `Recording for "${r.name}" (temporary signed URL, expires in a few hours):\n${r.url}`;
+    case "none":
+      return `No recording available for "${r.name}".`;
+    case "expired":
+      return EXPIRED_MSG;
+    case "error":
+      return `Could not fetch the recording link: ${r.message}`;
   }
 }
 
@@ -611,9 +331,9 @@ export async function sana(tool: string, args: Record<string, unknown> = {}): Pr
     let notice: string | undefined;
     try {
       const s = store.getSyncState();
-      const loggedIn = client.hasAuthCookie() && s.phase !== "needs_login";
-      if (!loggedIn) notice = LOGIN_EXPLAINER;
-      else if (syncBlocking(s)) notice = syncBlockedMessage(s);
+      const sess = sessionInfo(client, s);
+      if (!sess.loggedIn) notice = LOGIN_EXPLAINER;
+      else if (isBlocking(s)) notice = syncBlockedMessage(s);
     } finally {
       store.close();
     }
@@ -626,20 +346,21 @@ export async function sana(tool: string, args: Record<string, unknown> = {}): Pr
   const store = new SanaStore();
   try {
     const s = store.getSyncState();
-    if (!client.hasAuthCookie()) {
+    const sess = sessionInfo(client, s);
+    if (!sess.hasCookie) {
       return `You are not logged in. ${LOGIN_HINT}`;
     }
-    if (!sessionUsable(client, s)) {
+    if (!sess.loggedIn) {
       return EXPIRED_MSG;
     }
     // Make sure the background syncer is alive (non-blocking).
     ensureDaemonRunning();
 
     // status stays available during a catch-up sync; data tools do not.
-    const blocked = syncBlocking(s) ? syncBlockedMessage(s) : null;
+    const blocked = isBlocking(s) ? syncBlockedMessage(s) : null;
     switch (name) {
       case "status":
-        return handleStatus(store);
+        return handleStatus(client, store);
       case "list_meetings":
       case "list":
         return blocked ?? handleListMeetings(store, args);
