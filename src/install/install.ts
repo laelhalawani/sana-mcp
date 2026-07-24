@@ -48,7 +48,13 @@ function safeDetect(c: ClientDef): boolean {
  */
 function runCommandClient(bin: string, args: string[]): void {
   if (process.platform === "win32") {
-    const line = [bin, ...args].map((a) => `"${String(a).replace(/"/g, '""')}"`).join(" ");
+    // Resolve the binary to a full path (which() -> where.exe) so we don't
+    // depend on cmd's PATH/PATHEXT resolution, which is fragile. A `.cmd`/`.ps1`
+    // shim still can't be exec'd directly by CreateProcess, so go through
+    // cmd.exe; quote the resolved path and each arg (call/cmd handles the shim).
+    const resolved = which(bin) ?? bin;
+    const q = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
+    const line = `${q(resolved)} ${args.map(q).join(" ")}`;
     execSync(line, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     return;
   }
