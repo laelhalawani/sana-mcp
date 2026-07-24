@@ -6,9 +6,11 @@ import { CLIENTS, type ClientDef } from "./clients.js";
 import { serverTarget, type ServerTarget } from "./server-target.js";
 import {
   upsertJsonServer,
+  upsertJsoncServer,
   upsertTomlServer,
   upsertYamlServerList,
   removeJsonServer,
+  removeJsoncServer,
   removeTomlServer,
   removeYamlServerList,
   type WriteResult,
@@ -51,6 +53,15 @@ function applyClient(
     const file = inst.path();
     if (!file) return { status: "skipped", detail: "not supported on this platform" };
     return mapWrite(upsertJsonServer(file, inst.topKey, name, entry, dryRun), file, dryRun);
+  }
+  if (inst.kind === "file-jsonc") {
+    const file = inst.path();
+    if (!file) return { status: "skipped", detail: "not supported on this platform" };
+    return mapWrite(
+      upsertJsoncServer(file, inst.topKey, name, entry, inst.build, dryRun),
+      file,
+      dryRun
+    );
   }
   if (inst.kind === "file-toml") {
     const file = inst.path();
@@ -141,6 +152,11 @@ function applyRemove(c: ClientDef, name: string, dryRun: boolean): ApplyResult {
     const file = inst.path();
     if (!file) return { status: "skipped", detail: "not supported on this platform" };
     return mapWrite(removeJsonServer(file, inst.topKey, name, dryRun), file, dryRun);
+  }
+  if (inst.kind === "file-jsonc") {
+    const file = inst.path();
+    if (!file) return { status: "skipped", detail: "not supported on this platform" };
+    return mapWrite(removeJsoncServer(file, inst.topKey, name, dryRun), file, dryRun);
   }
   if (inst.kind === "file-toml") {
     const file = inst.path();

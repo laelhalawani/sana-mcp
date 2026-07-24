@@ -5,9 +5,13 @@ import fs from "node:fs";
 import path from "node:path";
 import * as TOML from "@iarna/toml";
 import { Document, parseDocument } from "yaml";
+import { parse as parseJsonc, modify, applyEdits, type ParseError } from "jsonc-parser";
 import type { ServerTarget } from "./server-target.js";
 
 export type WriteResult = "ok" | "noop" | "skipped-unparseable";
+
+/** Builds the per-server config value written under topKey[name]. */
+export type EntryBuilder = (entry: ServerTarget) => Record<string, unknown>;
 
 function entryObject(entry: ServerTarget): Record<string, unknown> {
   const o: Record<string, unknown> = { command: entry.command, args: entry.args };
@@ -256,5 +260,90 @@ export function removeTomlServer(file: string, name: string, dryRun = false): Wr
   if (Object.keys(servers).length) doc.mcp_servers = servers;
   else delete doc.mcp_servers;
   fs.writeFileSync(file, TOML.stringify(doc as unknown as TOML.JsonMap));
+  return "ok";
+}
+
+// ---- JSONC (comment-tolerant: opencode `mcp`, VS Code `servers`) ---------
+// Uses jsonc-parser's edit API so existing comments and formatting survive.
+// `topKey` is the servers container (e.g. "mcp" | "servers"); `build` shapes
+// the per-server value (opencode uses type:"local" + array command; VS Code
+// uses type:"stdio" + command/args).
+
+const managedKeys = (o: Record<string, unknown>): string =>
+  JSON.stringify({
+    type: o.type ?? null,
+    command: o.command ?? null,
+    args: o.args ?? null,
+    env: o.env ?? o.environment ?? null,
+  });
+
+function readJsoncTolerant(file: string): { fresh: boolean; text: string | null } {
+  try {
+    return { fresh: false, text: fs.readFileSync(file, "utf8") };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { fresh: true, text: "{}" };
+    return { fresh: false, text: null };
+  }
+}
+
+/** Parse JSONC leniently; returns null if it has hard syntax errors. */
+function parseJsoncSafe(text: string): Record<string, unknown> | null {
+  const errors: ParseError[] = [];
+  const data = parseJsonc(text, errors, { allowTrailingComma: true }) as unknown;
+  if (errors.length) return null;
+  if (data == null) return {};
+  if (typeof data !== "object" || Array.isArray(data)) return null;
+  return data as Record<string, unknown>;
+}
+
+export function upsertJsoncServer(
+  file: string,
+  topKey: string,
+  name: string,
+  entry: ServerTarget,
+  build: EntryBuilder,
+  dryRun = false
+): WriteResult {
+  const { fresh, text } = readJsoncTolerant(file);
+  if (text === null) return "skipped-unparseable";
+  const data = parseJsoncSafe(text);
+  if (data === null) return "skipped-unparseable";
+  const container = data[topKey];
+  if (container != null && (typeof container !== "object" || Array.isArray(container)))
+    return "skipped-unparseable";
+  const servers = (container as Record<string, unknown> | undefined) ?? {};
+  const obj = build(entry);
+  const cur = (servers[name] as Record<string, unknown> | undefined) ?? null;
+  if (!fresh && cur != null && managedKeys({ ...cur }) === managedKeys(obj)) return "noop";
+  if (dryRun) return "ok";
+  // Merge managed fields onto any existing entry (preserve user-added keys).
+  const merged = { ...(cur ?? {}), ...obj };
+  const edits = modify(text, [topKey, name], merged, {
+    formattingOptions: { insertSpaces: true, tabSize: 2 },
+  });
+  const out = applyEdits(text, edits);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, out.endsWith("\n") ? out : out + "\n");
+  return "ok";
+}
+
+export function removeJsoncServer(
+  file: string,
+  topKey: string,
+  name: string,
+  dryRun = false
+): WriteResult {
+  const { fresh, text } = readJsoncTolerant(file);
+  if (fresh) return "noop";
+  if (text === null) return "skipped-unparseable";
+  const data = parseJsoncSafe(text);
+  if (data === null) return "skipped-unparseable";
+  const servers = (data[topKey] as Record<string, unknown> | undefined) ?? {};
+  if (!(name in servers)) return "noop";
+  if (dryRun) return "ok";
+  const edits = modify(text, [topKey, name], undefined, {
+    formattingOptions: { insertSpaces: true, tabSize: 2 },
+  });
+  fs.writeFileSync(file, applyEdits(text, edits));
   return "ok";
 }
