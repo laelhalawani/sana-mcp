@@ -279,6 +279,14 @@ test("release workflow binds every build and publish step to the authorized comm
   assert.match(workflow, /Existing release title does not match/);
   assert.match(workflow, /prerelease classification is incorrect/);
   assert.match(workflow, /verify_remote_assets false/);
+  assert.match(
+    workflow,
+    /gh api \\\n\s+--paginate \\\n\s+"repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100" \\\n\s+--slurp/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /repos\/\$GITHUB_REPOSITORY\/releases\/tags\/\$RELEASE_TAG/,
+  );
   assert.match(workflow, /missing_assets\+=\("release-assets\/\$asset"\)/);
   assert.match(
     workflow,
@@ -584,7 +592,7 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
   );
   assert.match(
     afterPublish,
-    /gh release edit "\$RELEASE_TAG" --draft=false[\s\S]*fetch_release[\s\S]*validate_release_identity[\s\S]*test "\$release_is_draft" = "false"[\s\S]*verify_remote_assets true/,
+    /gh release edit "\$RELEASE_TAG" --draft=false[\s\S]*require_release[\s\S]*validate_release_identity[\s\S]*test "\$release_is_draft" = "false"[\s\S]*verify_remote_assets true/,
   );
 
   for (const remoteMatches of [true, false]) {
@@ -653,19 +661,21 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "if (args[0] === 'api' && args[1]?.includes('/commits/')) {",
         "  console.error('commit lookup must not be used as a tag lookup'); process.exit(67);",
         "}",
-        "if (args[0] === 'api') {",
+        "if (args[0] === 'api' && args.includes('--paginate')) {",
+        "  if (process.env.FAKE_RELEASE_LOOKUP_ERROR === '1') { console.error('synthetic release lookup failure'); process.exit(1); }",
         "  const state = load();",
-        "  if (!state.exists) { console.error('HTTP 404: Not Found'); process.exit(1); }",
-        "  process.stdout.write(JSON.stringify({",
+        "  const releases = state.exists ? [{",
         "    tag_name: state.tag,",
         "    target_commitish: 'main',",
         "    draft: state.draft,",
         "    name: state.title,",
         "    prerelease: state.prerelease,",
         "    assets: readdirSync(assetsDir).map((name) => ({ name })),",
-        "  }));",
+        "  }] : [];",
+        "  process.stdout.write(JSON.stringify([[], releases]));",
         "  process.exit(0);",
         "}",
+        "if (args[0] === 'api') process.exit(68);",
         "if (args[0] !== 'release') process.exit(64);",
         "if (args[1] === 'download') {",
         "  const pattern = args[args.indexOf('--pattern') + 1];",
@@ -707,6 +717,7 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         tagMoveOnEditSha?: string,
         tagObjectLookupFails = false,
         tagMoveOnDownloadSha?: string,
+        releaseLookupFails = false,
       ) =>
         spawnSync("/bin/bash", ["-c", publishScript], {
           cwd: temporary,
@@ -728,6 +739,9 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
             ...(tagMoveOnDownloadSha === undefined
               ? {}
               : { FAKE_MOVE_TAG_ON_DOWNLOAD_SHA: tagMoveOnDownloadSha }),
+            ...(releaseLookupFails
+              ? { FAKE_RELEASE_LOOKUP_ERROR: "1" }
+              : {}),
             ...(tagMoveOnUploadSha === undefined
               ? {}
               : { FAKE_MOVE_TAG_ON_UPLOAD_SHA: tagMoveOnUploadSha }),
@@ -1009,6 +1023,36 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         assert.match(
           annotatedDereferenceFailure.stderr,
           /Could not resolve release tag/,
+        );
+
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: true,
+            draft: true,
+            tag: `v${packageMetadata.version}`,
+            title: `v${packageMetadata.version}`,
+            prerelease: false,
+            tagExists: true,
+            tagSha: sourceCommit,
+          }),
+        );
+        const releaseLookupFailure = execute(
+          `v${packageMetadata.version}`,
+          false,
+          undefined,
+          false,
+          false,
+          undefined,
+          undefined,
+          false,
+          undefined,
+          true,
+        );
+        assert.notEqual(releaseLookupFailure.status, 0);
+        assert.match(
+          releaseLookupFailure.stderr,
+          /Could not resolve release v0\.4\.0/,
         );
 
         const movedTagSha =

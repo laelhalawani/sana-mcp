@@ -487,6 +487,7 @@ jobs:
           esac
 
           release_json="$publish_work/release.json"
+          release_pages="$publish_work/release-pages.json"
           release_error="$publish_work/release.error"
           local_names="$publish_work/local-names"
           remote_names="$publish_work/remote-names"
@@ -496,9 +497,44 @@ jobs:
             LC_ALL=C sort > "$local_names"
 
           fetch_release() {
-            gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            : > "$release_error"
+            if ! gh api \
+              --paginate \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --slurp \
+              > "$release_pages" 2> "$release_error"
+            then
+              return 1
+            fi
+            bun -e '
+              import { readFileSync } from "node:fs";
+              const pages = JSON.parse(readFileSync(process.argv[1], "utf8"));
+              const releaseTag = process.argv[2];
+              const matches = pages.flat().filter(
+                (release) => release.tag_name === releaseTag,
+              );
+              if (matches.length === 0) process.exit(4);
+              if (matches.length !== 1) {
+                console.error(`Multiple releases resolve to ${releaseTag}.`);
+                process.exit(3);
+              }
+              process.stdout.write(JSON.stringify(matches[0]));
+            ' "$release_pages" "$RELEASE_TAG" \
               > "$release_json" 2> "$release_error"
+          }
+
+          require_release() {
+            if fetch_release; then
+              return 0
+            fi
+            release_status=$?
+            cat "$release_error" >&2
+            if [ "$release_status" -eq 4 ]; then
+              echo "Release $RELEASE_TAG disappeared during publication." >&2
+            else
+              echo "Could not resolve release $RELEASE_TAG during publication." >&2
+            fi
+            exit 1
           }
 
           validate_release_identity() {
@@ -552,23 +588,27 @@ jobs:
 
           if fetch_release; then
             validate_release_identity
-          elif grep -q "HTTP 404" "$release_error"; then
-            prerelease=()
-            if [ "$expected_prerelease" = "true" ]; then
-              prerelease=(--prerelease)
-            fi
-            gh release create "$RELEASE_TAG" \
-              --verify-tag \
-              --draft \
-              --target "$SOURCE_SHA" \
-              --title "$RELEASE_TAG" \
-              "${prerelease[@]}"
-            verify_release_tag
-            fetch_release
-            validate_release_identity
           else
-            cat "$release_error" >&2
-            exit 1
+            release_status=$?
+            if [ "$release_status" -eq 4 ]; then
+              prerelease=()
+              if [ "$expected_prerelease" = "true" ]; then
+                prerelease=(--prerelease)
+              fi
+              gh release create "$RELEASE_TAG" \
+                --verify-tag \
+                --draft \
+                --target "$SOURCE_SHA" \
+                --title "$RELEASE_TAG" \
+                "${prerelease[@]}"
+              verify_release_tag
+              require_release
+              validate_release_identity
+            else
+              cat "$release_error" >&2
+              echo "Could not resolve release $RELEASE_TAG." >&2
+              exit 1
+            fi
           fi
 
           verify_release_tag
@@ -590,14 +630,14 @@ jobs:
             gh release upload "$RELEASE_TAG" "${missing_assets[@]}"
           fi
 
-          fetch_release
+          require_release
           validate_release_identity
           test "$release_is_draft" = "true" ||
             { echo "Release publication state changed concurrently" >&2; exit 1; }
           verify_remote_assets true
           verify_release_tag
           gh release edit "$RELEASE_TAG" --draft=false
-          fetch_release
+          require_release
           validate_release_identity
           test "$release_is_draft" = "false" ||
             { echo "Release remained a draft after publication" >&2; exit 1; }

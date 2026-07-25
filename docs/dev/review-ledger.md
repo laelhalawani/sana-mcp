@@ -1463,3 +1463,32 @@ Post-correction validation:
 - a locally built Linux x64 musl artifact executed `__inspect` and `--help` in
   the pinned Alpine image after installing the declared runtime packages;
 - `sh -n install.sh` and `git diff --check`: clean.
+
+### Draft release lookup correction
+
+GitHub Actions run `30166063683` passed all seven native target jobs and created
+the exact `v0.4.0` tag plus an empty draft. Publication then stopped because the
+published-release-by-tag REST endpoint does not return drafts. The draft and tag
+were preserved for safe resume.
+
+Correction owner: `/root`.
+
+Exact correction files:
+
+- `.github/workflows/release.yml`;
+- `tests/release/release.test.ts`.
+
+The correction uses the authenticated, paginated releases listing, selects one
+exact tag across every page, and distinguishes absent, API-failed, malformed,
+and duplicate results. Only proven absence permits creation; every later fetch
+requires the same validated release identity before mutation continues.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/draft_release_api_analysis` | The tag endpoint is published-only; the fake API concealed that behavior | Replaced it with paginated draft-aware listing, explicit result states, and a later-page fake | correction required review |
+| `/root/draft_release_fetch_review` | none | n/a | CLEAN - zero findings |
+| `/root/draft_release_cross_review` | none | n/a | CLEAN - zero findings |
+
+Focused typecheck and release/projection validation passed: 6 tests, 0 failed.
+The existing empty draft remains bound to tag commit `b77bb12` and requires no
+deletion or tag movement.
