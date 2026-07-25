@@ -43,7 +43,7 @@ replaces the runtime without requiring Sana to be reachable; your login and loca
 meeting state remain in place. The command reports a no-op when you already have
 the latest version and never downgrades a newer installation.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.2` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.3` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
 `apk add --no-cache libstdc++ libgcc`; the installer detects and reports this
@@ -55,8 +55,12 @@ handled as an incompatible replacement. Before changing anything, the installer 
 local meetings must be resynced and you must sign in again, then asks whether to
 continue. Declining leaves the installation unchanged. Confirming replaces the
 verified old runtime and resets its default local state; it does not migrate or
-revalidate the old authentication. An unrecognized receiptless executable is
-never run or overwritten, and an overridden data or transcript directory is
+revalidate the old authentication. A direct interactive one-line replacement
+opens the configurer so you can sign in again immediately. A replacement handed
+off by `sana-mcp update` defers setup and prints the exact command to run later.
+For a direct unattended run, `SANA_MCP_YES=1` registers detected clients without
+prompts and then prints sign-in guidance. An unrecognized receiptless executable
+is never run or overwritten, and an overridden data or transcript directory is
 never reset automatically.
 
 Linux and macOS support compatible receipt-backed updates. An epoch-changing
