@@ -1078,8 +1078,8 @@ case "$os" in
   Linux)
     if [ -x "/lib/ld-musl-${arch}.so.1" ]; then
       libc="musl"
-    elif [ -x /usr/bin/getconf ] &&
-      /usr/bin/getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+    elif command -v getconf >/dev/null 2>&1 &&
+      getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
       libc="glibc"
     elif command -v ldd >/dev/null 2>&1 &&
       ldd --version 2>&1 | awk 'BEGIN { found=0 } /musl/ { found=1 } END { exit !found }'; then
@@ -1097,6 +1097,13 @@ case "$os" in
     ;;
   *) fail "unsupported OS: $os (on Windows use install.ps1)" ;;
 esac
+
+if [ "${libc:-}" = "musl" ] && command -v apk >/dev/null 2>&1; then
+  if ! apk info --exists libstdc++ >/dev/null 2>&1 ||
+    ! apk info --exists libgcc >/dev/null 2>&1; then
+    fail "Alpine requires the libstdc++ and libgcc runtime packages. Run: apk add --no-cache libstdc++ libgcc. Then rerun this installer."
+  fi
+fi
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/sana-mcp.XXXXXX") ||
   fail "could not create a temporary directory"

@@ -45,7 +45,10 @@ state; the error prints the retained locations and the next manual action.
 
 Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.0` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
-published. Windows ARM64 is not yet in the verified release matrix.
+published. On Alpine, install Bun's required C++ runtime first with
+`apk add --no-cache libstdc++ libgcc`; the installer detects and reports this
+before downloading release metadata or binary assets. Windows ARM64 is not yet
+in the verified release matrix.
 
 The first upgrade from an older, pre-receipt installer will refuse to overwrite
 an unproven binary. If that happens, confirm and rename the exact binary path
