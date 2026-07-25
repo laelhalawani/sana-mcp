@@ -37,26 +37,35 @@ If a terminal is present but interactive controls are disabled by redirection,
 CI, or terminal policy, the installer makes the same explicit deferral and keeps
 the verified runtime installed.
 
-During an upgrade, the new binary, PATH entry, and installer receipt are
-published before the new runtime opens local state. After that boundary, a
-configuration or health failure keeps the new runtime and recovery inventory in
-place instead of restoring an older executable against possibly newer local
-state; the error prints the retained locations and the next manual action.
+Run `sana-mcp update` to check for and install the latest release. A compatible
+receipt-backed update verifies the installed runtime and release metadata, then
+replaces the runtime without requiring Sana to be reachable; your login and local
+meeting state remain in place. The command reports a no-op when you already have
+the latest version and never downgrades a newer installation.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.1` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.2` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
 `apk add --no-cache libstdc++ libgcc`; the installer detects and reports this
 before downloading release metadata or binary assets. Windows ARM64 is not yet
 in the verified release matrix.
 
-On Windows, the installer recognizes the official pre-receipt releases by their
-published binary digests, stops an exact-path legacy daemon when needed, and
-replaces the old runtime transactionally. It revalidates the old Sana cookie
-against Sana before publishing it in the current session format; expired
-sessions request a fresh sign-in, and a temporary validation failure leaves the
-old session unchanged. An unrecognized receiptless executable is never run or
-overwritten.
+On Windows, an older official installation that cannot be updated in place is
+handled as an incompatible replacement. Before changing anything, the installer explains that
+local meetings must be resynced and you must sign in again, then asks whether to
+continue. Declining leaves the installation unchanged. Confirming replaces the
+verified old runtime and resets its default local state; it does not migrate or
+revalidate the old authentication. An unrecognized receiptless executable is
+never run or overwritten, and an overridden data or transcript directory is
+never reset automatically.
+
+Linux and macOS support compatible receipt-backed updates. An epoch-changing
+update is refused before confirmation until their destructive replacement
+coordinator is implemented.
+
+For an intentional unattended incompatible replacement, set
+`SANA_MCP_REPLACE_INCOMPATIBLE=1`. `SANA_MCP_YES=1` configures detected clients;
+it does not authorize deleting incompatible local state.
 
 ## What it does
 
@@ -150,6 +159,7 @@ Subcommands:
 | `sana-mcp daemon`             | run the background sync daemon in the foreground         |
 | `sana-mcp install`            | detect MCP clients and register sana-mcp with your picks |
 | `sana-mcp uninstall`          | remove sana-mcp from the clients you choose              |
+| `sana-mcp update`             | verify this install and update to the latest release     |
 | `sana-mcp mcp`                | run the MCP server on stdio (used by clients internally) |
 
 ## Register with an AI client

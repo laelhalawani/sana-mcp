@@ -32,7 +32,9 @@ $Repo = "Etals-AiApp/sana-ai-mcp"
 $TempDir = $null
 $StagedBinary = $null
 $InstallLock = $null
+$InstallLockHandle = $null
 $PathLock = $null
+$PathLockHandle = $null
 $Destination = $null
 $ReceiptPath = $null
 $TransactionActive = $false
@@ -58,7 +60,13 @@ $ConfigJournalPreexisting = $false
 $LiveStateTouched = $false
 $InstallFailure = $null
 $CleanupErrors = @()
-$AuthMigrationState = "not-run"
+$IncompatibleInstall = $false
+$IncompatibleReceiptConfirmed = $false
+$IncompatibleStateReset = $false
+$IncompatibleDigest = $null
+$IncompatibleResetJournal = $null
+$IncompatibleResetPrepared = $false
+$StateRecoveryIncomplete = $false
 
 function Assert-ReleaseTag([string] $Tag) {
   if ($Tag -cnotmatch '\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?\z') {
@@ -237,14 +245,16 @@ function Read-ReleaseProperties([string] $File, [string] $ExpectedTarget) {
   $Allowed = @(
     "format", "manifestVersion", "manifestSha256", "packageVersion",
     "releaseTag", "sourceCommit", "installerProtocol", "lifecycleProtocol", "inspectProtocol",
-    "semanticCapability", "target", "libc", "assetName",
+    "stateCompatibility", "semanticCapability", "installerAssetName",
+    "installerSha256", "target", "libc", "assetName",
     "checksumFileName", "sha256"
   )
   $Values = Read-Properties $File $Allowed
   $Required = @(
     "format", "manifestVersion", "manifestSha256", "packageVersion",
     "releaseTag", "sourceCommit", "installerProtocol", "lifecycleProtocol", "inspectProtocol",
-    "semanticCapability", "target", "assetName", "checksumFileName", "sha256"
+    "stateCompatibility", "semanticCapability", "installerAssetName",
+    "installerSha256", "target", "assetName", "checksumFileName", "sha256"
   )
   foreach ($Key in $Required) {
     if (-not $Values.ContainsKey($Key)) { throw "Release metadata is missing $Key." }
@@ -254,7 +264,14 @@ function Read-ReleaseProperties([string] $File, [string] $ExpectedTarget) {
   if ($Values["installerProtocol"] -cne "1") { throw "Unsupported installer protocol." }
   if ($Values["lifecycleProtocol"] -cne "1") { throw "Unsupported lifecycle protocol." }
   if ($Values["inspectProtocol"] -cne "1") { throw "Unsupported inspect protocol." }
+  if ($Values["stateCompatibility"] -cnotmatch '^[1-9][0-9]*$') {
+    throw "Release state compatibility is invalid."
+  }
   if ($Values["semanticCapability"] -cne "keyword") { throw "Unsupported binary capability." }
+  if ($Values["installerAssetName"] -cne "install.ps1" -or
+      $Values["installerSha256"] -cnotmatch '^[a-f0-9]{64}$') {
+    throw "Release metadata does not bind the Windows installer."
+  }
   if ($Values["target"] -cne $ExpectedTarget) { throw "Release metadata target does not match this system." }
   if ($Values.ContainsKey("libc")) { throw "Windows release metadata must not declare libc." }
   if ($Values["releaseTag"] -cne "v$($Values["packageVersion"])") {
@@ -319,6 +336,22 @@ function Get-VerifiedLegacyRelease([string] $Executable) {
     throw "Existing $Executable has no receipt and does not match an official pre-receipt sana-mcp release."
   }
   return $Release
+}
+
+function Confirm-IncompatibleReplacement([string] $Release) {
+  Write-Host ""
+  Write-Host "An older incompatible sana-mcp installation was detected ($Release)."
+  Write-Host "We can't update it in place, but we can overwrite it with a new installation."
+  Write-Host "The meetings will have to be re-synced and you will have to sign in again."
+  if ($env:SANA_MCP_REPLACE_INCOMPATIBLE -eq "1") {
+    Write-Host "Continuing with the explicitly approved incompatible replacement."
+    return $true
+  }
+  if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) {
+    throw "Incompatible replacement needs an interactive confirmation. Rerun in a terminal, or set SANA_MCP_REPLACE_INCOMPATIBLE=1 to approve this reset explicitly."
+  }
+  $Answer = Read-Host "Do you want to continue? [y/N]"
+  return @("y", "yes") -ccontains $Answer.Trim().ToLowerInvariant()
 }
 
 function Get-LegacyDaemonProcesses([string] $Executable) {
@@ -445,17 +478,46 @@ function Normalize-PathEntry([string] $Path) {
 
 function Read-InstallReceipt([string] $File) {
   $Receipt = Read-Properties $File @(
-    "format", "version", "target", "sourceCommit", "binarySha256", "pathManaged"
+    "format", "version", "target", "sourceCommit", "binarySha256", "pathManaged",
+    "installerProtocol", "lifecycleProtocol", "inspectProtocol", "stateCompatibility"
   )
-  foreach ($Key in @(
-    "format", "version", "target", "sourceCommit", "binarySha256", "pathManaged"
-  )) {
+  foreach ($Key in @("format", "version", "target", "sourceCommit", "binarySha256", "pathManaged")) {
     if (-not $Receipt.ContainsKey($Key)) {
       throw "Installer receipt is missing $Key."
     }
   }
-  if ($Receipt["format"] -cne "sana-mcp-install-v1") {
+  if (@("sana-mcp-install-v1", "sana-mcp-install-v2") -cnotcontains
+      $Receipt["format"]) {
     throw "Existing binary has no supported installer receipt."
+  }
+  if ($Receipt["format"] -ceq "sana-mcp-install-v1") {
+    foreach ($Unexpected in @(
+      "installerProtocol", "lifecycleProtocol", "inspectProtocol",
+      "stateCompatibility"
+    )) {
+      if ($Receipt.ContainsKey($Unexpected)) {
+        throw "Version 1 installer receipt contains version 2 state."
+      }
+    }
+    $Receipt["installerProtocol"] = "1"
+    $Receipt["lifecycleProtocol"] = "1"
+    $Receipt["inspectProtocol"] = "1"
+    $Receipt["stateCompatibility"] = "1"
+  } else {
+    foreach ($Required in @(
+      "installerProtocol", "lifecycleProtocol", "inspectProtocol",
+      "stateCompatibility"
+    )) {
+      if (-not $Receipt.ContainsKey($Required)) {
+        throw "Version 2 installer receipt is missing $Required."
+      }
+    }
+    if ($Receipt["installerProtocol"] -cnotmatch '^[1-9][0-9]*$' -or
+        $Receipt["lifecycleProtocol"] -cnotmatch '^[1-9][0-9]*$' -or
+        $Receipt["inspectProtocol"] -cnotmatch '^[1-9][0-9]*$' -or
+        $Receipt["stateCompatibility"] -cnotmatch '^[1-9][0-9]*$') {
+      throw "Version 2 installer receipt protocol state is invalid."
+    }
   }
   Assert-ReleaseTag "v$($Receipt["version"])"
   if ($Receipt["sourceCommit"] -cnotmatch '^[a-f0-9]{40}$' -or
@@ -466,6 +528,35 @@ function Read-InstallReceipt([string] $File) {
     throw "Installer receipt PATH state is invalid."
   }
   return $Receipt
+}
+
+function Assert-ExpectedUpdateInstallation(
+  [hashtable] $Receipt,
+  [string] $Digest
+) {
+  if ($env:SANA_MCP_UPDATE -ne "1") {
+    return
+  }
+  if ([string]::IsNullOrEmpty(
+        $env:SANA_MCP_EXPECTED_INSTALLED_VERSION) -or
+      [string]::IsNullOrEmpty(
+        $env:SANA_MCP_EXPECTED_INSTALLED_TARGET) -or
+      [string]::IsNullOrEmpty(
+        $env:SANA_MCP_EXPECTED_INSTALLED_SHA256) -or
+      [string]::IsNullOrEmpty(
+        $env:SANA_MCP_EXPECTED_INSTALLED_STATE_COMPATIBILITY)) {
+    throw "sana-mcp update did not provide its complete installed-runtime authority."
+  }
+  if ($Receipt["version"] -cne
+        $env:SANA_MCP_EXPECTED_INSTALLED_VERSION -or
+      $Receipt["target"] -cne
+        $env:SANA_MCP_EXPECTED_INSTALLED_TARGET -or
+      $Digest -cne
+        $env:SANA_MCP_EXPECTED_INSTALLED_SHA256 -or
+      $Receipt["stateCompatibility"] -cne
+        $env:SANA_MCP_EXPECTED_INSTALLED_STATE_COMPATIBILITY) {
+    throw "The installed runtime changed after sana-mcp update obtained authority."
+  }
 }
 
 function Invoke-Lifecycle([string] $Executable, [string] $Operation) {
@@ -760,14 +851,30 @@ function Set-RetainedRuntimeState {
 function Invoke-InstallerCleanup(
   [AllowNull()] [string] $PendingBinary,
   [AllowNull()] [string] $PendingReceipt,
+  [AllowNull()] [IO.FileStream] $OwnedInstallLockHandle,
   [bool] $OwnsInstallLock,
   [AllowNull()] [string] $OwnedInstallLock,
+  [AllowNull()] [IO.FileStream] $OwnedPathLockHandle,
   [bool] $OwnsPathLock,
   [AllowNull()] [string] $OwnedPathLock,
   [bool] $KeepTemporary,
   [AllowNull()] [string] $TemporaryDirectory
 ) {
   $Failures = @()
+  try {
+    if ($null -ne $OwnedInstallLockHandle) {
+      $OwnedInstallLockHandle.Dispose()
+    }
+  } catch {
+    $Failures += "could not release the install-lock handle: $($_.Exception.Message)"
+  }
+  try {
+    if ($null -ne $OwnedPathLockHandle) {
+      $OwnedPathLockHandle.Dispose()
+    }
+  } catch {
+    $Failures += "could not release the user-state-lock handle: $($_.Exception.Message)"
+  }
   try {
     if (-not [string]::IsNullOrEmpty($PendingBinary) -and
         (Test-Path -LiteralPath $PendingBinary)) {
@@ -814,6 +921,291 @@ function Invoke-InstallerCleanup(
   return $Failures
 }
 
+function New-UserStateLock {
+  $Root = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::LocalApplicationData
+  )
+  if ([string]::IsNullOrWhiteSpace($Root)) {
+    throw "Windows did not provide an authoritative per-user directory for installer serialization."
+  }
+  $Directory = Join-Path $Root ".sana-mcp-installer-path.lock"
+  if (Test-Path -LiteralPath $Directory) {
+    Assert-NotReparse $Directory "User-state lock"
+    $ExistingOwner = Join-Path $Directory "owner.properties"
+    if (Test-Path -LiteralPath $ExistingOwner -PathType Leaf) {
+      try {
+        $Probe = [IO.File]::Open(
+          $ExistingOwner,
+          [IO.FileMode]::Open,
+          [IO.FileAccess]::ReadWrite,
+          [IO.FileShare]::None
+        )
+        $Probe.Dispose()
+      } catch [IO.IOException] {
+        throw "Another sana-mcp installer is changing user state."
+      }
+    }
+    Remove-Item -LiteralPath $Directory -Recurse -Force
+  }
+  [IO.Directory]::CreateDirectory($Directory) | Out-Null
+  $Owner = Join-Path $Directory "owner.properties"
+  [IO.File]::WriteAllText(
+    $Owner,
+    ("owner=" + [Guid]::NewGuid().ToString("N") + "`n"),
+    [Text.Encoding]::ASCII
+  )
+  try {
+    $Handle = [IO.File]::Open(
+      $Owner,
+      [IO.FileMode]::Open,
+      [IO.FileAccess]::ReadWrite,
+      [IO.FileShare]::None
+    )
+  } catch {
+    Remove-Item -LiteralPath $Directory -Recurse -Force `
+      -ErrorAction SilentlyContinue
+    throw
+  }
+  return @{
+    directory = $Directory
+    handle = $Handle
+  }
+}
+
+function Remove-ResolvedIncompatibleRecovery([string] $RecoveryDirectory) {
+  if (-not (Test-Path -LiteralPath $RecoveryDirectory)) {
+    return
+  }
+  $RecoveryParent = Split-Path -Parent $RecoveryDirectory
+  $RetiredRecovery = Join-Path $RecoveryParent (
+    ".sana-mcp-incompatible-recovery-completed-" +
+    [Guid]::NewGuid().ToString("N")
+  )
+  Move-Item -LiteralPath $RecoveryDirectory -Destination $RetiredRecovery
+  try {
+    Remove-Item -LiteralPath $RetiredRecovery -Recurse -Force
+  } catch {
+    [Console]::Error.WriteLine(
+      "sana-mcp: completed recovery cleanup was retained at $RetiredRecovery"
+    )
+  }
+}
+
+function Invoke-PendingIncompatibleRecovery(
+  [string] $Executable,
+  [string] $Receipt,
+  [string] $RecoveryDirectory,
+  [string] $InstallLockDirectory
+) {
+  Assert-NotReparse $RecoveryDirectory "Incompatible recovery directory"
+  if (Test-Path -LiteralPath $Executable) {
+    Assert-NotReparse $Executable "Installed binary"
+  }
+  if (Test-Path -LiteralPath $Receipt) {
+    Assert-NotReparse $Receipt "Installer receipt"
+  }
+  if (Test-Path -LiteralPath $InstallLockDirectory) {
+    Assert-NotReparse $InstallLockDirectory "Install lock"
+    $OwnerFile = Join-Path $InstallLockDirectory "owner.properties"
+    if (-not (Test-Path -LiteralPath $OwnerFile -PathType Leaf)) {
+      throw "The incomplete incompatible replacement has an unowned install lock: $InstallLockDirectory"
+    }
+    try {
+      $LockProbe = [IO.File]::Open(
+        $OwnerFile,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::None
+      )
+      $LockProbe.Dispose()
+    } catch [IO.IOException] {
+      throw "Another sana-mcp install is still recovering the incompatible installation."
+    }
+    Remove-Item -LiteralPath $InstallLockDirectory -Recurse -Force
+  }
+
+  $InventoryFile = Join-Path $RecoveryDirectory "installer.properties"
+  if (-not (Test-Path -LiteralPath $InventoryFile -PathType Leaf)) {
+    throw "The incompatible replacement recovery inventory is missing."
+  }
+  $Inventory = Read-Properties $InventoryFile @(
+    "format", "oldWasRunning", "legacyInstall",
+    "previousBinarySha256", "previousReceiptSha256",
+    "replacementBinarySha256", "replacementVersion",
+    "replacementTarget", "replacementStateCompatibility"
+  )
+  if ($Inventory["format"] -cne "sana-mcp-incompatible-recovery-v1" -or
+      @("true", "false") -cnotcontains $Inventory["oldWasRunning"] -or
+      @("true", "false") -cnotcontains $Inventory["legacyInstall"] -or
+      $Inventory["previousBinarySha256"] -cnotmatch '^[a-f0-9]{64}$' -or
+      $Inventory["replacementBinarySha256"] -cnotmatch '^[a-f0-9]{64}$' -or
+      $Inventory["replacementVersion"] -cnotmatch '^[0-9A-Za-z.+-]+$' -or
+      $Inventory["replacementTarget"] -cne "bun-windows-x64" -or
+      $Inventory["replacementStateCompatibility"] -cnotmatch '^[1-9][0-9]*$') {
+    throw "The incompatible replacement recovery inventory is invalid."
+  }
+  $PreviousExecutable =
+    Join-Path $RecoveryDirectory "previous-sana-mcp.exe"
+  $ReplacementExecutable =
+    Join-Path $RecoveryDirectory "replacement-sana-mcp.exe"
+  $PreviousReceipt =
+    Join-Path $RecoveryDirectory "previous-receipt"
+  foreach ($RequiredBinary in @(
+      $PreviousExecutable, $ReplacementExecutable
+    )) {
+    Assert-NotReparse $RequiredBinary "Incompatible recovery binary"
+    if (-not (Test-Path -LiteralPath $RequiredBinary -PathType Leaf)) {
+      throw "The incompatible replacement recovery binary inventory is incomplete."
+    }
+  }
+  if ((Get-Sha256 $PreviousExecutable) -cne
+      $Inventory["previousBinarySha256"] -or
+      (Get-Sha256 $ReplacementExecutable) -cne
+      $Inventory["replacementBinarySha256"]) {
+    throw "The incompatible replacement recovery binaries changed."
+  }
+  $WasLegacy = $Inventory["legacyInstall"] -ceq "true"
+  if (-not $WasLegacy) {
+    Assert-NotReparse $PreviousReceipt "Previous installer receipt"
+    if (-not (Test-Path -LiteralPath $PreviousReceipt -PathType Leaf)) {
+      throw "The incompatible replacement recovery receipt is missing."
+    }
+    if ($Inventory["previousReceiptSha256"] -cnotmatch '^[a-f0-9]{64}$' -or
+        (Get-Sha256 $PreviousReceipt) -cne
+        $Inventory["previousReceiptSha256"]) {
+      throw "The previous incompatible replacement receipt changed."
+    }
+  } elseif ($Inventory["previousReceiptSha256"] -cne "none") {
+    throw "The legacy incompatible recovery inventory is invalid."
+  }
+  $JournalFile =
+    Join-Path $RecoveryDirectory "incompatible-reset.json"
+  if (-not (Test-Path -LiteralPath $JournalFile -PathType Leaf)) {
+    $NeedsReset = $true
+    $NeedsCommit = $false
+  } else {
+    $StatusFile = [IO.Path]::GetTempFileName()
+    $RecoveryInspectFile = [IO.Path]::GetTempFileName()
+    $PreviousResetAuthority = $env:SANA_MCP_INCOMPATIBLE_RESET
+    try {
+      & $ReplacementExecutable __inspect --format properties |
+        Set-Content -LiteralPath $RecoveryInspectFile -Encoding ASCII
+      if ($LASTEXITCODE -ne 0) {
+        throw "The incompatible recovery runtime could not be inspected."
+      }
+      $RecoveryInspect = Read-Properties $RecoveryInspectFile @(
+        "inspectProtocol", "version", "target", "installerProtocol",
+        "lifecycleProtocol", "stateCompatibility", "semanticCapability"
+      )
+      if ($RecoveryInspect["inspectProtocol"] -cne "1" -or
+          $RecoveryInspect["installerProtocol"] -cne "1" -or
+          $RecoveryInspect["lifecycleProtocol"] -cne "1" -or
+          $RecoveryInspect["version"] -cne
+            $Inventory["replacementVersion"] -or
+          $RecoveryInspect["target"] -cne
+            $Inventory["replacementTarget"] -or
+          $RecoveryInspect["stateCompatibility"] -cne
+            $Inventory["replacementStateCompatibility"]) {
+        throw "The incompatible recovery runtime identity is invalid."
+      }
+      $env:SANA_MCP_INCOMPATIBLE_RESET = "1"
+      & $ReplacementExecutable __reset-incompatible-state status `
+        --journal $RecoveryDirectory `
+        --format properties |
+        Set-Content -LiteralPath $StatusFile -Encoding ASCII
+      if ($LASTEXITCODE -ne 0) {
+        throw "The incompatible recovery status could not be read."
+      }
+      $Status = Read-Properties $StatusFile @(
+        "resetProtocol", "transactionState"
+      )
+      if ($Status["resetProtocol"] -cne "1") {
+        throw "The incompatible recovery protocol is unsupported."
+      }
+      $NeedsReset = @(
+        "prepared", "quarantined", "fresh",
+        "rollback-started", "rolled-back"
+      ) -ccontains $Status["transactionState"]
+      $NeedsCommit = @(
+        "commit-started", "committed"
+      ) -ccontains $Status["transactionState"]
+      if (-not $NeedsReset -and -not $NeedsCommit) {
+        throw "The incompatible recovery transaction state is invalid."
+      }
+      if ($NeedsCommit) {
+        if (-not (Test-Path -LiteralPath $Executable -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $Receipt -PathType Leaf)) {
+          throw "The committed incompatible replacement runtime is incomplete."
+        }
+        $ReplacementReceipt = Read-InstallReceipt $Receipt
+        if ($ReplacementReceipt["format"] -cne "sana-mcp-install-v2" -or
+            $ReplacementReceipt["binarySha256"] -cne
+              $Inventory["replacementBinarySha256"] -or
+            (Get-Sha256 $Executable) -cne
+              $Inventory["replacementBinarySha256"]) {
+          throw "The committed incompatible replacement runtime changed."
+        }
+      }
+      if ($NeedsReset) {
+        $StoppedForRecovery =
+          Invoke-Lifecycle $ReplacementExecutable "stop"
+        if ($StoppedForRecovery["state"] -cne "stopped") {
+          throw "The replacement daemon did not stop before incompatible recovery."
+        }
+      }
+      $RecoveryOperation = if ($NeedsCommit) { "commit" } else { "rollback" }
+      & $ReplacementExecutable __reset-incompatible-state $RecoveryOperation `
+        --journal $RecoveryDirectory `
+        --format properties | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "The incomplete incompatible replacement could not be recovered."
+      }
+    } finally {
+      if ($null -eq $PreviousResetAuthority) {
+        Remove-Item Env:SANA_MCP_INCOMPATIBLE_RESET -ErrorAction SilentlyContinue
+      } else {
+        $env:SANA_MCP_INCOMPATIBLE_RESET = $PreviousResetAuthority
+      }
+      Remove-Item -LiteralPath $StatusFile -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath $RecoveryInspectFile -Force `
+        -ErrorAction SilentlyContinue
+    }
+  }
+
+  if ($NeedsReset) {
+    $ExecutableRestore = Join-Path (
+      Split-Path -Parent $Executable
+    ) (".sana-mcp-recovery-" + [Guid]::NewGuid().ToString("N") + ".exe")
+    Copy-Item -LiteralPath $PreviousExecutable -Destination $ExecutableRestore
+    Move-Item -LiteralPath $ExecutableRestore -Destination $Executable -Force
+    if ($WasLegacy) {
+      if (Test-Path -LiteralPath $Receipt) {
+        Remove-Item -LiteralPath $Receipt -Force
+      }
+    } else {
+      $ReceiptRestore = Join-Path (
+        Split-Path -Parent $Receipt
+      ) (".sana-mcp-receipt-recovery-" + [Guid]::NewGuid().ToString("N"))
+      Copy-Item -LiteralPath $PreviousReceipt -Destination $ReceiptRestore
+      Move-Item -LiteralPath $ReceiptRestore -Destination $Receipt -Force
+    }
+    if ($Inventory["oldWasRunning"] -ceq "true") {
+      if ($WasLegacy) {
+        Start-LegacyDaemon $Executable
+      } else {
+        $Restarted = Invoke-Lifecycle $Executable "start"
+        if ($Restarted["state"] -cne "running") {
+          throw "The previous runtime did not restart during incompatible recovery."
+        }
+      }
+    }
+  }
+  Remove-ResolvedIncompatibleRecovery $RecoveryDirectory
+  return @{
+    restoredPrevious = $NeedsReset
+  }
+}
+
 try {
   $NativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) {
     $env:PROCESSOR_ARCHITEW6432
@@ -824,6 +1216,67 @@ try {
     "AMD64" { $Target = "bun-windows-x64" }
     "ARM64" { throw "Windows ARM64 is not in the currently verified release matrix." }
     default { throw "Unsupported Windows architecture: $NativeArchitecture" }
+  }
+
+  $PreflightInstallDir = Resolve-InstallDirectory `
+    $env:SANA_MCP_INSTALL_DIR `
+    $env:LOCALAPPDATA
+  $PreflightDestination = Join-Path $PreflightInstallDir "sana-mcp.exe"
+  $PreflightReceipt = Join-Path $PreflightInstallDir ".sana-mcp-install-v1"
+  $PreflightInstallLock =
+    Join-Path $PreflightInstallDir ".sana-mcp-install-lock"
+  $PreflightRecovery =
+    Join-Path $PreflightInstallDir ".sana-mcp-incompatible-recovery"
+  if (Test-Path -LiteralPath $PreflightRecovery) {
+    $RecoveryLock = New-UserStateLock
+    $PathLock = $RecoveryLock["directory"]
+    $PathLockHandle = $RecoveryLock["handle"]
+    $PathLockAcquired = $true
+    $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) (
+      "sana-mcp-recovery-" + [Guid]::NewGuid().ToString("N")
+    )
+    [System.IO.Directory]::CreateDirectory($TempDir) | Out-Null
+    $RecoveredIncompatible = Invoke-PendingIncompatibleRecovery `
+      $PreflightDestination `
+      $PreflightReceipt `
+      $PreflightRecovery `
+      $PreflightInstallLock
+    if ($RecoveredIncompatible.restoredPrevious) {
+      Write-Host "Restored the previous installation after an interrupted incompatible replacement."
+    } else {
+      Write-Host "Completed cleanup from the previous incompatible replacement."
+    }
+    Remove-Item -LiteralPath $TempDir -Recurse -Force
+    $TempDir = $null
+  }
+  $PreflightDestinationExists =
+    Test-Path -LiteralPath $PreflightDestination -PathType Leaf
+  $PreflightReceiptExists =
+    Test-Path -LiteralPath $PreflightReceipt -PathType Leaf
+  if ($env:SANA_MCP_UPDATE -eq "1" -and
+      (-not $PreflightDestinationExists -or
+       -not $PreflightReceiptExists)) {
+    throw "The installed runtime changed after sana-mcp update obtained authority."
+  }
+  if ($PreflightDestinationExists -and -not $PreflightReceiptExists) {
+    $IncompatibleDigest = Get-Sha256 $PreflightDestination
+    $LegacyRelease =
+      Get-VerifiedLegacyReleaseDigest $IncompatibleDigest
+    if ([string]::IsNullOrEmpty($LegacyRelease)) {
+      throw "Existing $PreflightDestination has no receipt and does not match an official pre-receipt sana-mcp release."
+    }
+    if ((Test-Path Env:SANA_DATA_DIR) -or
+        (Test-Path Env:SANA_TRANSCRIPTS_DIR)) {
+      throw "Automatic incompatible replacement is unavailable with SANA_DATA_DIR or SANA_TRANSCRIPTS_DIR. Move those Sana directories manually, then rerun the installer."
+    }
+    if (-not (Confirm-IncompatibleReplacement $LegacyRelease)) {
+      Write-Host "Installation cancelled. Nothing was changed."
+      return
+    }
+    $IncompatibleInstall = $true
+    $IncompatibleStateReset = $true
+  } elseif ($PreflightDestinationExists -ne $PreflightReceiptExists) {
+    throw "The install destination is not a complete installer-owned sana-mcp installation."
   }
 
   $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sana-mcp-" + [Guid]::NewGuid().ToString("N"))
@@ -861,6 +1314,41 @@ try {
   if ($Release["releaseTag"] -cne $Version) {
     throw "Release metadata resolved to a different tag."
   }
+  if ($PreflightDestinationExists -and $PreflightReceiptExists) {
+    Assert-NotReparse $PreflightDestination "Installed binary"
+    Assert-NotReparse $PreflightReceipt "Installer receipt"
+    $PreflightOwnedReceipt = Read-InstallReceipt $PreflightReceipt
+    $PreflightOwnedDigest = Get-Sha256 $PreflightDestination
+    if ($PreflightOwnedReceipt["target"] -cne $Target -or
+        $PreflightOwnedDigest -cne
+          $PreflightOwnedReceipt["binarySha256"]) {
+      throw "The existing installation does not match its installer receipt."
+    }
+    Assert-ExpectedUpdateInstallation `
+      $PreflightOwnedReceipt `
+      $PreflightOwnedDigest
+    if ($PreflightOwnedReceipt["stateCompatibility"] -cne
+        $Release["stateCompatibility"]) {
+      if ((Test-Path Env:SANA_DATA_DIR) -or
+          (Test-Path Env:SANA_TRANSCRIPTS_DIR)) {
+        throw "Automatic incompatible replacement is unavailable with SANA_DATA_DIR or SANA_TRANSCRIPTS_DIR. Move those Sana directories manually, then rerun the installer."
+      }
+      if (-not (Confirm-IncompatibleReplacement "state compatibility $($PreflightOwnedReceipt["stateCompatibility"])")) {
+        Write-Host "Installation cancelled. Nothing was changed."
+        return
+      }
+      $IncompatibleReceiptConfirmed = $true
+      $IncompatibleStateReset = $true
+      $IncompatibleDigest = $PreflightOwnedDigest
+    }
+  }
+
+  if (-not $PathLockAcquired) {
+    $UserStateLock = New-UserStateLock
+    $PathLock = $UserStateLock["directory"]
+    $PathLockHandle = $UserStateLock["handle"]
+    $PathLockAcquired = $true
+  }
 
   $Manifest = Join-Path $TempDir "manifest.json"
   $ManifestChecksum = Join-Path $TempDir "manifest.json.sha256"
@@ -893,11 +1381,11 @@ try {
   }
   $Inspect = Read-Properties $InspectFile @(
     "inspectProtocol", "version", "target", "installerProtocol",
-    "lifecycleProtocol", "semanticCapability"
+    "lifecycleProtocol", "stateCompatibility", "semanticCapability"
   )
   foreach ($Key in @(
     "inspectProtocol", "version", "target", "installerProtocol",
-    "lifecycleProtocol", "semanticCapability"
+    "lifecycleProtocol", "stateCompatibility", "semanticCapability"
   )) {
     if (-not $Inspect.ContainsKey($Key)) {
       throw "Downloaded binary inspection is missing $Key."
@@ -908,6 +1396,7 @@ try {
       $Inspect["target"] -cne $Release["target"] -or
       $Inspect["installerProtocol"] -cne $Release["installerProtocol"] -or
       $Inspect["lifecycleProtocol"] -cne $Release["lifecycleProtocol"] -or
+      $Inspect["stateCompatibility"] -cne $Release["stateCompatibility"] -or
       $Inspect["semanticCapability"] -cne $Release["semanticCapability"]) {
     throw "Downloaded binary identity does not match the release manifest."
   }
@@ -929,13 +1418,32 @@ try {
   }
   New-Item -ItemType Directory -Path $InstallLock | Out-Null
   $LockAcquired = $true
+  $InstallLockOwner = Join-Path $InstallLock "owner.properties"
+  $InstallLockOwnerBody =
+    "owner=" + [Guid]::NewGuid().ToString("N")
+  [IO.File]::WriteAllText(
+    $InstallLockOwner,
+    "$InstallLockOwnerBody`n",
+    [Text.Encoding]::ASCII
+  )
+  $InstallLockHandle = [IO.File]::Open(
+    $InstallLockOwner,
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::ReadWrite,
+    [IO.FileShare]::None
+  )
 
   $DestinationExists = Test-Path -LiteralPath $Destination -PathType Leaf
   $ReceiptExists = Test-Path -LiteralPath $ReceiptPath -PathType Leaf
   if ($DestinationExists -and -not $ReceiptExists) {
+    if (-not $IncompatibleInstall -or
+        (Get-Sha256 $Destination) -cne $IncompatibleDigest) {
+      throw "The incompatible installation changed after confirmation; nothing was replaced."
+    }
     $LegacyRelease = Get-VerifiedLegacyRelease $Destination
     $OldPresent = $true
     $LegacyInstall = $true
+    $IncompatibleStateReset = $true
     $OldWasRunning =
       @(Get-LegacyDaemonProcesses $Destination).Count -gt 0
     $OldBinaryBackup = Join-Path $TempDir "previous-sana-mcp.exe"
@@ -952,8 +1460,18 @@ try {
     if ($OldReceipt["target"] -cne $Target) {
       throw "The existing installer receipt belongs to a different target."
     }
-    if ((Get-Sha256 $Destination) -cne $OldReceipt["binarySha256"]) {
+    $OldDigest = Get-Sha256 $Destination
+    if ($OldDigest -cne $OldReceipt["binarySha256"]) {
       throw "The existing binary no longer matches its installer receipt."
+    }
+    Assert-ExpectedUpdateInstallation $OldReceipt $OldDigest
+    if ($OldReceipt["stateCompatibility"] -cne
+        $Release["stateCompatibility"]) {
+      if (-not $IncompatibleReceiptConfirmed -or
+          $OldDigest -cne $IncompatibleDigest) {
+        throw "The incompatible installation changed after confirmation; nothing was replaced."
+      }
+      $IncompatibleStateReset = $true
     }
 
     $OldInspectFile = Join-Path $TempDir "old-inspect.properties"
@@ -965,7 +1483,7 @@ try {
     }
     $OldInspect = Read-Properties $OldInspectFile @(
       "inspectProtocol", "version", "target", "installerProtocol",
-      "lifecycleProtocol", "semanticCapability"
+      "lifecycleProtocol", "stateCompatibility", "semanticCapability"
     )
     foreach ($Key in @(
       "inspectProtocol", "version", "target", "installerProtocol",
@@ -975,9 +1493,19 @@ try {
         throw "The existing binary inspection is missing $Key."
       }
     }
+    if ($OldReceipt["format"] -ceq "sana-mcp-install-v1") {
+      if ($OldInspect.ContainsKey("stateCompatibility")) {
+        throw "The existing v1 binary inspection unexpectedly declares state compatibility."
+      }
+      $OldInspect["stateCompatibility"] = "1"
+    } elseif (-not $OldInspect.ContainsKey("stateCompatibility")) {
+      throw "The existing binary inspection is missing stateCompatibility."
+    }
     if ($OldInspect["inspectProtocol"] -cne "1" -or
         $OldInspect["installerProtocol"] -cne "1" -or
         $OldInspect["lifecycleProtocol"] -cne "1" -or
+        $OldInspect["stateCompatibility"] -cne
+          $OldReceipt["stateCompatibility"] -or
         $OldInspect["target"] -cne $OldReceipt["target"] -or
         $OldInspect["version"] -cne $OldReceipt["version"]) {
       throw "The existing binary identity does not match its installer receipt."
@@ -992,24 +1520,66 @@ try {
     Copy-Item -LiteralPath $ReceiptPath -Destination $OldReceiptBackup
   }
 
+  if ($IncompatibleStateReset) {
+    $IncompatibleResetJournal =
+      Join-Path $InstallDir ".sana-mcp-incompatible-recovery"
+    if (Test-Path -LiteralPath $IncompatibleResetJournal) {
+      throw "An incompatible replacement recovery directory already exists: $IncompatibleResetJournal"
+    }
+    $RecoveryStage = Join-Path $InstallDir (
+      ".sana-mcp-incompatible-recovery-stage-" +
+      [Guid]::NewGuid().ToString("N")
+    )
+    try {
+      [IO.Directory]::CreateDirectory($RecoveryStage) | Out-Null
+      Copy-Item -LiteralPath $OldBinaryBackup -Destination (
+        Join-Path $RecoveryStage "previous-sana-mcp.exe"
+      )
+      Copy-Item -LiteralPath $Binary -Destination (
+        Join-Path $RecoveryStage "replacement-sana-mcp.exe"
+      )
+      if (-not $LegacyInstall) {
+        Copy-Item -LiteralPath $OldReceiptBackup -Destination (
+          Join-Path $RecoveryStage "previous-receipt"
+        )
+      }
+      $PreviousReceiptHash = if ($LegacyInstall) {
+        "none"
+      } else {
+        Get-Sha256 $OldReceiptBackup
+      }
+      $RecoveryInventory = @(
+        "format=sana-mcp-incompatible-recovery-v1"
+        "oldWasRunning=$($OldWasRunning.ToString().ToLowerInvariant())"
+        "legacyInstall=$($LegacyInstall.ToString().ToLowerInvariant())"
+        "previousBinarySha256=$(Get-Sha256 $OldBinaryBackup)"
+        "previousReceiptSha256=$PreviousReceiptHash"
+        "replacementBinarySha256=$($Release["sha256"])"
+        "replacementVersion=$($Release["packageVersion"])"
+        "replacementTarget=$($Release["target"])"
+        "replacementStateCompatibility=$($Release["stateCompatibility"])"
+      ) -join "`n"
+      [IO.File]::WriteAllText(
+        (Join-Path $RecoveryStage "installer.properties"),
+        "$RecoveryInventory`n",
+        [Text.Encoding]::ASCII
+      )
+      Move-Item -LiteralPath $RecoveryStage `
+        -Destination $IncompatibleResetJournal
+    } catch {
+      if (Test-Path -LiteralPath $RecoveryStage) {
+        Remove-Item -LiteralPath $RecoveryStage -Recurse -Force `
+          -ErrorAction SilentlyContinue
+      }
+      throw
+    }
+  }
+
   $StagedBinary = Join-Path $InstallDir (".sana-mcp-" + [Guid]::NewGuid().ToString("N") + ".exe")
   Copy-Item -LiteralPath $Binary -Destination $StagedBinary
   if ((Get-Sha256 $StagedBinary) -cne $Release["sha256"]) {
     throw "Staged binary checksum changed before installation."
   }
-
-  $PathLockRoot = [Environment]::GetFolderPath(
-    [Environment+SpecialFolder]::LocalApplicationData
-  )
-  if ([string]::IsNullOrWhiteSpace($PathLockRoot)) {
-    throw "Windows did not provide an authoritative per-user directory for installer serialization."
-  }
-  $PathLock = Join-Path $PathLockRoot ".sana-mcp-installer-path.lock"
-  if (Test-Path -LiteralPath $PathLock) {
-    throw "Another sana-mcp installer is changing user state, or a stale lock needs removal: $PathLock"
-  }
-  New-Item -ItemType Directory -Path $PathLock | Out-Null
-  $PathLockAcquired = $true
 
   $TransactionActive = $true
   if ($OldWasRunning) {
@@ -1085,84 +1655,61 @@ try {
 
   $StagedReceipt = Join-Path $InstallDir (".sana-mcp-receipt-" + [Guid]::NewGuid().ToString("N"))
   $ReceiptBody = @(
-    "format=sana-mcp-install-v1"
+    "format=sana-mcp-install-v2"
     "version=$($Release["packageVersion"])"
     "target=$($Release["target"])"
     "sourceCommit=$($Release["sourceCommit"])"
     "binarySha256=$($Release["sha256"])"
     "pathManaged=$($NewPathManaged.ToString().ToLowerInvariant())"
+    "installerProtocol=$($Release["installerProtocol"])"
+    "lifecycleProtocol=$($Release["lifecycleProtocol"])"
+    "inspectProtocol=$($Release["inspectProtocol"])"
+    "stateCompatibility=$($Release["stateCompatibility"])"
   ) -join "`n"
   [IO.File]::WriteAllText($StagedReceipt, "$ReceiptBody`n", [Text.Encoding]::ASCII)
   Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force
   $StagedReceipt = $null
 
-  $AuthMigrationOutput = @(
-    & $Destination __migrate-legacy-auth --format properties
-  )
-  $AuthMigrationExit = $LASTEXITCODE
-  if ($AuthMigrationExit -ne 0) {
-    # The command may have opened or migrated the local store before failing.
-    $LiveStateTouched = $true
-    throw "Legacy Sana authentication migration failed (exit $AuthMigrationExit). The replacement runtime was retained."
-  }
-  $AuthMigrationFile = Join-Path $TempDir "auth-migration.properties"
-  [IO.File]::WriteAllText(
-    $AuthMigrationFile,
-    (($AuthMigrationOutput -join "`n") + "`n"),
-    [Text.Encoding]::ASCII
-  )
-  $AuthMigration = Read-Properties $AuthMigrationFile @(
-    "migrationProtocol", "state", "persistentStateTouched"
-  )
-  foreach ($Key in @(
-    "migrationProtocol", "state", "persistentStateTouched"
-  )) {
-    if (-not $AuthMigration.ContainsKey($Key)) {
-      $LiveStateTouched = $true
-      throw "Legacy Sana authentication migration response is missing $Key."
+  if ($IncompatibleStateReset) {
+    $PreviousResetAuthority = $env:SANA_MCP_INCOMPATIBLE_RESET
+    try {
+      $env:SANA_MCP_INCOMPATIBLE_RESET = "1"
+      $ResetOutput = @(
+        & $Destination __reset-incompatible-state prepare `
+          --journal $IncompatibleResetJournal `
+          --install-dir $InstallDir `
+          --format properties
+      )
+      $ResetExit = $LASTEXITCODE
+    } finally {
+      if ($null -eq $PreviousResetAuthority) {
+        Remove-Item Env:SANA_MCP_INCOMPATIBLE_RESET -ErrorAction SilentlyContinue
+      } else {
+        $env:SANA_MCP_INCOMPATIBLE_RESET = $PreviousResetAuthority
+      }
     }
-  }
-  if ($AuthMigration["migrationProtocol"] -cne "1" -or
-      @(
-        "not-needed", "preserved", "fresh-login-required",
-        "validation-unavailable", "local-session-unavailable"
-      ) -cnotcontains $AuthMigration["state"] -or
-      @("true", "false") -cnotcontains
-        $AuthMigration["persistentStateTouched"]) {
-    $LiveStateTouched = $true
-    throw "Legacy Sana authentication migration returned an invalid response."
-  }
-  $AuthMigrationState = $AuthMigration["state"]
-  $AuthStateTouched =
-    $AuthMigration["persistentStateTouched"] -ceq "true"
-  if (
-    ($AuthStateTouched -and @(
-      "preserved", "fresh-login-required"
-    ) -cnotcontains $AuthMigrationState) -or
-    (-not $AuthStateTouched -and @(
-      "not-needed", "validation-unavailable",
-      "local-session-unavailable"
-    ) -cnotcontains $AuthMigrationState)
-  ) {
-    $LiveStateTouched = $true
-    throw "Legacy Sana authentication migration response is contradictory."
-  }
-  if ($AuthStateTouched) {
-    $LiveStateTouched = $true
-  }
-  switch -CaseSensitive ($AuthMigrationState) {
-    "preserved" {
-      Write-Host "Existing Sana authentication was revalidated and preserved."
+    $IncompatibleResetPrepared = Test-Path -LiteralPath (
+      Join-Path $IncompatibleResetJournal "incompatible-reset.json"
+    ) -PathType Leaf
+    if ($ResetExit -ne 0) {
+      throw "The incompatible local Sana state could not be reset (exit $ResetExit)."
     }
-    "fresh-login-required" {
-      Write-Host "The previous Sana session could not be preserved; sign in again during setup."
+    $ResetFile = Join-Path $TempDir "incompatible-reset.properties"
+    [IO.File]::WriteAllText(
+      $ResetFile,
+      (($ResetOutput -join "`n") + "`n"),
+      [Text.Encoding]::ASCII
+    )
+    $Reset = Read-Properties $ResetFile @(
+      "resetProtocol", "state", "quarantinePresent"
+    )
+    if ($Reset["resetProtocol"] -cne "1" -or
+        $Reset["state"] -cne "fresh" -or
+        @("true", "false") -cnotcontains $Reset["quarantinePresent"]) {
+      throw "The incompatible local Sana reset returned an invalid response."
     }
-    "validation-unavailable" {
-      throw "Existing Sana authentication could not be validated because Sana is unavailable. The previous runtime and unchanged session were restored; rerun the installer when Sana is reachable."
-    }
-    "local-session-unavailable" {
-      throw "Existing Sana authentication could not be read safely. The previous runtime and unchanged session were restored; repair the reported session path and rerun the installer."
-    }
+    $IncompatibleResetPrepared = $true
+    Write-Host "Removed the incompatible local session and meeting cache."
   }
 
   $ConfigJournalDir = Join-Path $InstallDir ".sana-mcp-config-transaction"
@@ -1170,7 +1717,11 @@ try {
   Assert-NotReparse $ConfigJournalDir "Client configuration journal directory"
   $ConfigJournalPreexisting = Test-Path -LiteralPath $ConfigJournalFile
   $ConfigInteractiveAttempted = $false
-  if ($env:SANA_MCP_YES -eq "1") {
+  if ($OldPresent) {
+    Write-Host "Existing MCP client registrations were kept unchanged."
+    $ConfigTransactionState = "no-mutation"
+    $ConfigureExit = 0
+  } elseif ($env:SANA_MCP_YES -eq "1") {
     $LiveStateTouched = $true
     $ConfigOutput = @(
       & $Destination __configure-transaction apply `
@@ -1276,7 +1827,9 @@ try {
     }
   }
 
-  $LiveStateTouched = $true
+  if (-not $IncompatibleStateReset) {
+    $LiveStateTouched = $true
+  }
   if ($OldWasRunning) {
     $Started = Invoke-Lifecycle $Destination "start"
     if ($Started["state"] -cne "running") {
@@ -1299,6 +1852,48 @@ try {
     throw "The user PATH changed before installation completed."
   }
 
+  if ($IncompatibleResetPrepared) {
+    $PreviousResetAuthority = $env:SANA_MCP_INCOMPATIBLE_RESET
+    try {
+      $env:SANA_MCP_INCOMPATIBLE_RESET = "1"
+      & $Destination __reset-incompatible-state commit `
+        --journal $IncompatibleResetJournal `
+        --format properties |
+        Set-Content -LiteralPath (
+          Join-Path $TempDir "incompatible-reset-commit.properties"
+        ) -Encoding ASCII
+      $ResetCommitExit = $LASTEXITCODE
+      if ($ResetCommitExit -ne 0) {
+        throw "reset cleanup returned exit $ResetCommitExit"
+      }
+      $ResetCommit = Read-Properties (
+        Join-Path $TempDir "incompatible-reset-commit.properties"
+      ) @("resetProtocol", "state", "quarantinePresent")
+      if ($ResetCommit["resetProtocol"] -cne "1" -or
+          $ResetCommit["state"] -cne "committed" -or
+          $ResetCommit["quarantinePresent"] -cne "false") {
+        throw "reset cleanup returned an invalid committed response"
+      }
+    } finally {
+      if ($null -eq $PreviousResetAuthority) {
+        Remove-Item Env:SANA_MCP_INCOMPATIBLE_RESET -ErrorAction SilentlyContinue
+      } else {
+        $env:SANA_MCP_INCOMPATIBLE_RESET = $PreviousResetAuthority
+      }
+    }
+    $IncompatibleResetPrepared = $false
+    try {
+      Remove-ResolvedIncompatibleRecovery $IncompatibleResetJournal
+    } catch {
+      [Console]::Error.WriteLine(
+        "sana-mcp: installation succeeded, but committed recovery cleanup remains pending: $($_.Exception.Message)"
+      )
+      [Console]::Error.WriteLine(
+        "sana-mcp: reset recovery journal: $IncompatibleResetJournal"
+      )
+    }
+  }
+
   $Committed = $true
   $TransactionActive = $false
   if ($ConfigTransactionState -ceq "applied") {
@@ -1312,13 +1907,57 @@ try {
     }
   }
   Write-Host "Installed $Destination"
+  if ($IncompatibleStateReset) {
+    Write-Host "Run sana-mcp to sign in again; meetings will be re-synced automatically."
+  }
   if (-not $NewPathManaged -and $MatchingEntries.Count -eq 0) {
     Write-Host "Add $InstallDir to PATH to run sana-mcp from new shells."
   }
 } catch {
   $InstallError = $_.Exception.Message
   $RollbackErrors = @()
+  $StateRollbackCompleted = $false
+  $PreviousRuntimeRestarted = -not ($OldPresent -and $OldWasRunning)
   if ($TransactionActive -and -not $Committed) {
+    $ResetJournalPublished =
+      -not [string]::IsNullOrEmpty($IncompatibleResetJournal) -and
+      (Test-Path -LiteralPath (
+        Join-Path $IncompatibleResetJournal "incompatible-reset.json"
+      ) -PathType Leaf)
+    if ($IncompatibleStateReset -and -not $ResetJournalPublished) {
+      $StateRollbackCompleted = $true
+    }
+    if ($IncompatibleResetPrepared -or $ResetJournalPublished) {
+      $PreviousResetAuthority = $env:SANA_MCP_INCOMPATIBLE_RESET
+      try {
+        $StoppedBeforeStateRollback =
+          Invoke-Lifecycle $Destination "stop"
+        if ($StoppedBeforeStateRollback["state"] -cne "stopped") {
+          throw "replacement daemon did not stop before local-state rollback"
+        }
+        $env:SANA_MCP_INCOMPATIBLE_RESET = "1"
+        & $Destination __reset-incompatible-state rollback `
+          --journal $IncompatibleResetJournal `
+          --format properties | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "reset rollback returned exit $LASTEXITCODE"
+        }
+        $IncompatibleResetPrepared = $false
+        $StateRollbackCompleted = $true
+      } catch {
+        $RetainNewRuntime = $true
+        $PreserveTemp = $true
+        $StateRecoveryIncomplete = $true
+        $RollbackErrors +=
+          "incompatible local-state rollback was incomplete: $($_.Exception.Message)"
+      } finally {
+        if ($null -eq $PreviousResetAuthority) {
+          Remove-Item Env:SANA_MCP_INCOMPATIBLE_RESET -ErrorAction SilentlyContinue
+        } else {
+          $env:SANA_MCP_INCOMPATIBLE_RESET = $PreviousResetAuthority
+        }
+      }
+    }
     $CanRestoreFiles = -not $RetainNewRuntime -and -not $LiveStateTouched
     $FilesRestored = $false
     if ($LiveStateTouched) {
@@ -1353,7 +1992,15 @@ try {
       }
     } elseif ($RetainNewRuntime) {
       try {
-        Set-RetainedRuntimeState
+        if ($StateRecoveryIncomplete) {
+          $StoppedAfterRecoveryFailure =
+            Invoke-Lifecycle $Destination "stop"
+          if ($StoppedAfterRecoveryFailure["state"] -cne "stopped") {
+            throw "Replacement runtime could not be stopped after local-state recovery failed."
+          }
+        } else {
+          Set-RetainedRuntimeState
+        }
       } catch {
         $RollbackErrors += $_.Exception.Message
       }
@@ -1419,8 +2066,20 @@ try {
             throw "previous runtime did not restart"
           }
         }
+        $PreviousRuntimeRestarted = $true
       } catch {
         $RollbackErrors += "could not restart the previous runtime: $($_.Exception.Message)"
+      }
+    }
+    if ($StateRollbackCompleted -and $FilesRestored -and
+        $PreviousRuntimeRestarted -and
+        -not [string]::IsNullOrEmpty($IncompatibleResetJournal)) {
+      try {
+        Remove-ResolvedIncompatibleRecovery $IncompatibleResetJournal
+      } catch {
+        $PreserveTemp = $true
+        $RollbackErrors +=
+          "could not remove the completed incompatible recovery inventory: $($_.Exception.Message)"
       }
     }
     if ($RetainNewRuntime) {
@@ -1459,8 +2118,10 @@ try {
     Invoke-InstallerCleanup `
       $StagedBinary `
       $StagedReceipt `
+      $InstallLockHandle `
       $LockAcquired `
       $InstallLock `
+      $PathLockHandle `
       $PathLockAcquired `
       $PathLock `
       $PreserveTemp `

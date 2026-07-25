@@ -53,35 +53,47 @@ governed by `AGENTS.md`.
 - The one-line command downloads the installer asset from `releases/latest`; a
   pinned install downloads the installer from that exact tag.
 - A versioned manifest freezes asset names, target, SHA-256 filename, binary
-  version, installer protocol, lifecycle protocol, and semantic capability.
+  version, installer protocol, lifecycle protocol, state-compatibility epoch,
+  installer asset/digest, and semantic capability.
 - The downloaded binary exposes a machine-readable internal inspect command for
   embedded version, target, and protocol. Installer handoff variables are
   untrusted display input and never mutation authority.
 - Every redirect remains HTTPS, bounded, and policy-validated.
 
-### Pre-1.0 state transition
+### Pre-1.0 update and incompatible replacement
 
-- A serialized startup gate is shared by CLI, MCP, daemon, store-open, manual
-  binary use, and installer lifecycle. No new entrypoint can open the legacy
-  singleton database.
-- Upgrading is a controlled removal of the old runtime followed by clean
-  installation. Rebuildable transcript, FTS, vector, generated state, and caches
-  are not schema-migrated.
-- Legacy authentication is preserved only when its canonical origin is explicit
-  and proven, legacy cookies can be bound host-only to that origin, `user.me`
-  returns an immutable user ID and an authoritative workspace ID, and the new
-  profile/resync path validates. `lastUsedWorkspaceId`, email, default origin, or
-  another account's workspace are never substitutes.
-- Pending-login state is never migrated.
-- The closed legacy DB, WAL, and SHM are atomically quarantined under a secure
-  transaction journal. They are never exposed through the new profile and remain
-  available for rollback until the new account-scoped profile completes a
-  cursor-valid full listing plus successful reconciliation/re-fetch of every
-  remotely available transcript, meeting-details, and participants artifact, and
-  the rollback window closes. Artifacts that cannot be proven rebuildable keep the
-  quarantine until explicit cleanup.
-- If provenance, auth, resync, ownership, or rollback cannot be proven, the
-  transition stops safely and requires login/manual action.
+- The manifest, standalone binary, and installer receipt carry the same explicit
+  positive state-compatibility epoch. A receipt-backed installation with the same
+  epoch is compatible; a different epoch and a recognized official pre-receipt
+  installation are incompatible.
+- A compatible update verifies the old receipt, binary digest, embedded identity,
+  target, and release tuple before replacing the runtime. It preserves local
+  authentication and meeting/cache state and does not depend on Sana being
+  reachable.
+- An incompatible installation is never migrated. Before mutation, the installer
+  explains that it cannot update in place, that meetings must be resynced and a
+  new login is required, and requests explicit confirmation. Declining is a
+  successful no-op.
+- Automatic incompatible replacement is currently implemented only on Windows.
+  POSIX epoch changes fail safely before confirmation; compatible POSIX updates
+  remain supported. A future POSIX coordinator must implement the same
+  quarantine/rollback contract before enabling destructive consent.
+- After confirmation, the serialized replacement transaction stops the proven
+  daemon, quarantines the canonical default state, publishes and health-checks
+  the new runtime and receipt, then deletes the quarantine only after commit.
+  Failure rolls back the runtime and state. No authentication is copied,
+  converted, or remotely revalidated.
+- An unrecognized receiptless executable is refused. An overridden
+  `SANA_DATA_DIR` or `SANA_TRANSCRIPTS_DIR` is never reset automatically.
+- `sana-mcp update` first proves that it is the canonical installed standalone
+  and that its adjacent receipt, digest, version, target, and compatibility epoch
+  match. It then resolves exact latest-release metadata. Same-version is a no-op;
+  a newer local version is not downgraded; an update hands off to the exact-tag,
+  checksum-verified installer.
+- Future state-breaking releases increment the epoch. Compatible releases retain
+  state; platforms with a reviewed replacement coordinator use explicit consent,
+  while other platforms fail safely. This keeps future update behavior
+  intentional without retaining pre-1.0 schema migration code.
 
 ### Human command grammar
 
@@ -89,6 +101,8 @@ governed by `AGENTS.md`.
 - Bare non-TTY invocation prints a short usage hint and never prompts.
 - `sana-mcp config` and `sana-mcp configure` open client configuration.
 - `sana-mcp disconnect` removes only proven sana-mcp client registrations.
+- `sana-mcp update` verifies the installed runtime and receipt, then uses the
+  exact release's verified installer to update it.
 - `sana-mcp uninstall` stops the daemon, disconnects proven-owned registrations,
   removes the proven installer-owned binary/PATH/receipt, and preserves auth/data.
 - `sana-mcp uninstall --purge-data` additionally removes local auth/cache only
@@ -1128,7 +1142,8 @@ Acceptance:
   inheritance;
 - atomic switch/sign-out, old-store retarget/closure signal, and late-writer
   rejection;
-- legacy session parse and Sana revalidation or typed fresh-login state.
+- active session parse and typed fresh-login state, without any installer-owned
+  authentication conversion path.
 
 ### B-STARTUP-FOUNDATION
 
@@ -1163,17 +1178,14 @@ Acceptance:
 - exact startup/profile journal and bounded quarantine/rollback for session,
   profile identity, DB/WAL/SHM, generated state, and cache only;
 - daemon verified stopped through B-DAEMON-CONTROL before DB/WAL/SHM mutation;
-- auth preservation only after authoritative parse, migration without invented
-  values, and Sana revalidation;
-- old cache is quarantined and retained; this scope never deletes it and cannot
-  claim reconciliation complete;
-- freeze a two-phase transition API and issue one transaction/profile/session
-  reconciliation token after quarantine and auth validation; ordinary CLI,
-  MCP, configurer, direct-store, and user daemon routes remain
-  `transition-required`;
-- leave reconciliation-proof validation, token consumption, and ready
-  publication to the consecutive integration scope after B-STORE freezes the
-  proof schema;
+- compatible receipt-backed updates do not enter this state-transition scope;
+  incompatible replacements start with fresh authentication and cache state;
+- the incompatible cache is quarantined only as rollback inventory; it is never
+  opened by the new runtime and is deleted only after the replacement
+  transaction's local health/daemon commit boundary;
+- no installer transition parses, copies, validates, or publishes legacy
+  authentication, and remote resync is not a prerequisite for committing a
+  locally healthy replacement;
 - typed ready, needs-login, transition-required, manual-action, rollback, and
   persistence-unknown outcomes.
 
@@ -1308,39 +1320,25 @@ Acceptance:
 Three distinct transaction authorities remain explicit:
 
 1. The shell distribution transaction owns executable replacement, managed PATH,
-   receipt, prior-runtime inventory, and old-runtime restart. It never edits auth,
-   cache, or client configuration directly.
+   receipt, prior-runtime inventory, old-runtime restart, and the incompatible
+   replacement handoff. It does not parse or migrate authentication.
 2. The client-config transaction in `src/install/config-transaction.ts` owns only
    proven sana-mcp client registrations and their rollback journal.
-3. The startup/profile transition in `src/runtime/profile-transition.ts` owns
-   auth validation, profile publication, DB/cache quarantine, and the resync
-   gate. Its distinct name must not be shortened to the ambiguous “installer
-   transaction.”
+3. The incompatible-state reset transaction owns only the confirmed,
+   same-parent quarantine/reset/rollback/commit of the canonical default state.
+   It never treats copied authentication as valid and is not entered for a
+   compatible update.
 
-`src/runtime/transition-handoff.ts` freezes a versioned handoff containing one
-transaction ID, authority-specific journal references, prepared/
-committed/rolled-back states, and exact commit order. Distribution prepares the
-new runtime, client configuration records its owned result, and startup/profile
-publishes or rolls back its profile state before distribution can commit and
-discard rollback material. A failure in one authority never grants another
-authority permission to claim or mutate its state.
+The incompatible reset journal records prepared/committed/rolled-back state and
+the exact quarantine path. Distribution prepares the new runtime, performs the
+reset only after explicit consent, and commits the quarantine deletion only
+after runtime replacement, receipt/PATH publication, smoke/health checks, and
+required daemon transition succeed. A failure before commit restores the
+previous runtime and state. Compatible updates bypass reset entirely.
 
-B-STORE defines the authoritative complete-listing and per-artifact
-reconciliation proof port; B-STARTUP-INTEGRATION then owns its validator and
-single-use finalization path. No B production provider may self-certify it.
-C-DAEMON-SYNC implements the production reconciler. Until that exact proof is
-returned, startup remains `transition-required`, keeps the quarantine and
-prior-runtime recovery inventory, and does not describe auth/cache transition as
-complete. C-INSTALLER-TRANSPORT-CLOSURE must verify the complete three-authority
-handoff and commit/rollback path.
-
-Pre-1.0 transition is controlled old-runtime uninstall plus clean new-runtime
-install, not an old-cache compatibility layer. Keep the prior runtime, journal,
-and quarantine until complete health/profile/artifact reconciliation. Never
-purge an unproven artifact or call copied auth preserved before Sana
-revalidation. Every test uses isolated temporary HOME/data/config/PATH/session/
-profile roots, fake network, injected clocks/process probes, and synthetic
-DB/WAL/SHM; no development command touches live `data/`.
+Every test uses isolated temporary HOME/data/config/PATH/session/profile roots,
+fake network, injected clocks/process probes, and synthetic DB/WAL/SHM; no
+development command touches live `data/`.
 
 Protected MCP tool names, aliases, argument meanings, Markdown free text,
 optional YAML frontmatter, and CLI/MCP byte parity remain frozen. Machine
@@ -1618,7 +1616,9 @@ Acceptance:
   cancellation, ownership, and exit contracts;
 - one coherent welcome/select/apply/login/success region plus settled unattended
   and non-TTY behavior;
-- profile-aware auth without claiming copied auth preserved before revalidation;
+- compatible updates preserve state without inspecting authentication;
+  incompatible replacements require a new login and make no auth-preservation
+  claim;
 - proven-owned disconnect and full uninstall, with runtime/registration removal
   separate from explicit confirmed purge;
 - no implicit live-data deletion and `--yes` alone never purges;
@@ -1688,18 +1688,17 @@ Exclusive files:
 - `tests/install/installers.test.ts`
 
 Start with a conformance/evidence pass. A production no-op is correct if the
-frozen lifecycle protocol v1 remains compatible. A discovered incompatibility
-stops work for the plan amendment defined in Stage B; this scope cannot make a
-partial protocol change. Preserve all clean Stage A transport invariants:
+frozen lifecycle protocol remains compatible. A discovered incompatibility
+must be reflected in the release compatibility epoch and use the reviewed
+destructive replacement consent flow. Preserve all clean Stage A transport
+invariants:
 exact tag/manifest/binary/checksum identity, HTTPS and size bounds, ownership/
 path/link checks, unique local temps, smoke before replacement, serialized
 lock/journal/rollback, old-runtime retention/restart, PATH receipts, checked
-failures, and truthful noninteractive deferral. Use B's verified instance/
-manual-action protocol and profile coordinator; never fall back to a bare PID or
-invented path/version/auth value. Verify the versioned transaction ID, three
-authority-specific journals, commit order, rollback, transition-required state,
-and later reconciliation-proof completion end to end. Native release proof
-remains Stage D.
+failures, and truthful noninteractive deferral. Never fall back to a bare PID or
+invented path, version, compatibility epoch, or authentication value. Verify
+compatible-update state preservation and incompatible replacement
+prepare/rollback/commit end to end. Native release proof remains Stage D.
 
 ### Stage C review
 

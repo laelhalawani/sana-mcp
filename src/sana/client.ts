@@ -7,7 +7,6 @@ import {
   type TranscriptSegment,
 } from "./types.js";
 import { loadConfig, sessionFile } from "../config.js";
-import { RUNTIME_DEFAULTS } from "../runtime/env.js";
 import { readJsonFile, writeJsonAtomic } from "../runtime/secure-files.js";
 
 interface SessionData {
@@ -260,9 +259,9 @@ export class SanaClient {
     this.workspaceId = data?.workspaceId;
     this.email = data?.email;
     this.pendingLogin = data?.pendingLogin ?? null;
-    // Pre-generation session files are the intentional generation-zero input
-    // to the pre-1.0 local migration. SQLite validation rejects this value if
-    // the durable store has already advanced.
+    // Generation-zero remains the explicit baseline for a session file that
+    // predates durable authentication publication. SQLite validation rejects
+    // it if the durable store has already advanced.
     this.generation = data?.generation ?? 0;
     this.publicationToken = data?.publicationToken ?? null;
     this.baseUrl = loadConfig().baseUrl.replace(/\/$/, "");
@@ -288,60 +287,6 @@ export class SanaClient {
       throw new LegacyPartialSessionError();
     }
     return new SanaClient(result.value);
-  }
-
-  /**
-   * Read a pre-publication session without trusting its saved routing identity.
-   * Origin-less cookies from the old runtime may be sent only to Sana's product
-   * origin, and callers must still revalidate them through `me()` before saving.
-   */
-  static loadPre1SessionForMigration(): Pre1SessionMigrationInput {
-    const result = readJsonFile(sessionFile(), sessionFileSchema);
-    if (result.kind === "missing") return { kind: "not-needed" };
-    const saved = result.value;
-    if ("generation" in saved && saved.generation !== undefined) {
-      return { kind: "not-needed" };
-    }
-
-    const cookies = CookieJar.fromJSON(saved.cookies);
-    const hasLegacyState =
-      cookies.has(AUTH_COOKIE) ||
-      saved.userId !== undefined ||
-      saved.workspaceId !== undefined ||
-      saved.pendingLogin != null;
-    if (!hasLegacyState) return { kind: "not-needed" };
-
-    const sourceVersion = {
-      generation: 0,
-      publicationToken: null,
-      userId: null,
-      workspaceId: null,
-    } as const;
-    if (!cookies.has(AUTH_COOKIE) || saved.pendingLogin != null) {
-      return { kind: "fresh-login-required", sourceVersion };
-    }
-
-    const configuredOrigin = new URL(
-      loadConfig().baseUrl.replace(/\/$/, ""),
-    ).origin;
-    const legacyOrigin =
-      saved.authenticatedOrigin ?? RUNTIME_DEFAULTS.baseUrl;
-    if (
-      configuredOrigin !== RUNTIME_DEFAULTS.baseUrl ||
-      legacyOrigin !== configuredOrigin
-    ) {
-      return { kind: "fresh-login-required", sourceVersion };
-    }
-
-    return {
-      kind: "candidate",
-      client: new SanaClient({
-        cookies: saved.cookies,
-        email: saved.email,
-        authenticatedOrigin: configuredOrigin,
-      }),
-      sourceVersion,
-    };
   }
 
   /**
@@ -917,28 +862,6 @@ export class SanaClient {
     );
   }
 }
-
-export type Pre1SessionMigrationInput =
-  | Readonly<{ kind: "not-needed" }>
-  | Readonly<{
-      kind: "fresh-login-required";
-      sourceVersion: Readonly<{
-        generation: 0;
-        publicationToken: null;
-        userId: null;
-        workspaceId: null;
-      }>;
-    }>
-  | Readonly<{
-      kind: "candidate";
-      client: SanaClient;
-      sourceVersion: Readonly<{
-        generation: 0;
-        publicationToken: null;
-        userId: null;
-        workspaceId: null;
-      }>;
-    }>;
 
 function isExactLoopbackHost(hostname: string): boolean {
   return (
