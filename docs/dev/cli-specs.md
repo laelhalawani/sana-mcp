@@ -15,9 +15,9 @@ flags, environment variables, and exit/edge behaviour.
 
 Status legend used throughout:
 
-- [shipped] - live as of the current release (v0.3.2).
-- [planned] - designed (see the per-area design docs in `docs/dev/`) and part of
-  the v0.4.0 work; not yet in the shipped binary.
+- [shipped] - implemented in the current `v0.4.0` release candidate.
+- [planned] - designed in the per-area documents but not implemented in the
+  current release candidate.
 
 Style: hyphens only, never em/en dashes. All timestamps are UTC unless stated.
 
@@ -29,16 +29,17 @@ Style: hyphens only, never em/en dashes. All timestamps are UTC unless stated.
 
 | Face | Invocation | Purpose |
 |---|---|---|
-| Interactive app | `sana-mcp` (no args, in a terminal) | Browse/search/read meetings, sign in, configure clients [planned]. Until v0.4.0, bare invocation opens the configurer [shipped]. |
+| Interactive app | `sana-mcp` (no args, in a terminal) | Browse, search, read meetings, sign in, and configure clients [shipped]. |
 | Client configurer | `sana-mcp install` (aliases `config`, `configure`) | Detect installed AI clients and register/unregister the MCP server with them. |
 | One-shot tool | `sana-mcp <tool> [json]` + flags | Non-interactive, scriptable output of a single capability (help/status/list/read/search/...). |
 | MCP server | `sana-mcp mcp` | Speak MCP over stdio; this is what AI clients launch. |
 | Background daemon | `sana-mcp daemon` | The only component that talks to Sana; syncs meetings into local SQLite. |
 | Uninstaller | `sana-mcp uninstall` | Remove the server from chosen clients. |
 
-The binary is produced with `bun build --compile` and cross-compiled to six
-targets: linux x64/arm64, darwin x64/arm64, windows x64/arm64. It embeds the Bun
-runtime, so end users need nothing else installed.
+The binary is produced with `bun build --compile` for seven verified targets:
+Linux x64/ARM64 with glibc or musl, macOS x64/Apple Silicon, and Windows x64.
+Windows ARM64 is not currently published. It embeds the Bun runtime, so end
+users need nothing else installed.
 
 Data is local-only. A background daemon downloads meetings, transcripts, and
 metadata into a local SQLite database; all read commands serve from that DB and
@@ -522,11 +523,11 @@ No data leaves the machine except authenticated requests to Sana itself.
 - Build: `bun build src/cli.ts --compile --target=bun-<os>-<arch>
   --external @huggingface/transformers --external sqlite-vec` per target.
 - Version is single-sourced from `package.json` (read by `cli.ts` and `mcp.ts`).
-- CI (`.github/workflows/release.yml`): on a push to `main` that carries a new
-  `package.json` version (or a `v*` tag, or `workflow_dispatch`), the six targets
-  build in parallel, upload artifacts, and a single `publish` job attaches all
-  binaries + their `.sha256` to the release (a single-writer publish avoids the
-  parallel-upload race). Tags containing `-` publish as prereleases.
+- CI (`.github/workflows/release.yml`): on a push to `main` whose
+  `v<package.json version>` tag does not exist (or a matching `v*` tag or manual
+  dispatch), the verified target matrix builds in parallel, uploads artifacts,
+  and a single `publish` job validates and publishes the complete manifest-bound
+  tuple. Tags containing `-` publish as prereleases.
 - Installers resolve `releases/latest`, so the one-liner always fetches the
   newest release.
 

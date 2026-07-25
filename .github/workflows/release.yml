@@ -1,34 +1,36 @@
 name: release
 
-# Releases are deliberate: an existing exact tag is selected manually, then the
-# protected `release` environment approves that commit before any build starts.
+# Build and publish an exact, manifest-bound release tuple:
+#   - a v* tag push releases that package-matching tag;
+#   - a main push releases v<package version> only when that tag is absent;
+#   - a manual dispatch rebuilds or resumes an existing package-matching tag.
 on:
+  push:
+    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing package-matching tag to release (for example v0.3.2)"
+        description: "Existing package-matching tag to release (for example v0.4.0)"
         required: true
         type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-${{ inputs.tag }}
-  cancel-in-progress: false
-
 jobs:
   authorize:
     runs-on: ubuntu-24.04
-    environment: release
     outputs:
       tag: ${{ steps.verify.outputs.tag }}
       sha: ${{ steps.verify.outputs.sha }}
+      skip: ${{ steps.verify.outputs.skip }}
+      create_tag: ${{ steps.verify.outputs.create_tag }}
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       # oven-sh/setup-bun v2.2.0
@@ -37,27 +39,114 @@ jobs:
           bun-version: "1.3.14"
       - id: verify
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
           REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           package_tag="v$(bun -e 'import p from "./package.json"; process.stdout.write(p.version)')"
-          test "$REQUESTED_TAG" = "$package_tag" ||
-            { echo "Tag $REQUESTED_TAG does not match package version $package_tag" >&2; exit 1; }
-          git show-ref --verify --quiet "refs/tags/$REQUESTED_TAG" ||
-            { echo "$REQUESTED_TAG is not an existing tag" >&2; exit 1; }
-          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$REQUESTED_TAG")" ||
-            { echo "Checkout is not the exact requested tag commit" >&2; exit 1; }
-          source_sha="$(git rev-parse "$REQUESTED_TAG^{commit}")"
+          source_sha="$(git rev-parse HEAD)"
           test "${#source_sha}" -eq 40 ||
             { echo "Resolved source commit is not a full SHA" >&2; exit 1; }
           case "$source_sha" in
             *[!a-f0-9]*) echo "Resolved source commit is not lowercase hexadecimal" >&2; exit 1 ;;
           esac
-          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            release_tag=$REQUESTED_TAG
+          elif [ "$REF_TYPE" = "tag" ]; then
+            release_tag=$REF_NAME
+          else
+            release_tag=$package_tag
+          fi
+
+          test "$release_tag" = "$package_tag" ||
+            { echo "Tag $release_tag does not match package version $package_tag" >&2; exit 1; }
+
+          tag_probe_error="$(mktemp)"
+          trap 'rm -f "$tag_probe_error"' EXIT
+          resolve_tag_commit() {
+            tag_name=$1
+            error_file=$2
+            : > "$error_file"
+            if ! ref_object=$(
+              gh api \
+                "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name" \
+                --jq '.object.type + " " + .object.sha' 2> "$error_file"
+            ); then
+              if grep -q "HTTP 404" "$error_file"; then
+                return 2
+              fi
+              return 1
+            fi
+            object_type=${ref_object%% *}
+            object_sha=${ref_object#* }
+            if [ "$object_type" = "tag" ]; then
+              if ! tag_object=$(
+                gh api \
+                  "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                  --jq '.object.type + " " + .object.sha' 2>> "$error_file"
+              ); then
+                return 1
+              fi
+              object_type=${tag_object%% *}
+              object_sha=${tag_object#* }
+            fi
+            if [ "$object_type" != "commit" ]; then
+              echo "Tag $tag_name does not resolve directly to a commit." > "$error_file"
+              return 1
+            fi
+            test "${#object_sha}" -eq 40 ||
+              { echo "Tag $tag_name resolved to an invalid commit SHA." > "$error_file"; return 1; }
+            case "$object_sha" in
+              *[!a-f0-9]*) echo "Tag $tag_name resolved to an invalid commit SHA." > "$error_file"; return 1 ;;
+            esac
+            printf '%s\n' "$object_sha"
+          }
+
+          tag_exists=false
+          remote_tag_sha=""
+          if remote_tag_sha=$(
+            resolve_tag_commit "$release_tag" "$tag_probe_error"
+          ); then
+            tag_exists=true
+          else
+            probe_status=$?
+            if [ "$probe_status" -ne 2 ]; then
+              cat "$tag_probe_error" >&2
+              echo "Could not determine whether $release_tag already exists." >&2
+              exit 1
+            fi
+          fi
+
+          create_tag=false
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
+            if [ "$tag_exists" = "true" ]; then
+              echo "$release_tag already exists; this main push has no new package version."
+              echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+              echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "create_tag=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            create_tag=true
+          else
+            [ "$tag_exists" = "true" ] ||
+              { echo "$release_tag is not an existing tag" >&2; exit 1; }
+            test "$source_sha" = "$remote_tag_sha" ||
+              { echo "Checkout is not the exact requested tag commit" >&2; exit 1; }
+          fi
+
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "create_tag=$create_tag" >> "$GITHUB_OUTPUT"
 
   linux:
     needs: authorize
+    if: needs.authorize.outputs.skip != 'true'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -131,6 +220,7 @@ jobs:
 
   macos:
     needs: authorize
+    if: needs.authorize.outputs.skip != 'true'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -184,6 +274,7 @@ jobs:
 
   windows:
     needs: authorize
+    if: needs.authorize.outputs.skip != 'true'
     name: bun-windows-x64
     runs-on: windows-2022
     steps:
@@ -242,6 +333,10 @@ jobs:
 
   publish:
     needs: [authorize, linux, macos, windows]
+    if: needs.authorize.outputs.skip != 'true'
+    concurrency:
+      group: release-${{ needs.authorize.outputs.tag }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -275,25 +370,121 @@ jobs:
             --artifacts-dir dist-assets \
             --output-dir release-assets
           sh -n release-assets/install.sh
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 33
       - name: Publish the immutable tuple
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.authorize.outputs.tag }}
           SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
+          CREATE_TAG: ${{ needs.authorize.outputs.create_tag }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin "refs/tags/$RELEASE_TAG"
-          test "$(git rev-parse FETCH_HEAD^{commit})" = "$SOURCE_SHA" ||
-            { echo "Release tag moved after authorization" >&2; exit 1; }
+          create_tag=$CREATE_TAG
+          case "$create_tag" in
+            true|false) ;;
+            *) echo "CREATE_TAG must be exactly true or false." >&2; exit 1 ;;
+          esac
+          publish_work="$(mktemp -d)"
+          trap 'find "$publish_work" -depth -delete' EXIT
+          resolve_tag_commit() {
+            tag_name=$1
+            error_file=$2
+            : > "$error_file"
+            if ! ref_object=$(
+              gh api \
+                "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name" \
+                --jq '.object.type + " " + .object.sha' 2> "$error_file"
+            ); then
+              if grep -q "HTTP 404" "$error_file"; then
+                return 2
+              fi
+              return 1
+            fi
+            object_type=${ref_object%% *}
+            object_sha=${ref_object#* }
+            if [ "$object_type" = "tag" ]; then
+              if ! tag_object=$(
+                gh api \
+                  "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                  --jq '.object.type + " " + .object.sha' 2>> "$error_file"
+              ); then
+                return 1
+              fi
+              object_type=${tag_object%% *}
+              object_sha=${tag_object#* }
+            fi
+            if [ "$object_type" != "commit" ]; then
+              echo "Tag $tag_name does not resolve directly to a commit." > "$error_file"
+              return 1
+            fi
+            test "${#object_sha}" -eq 40 ||
+              { echo "Tag $tag_name resolved to an invalid commit SHA." > "$error_file"; return 1; }
+            case "$object_sha" in
+              *[!a-f0-9]*) echo "Tag $tag_name resolved to an invalid commit SHA." > "$error_file"; return 1 ;;
+            esac
+            printf '%s\n' "$object_sha"
+          }
+
+          tag_probe_error="$publish_work/tag-probe.error"
+          verify_release_tag() {
+            if ! observed_tag_sha=$(
+              resolve_tag_commit "$RELEASE_TAG" "$tag_probe_error"
+            ); then
+              cat "$tag_probe_error" >&2
+              echo "Could not resolve release tag $RELEASE_TAG." >&2
+              exit 1
+            fi
+            test "$observed_tag_sha" = "$SOURCE_SHA" ||
+              { echo "Release tag moved after authorization" >&2; exit 1; }
+          }
+
+          if observed_tag_sha=$(
+            resolve_tag_commit "$RELEASE_TAG" "$tag_probe_error"
+          ); then
+            test "$observed_tag_sha" = "$SOURCE_SHA" ||
+              { echo "Release tag moved after authorization" >&2; exit 1; }
+          else
+            probe_status=$?
+            if [ "$probe_status" -ne 2 ]; then
+              cat "$tag_probe_error" >&2
+              echo "Could not resolve release tag $RELEASE_TAG." >&2
+              exit 1
+            fi
+            if [ "$create_tag" != "true" ]; then
+              echo "Release tag $RELEASE_TAG disappeared after authorization." >&2
+              exit 1
+            fi
+
+            tag_create_error="$publish_work/tag-create.error"
+            if ! gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" \
+              -f "sha=$SOURCE_SHA" \
+              > /dev/null 2> "$tag_create_error"
+            then
+              # A concurrent exact tag creation is safe; every other failure
+              # remains observable and stops before release mutation.
+              if observed_tag_sha=$(
+                resolve_tag_commit "$RELEASE_TAG" "$tag_probe_error"
+              ); then
+                test "$observed_tag_sha" = "$SOURCE_SHA" ||
+                  { echo "Release tag moved after authorization" >&2; exit 1; }
+              else
+                cat "$tag_create_error" >&2
+                cat "$tag_probe_error" >&2
+                echo "Could not create release tag $RELEASE_TAG." >&2
+                exit 1
+              fi
+            else
+              verify_release_tag
+            fi
+          fi
           tag_without_build="${RELEASE_TAG%%+*}"
           expected_prerelease=false
           case "$tag_without_build" in
             *-*) expected_prerelease=true ;;
           esac
 
-          publish_work="$(mktemp -d)"
-          trap 'find "$publish_work" -depth -delete' EXIT
           release_json="$publish_work/release.json"
           release_error="$publish_work/release.error"
           local_names="$publish_work/local-names"
@@ -315,7 +506,6 @@ jobs:
                 import { readFileSync } from "node:fs";
                 const release = JSON.parse(readFileSync(process.argv[1], "utf8"));
                 console.log(release.tag_name);
-                console.log(release.target_commitish);
                 console.log(String(release.draft));
                 console.log(release.name);
                 console.log(String(release.prerelease));
@@ -323,12 +513,10 @@ jobs:
             )
             test "${identity[0]}" = "$RELEASE_TAG" ||
               { echo "Existing release tag does not match the requested tag" >&2; exit 1; }
-            test "${identity[1]}" = "$SOURCE_SHA" ||
-              { echo "Existing release targets a different source commit" >&2; exit 1; }
-            release_is_draft="${identity[2]}"
-            test "${identity[3]}" = "$RELEASE_TAG" ||
+            release_is_draft="${identity[1]}"
+            test "${identity[2]}" = "$RELEASE_TAG" ||
               { echo "Existing release title does not match the requested tag" >&2; exit 1; }
-            test "${identity[4]}" = "$expected_prerelease" ||
+            test "${identity[3]}" = "$expected_prerelease" ||
               { echo "Existing release prerelease classification is incorrect" >&2; exit 1; }
           }
 
@@ -374,6 +562,7 @@ jobs:
               --target "$SOURCE_SHA" \
               --title "$RELEASE_TAG" \
               "${prerelease[@]}"
+            verify_release_tag
             fetch_release
             validate_release_identity
           else
@@ -381,8 +570,11 @@ jobs:
             exit 1
           fi
 
+          verify_release_tag
+
           if [ "$release_is_draft" = "false" ]; then
             verify_remote_assets true
+            verify_release_tag
             echo "Release $RELEASE_TAG is already published with the authorized tuple."
             exit 0
           fi
@@ -402,4 +594,11 @@ jobs:
           test "$release_is_draft" = "true" ||
             { echo "Release publication state changed concurrently" >&2; exit 1; }
           verify_remote_assets true
+          verify_release_tag
           gh release edit "$RELEASE_TAG" --draft=false
+          fetch_release
+          validate_release_identity
+          test "$release_is_draft" = "false" ||
+            { echo "Release remained a draft after publication" >&2; exit 1; }
+          verify_remote_assets true
+          verify_release_tag
