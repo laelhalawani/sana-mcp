@@ -472,7 +472,9 @@ linuxOnlyTest("release resolver distinguishes version reuse, new versions, and l
     assert.notEqual(unavailable.result.status, 0);
     assert.match(
       unavailable.result.stderr,
-      /Could not determine whether v0\.4\.0 already exists/,
+      new RegExp(
+        `Could not determine whether v${packageMetadata.version.replaceAll(".", "\\.")} already exists`,
+      ),
     );
 
     const tagPush = execute({
@@ -509,7 +511,9 @@ linuxOnlyTest("release resolver distinguishes version reuse, new versions, and l
     assert.notEqual(annotatedObjectMissing.result.status, 0);
     assert.match(
       annotatedObjectMissing.result.stderr,
-      /Could not determine whether v0\.4\.0 already exists/,
+      new RegExp(
+        `Could not determine whether v${packageMetadata.version.replaceAll(".", "\\.")} already exists`,
+      ),
     );
 
     const matchingManual = execute({
@@ -1052,7 +1056,9 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         assert.notEqual(releaseLookupFailure.status, 0);
         assert.match(
           releaseLookupFailure.stderr,
-          /Could not resolve release v0\.4\.0/,
+          new RegExp(
+            `Could not resolve release v${packageMetadata.version.replaceAll(".", "\\.")}`,
+          ),
         );
 
         const movedTagSha =

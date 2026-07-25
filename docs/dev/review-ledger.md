@@ -1492,3 +1492,51 @@ requires the same validated release identity before mutation continues.
 Focused typecheck and release/projection validation passed: 6 tests, 0 failed.
 The existing empty draft remains bound to tag commit `b77bb12` and requires no
 deletion or tag movement.
+
+## Windows pre-receipt upgrade and download UX correction (`v0.4.1`)
+
+Development owner: `/root`.
+
+Exact scope files:
+
+- `install.ps1`;
+- `src/cli.ts`, `src/install/legacy-auth-migration.ts`;
+- `src/sana/client.ts`, `src/store/db.ts`;
+- `tests/install/installers.test.ts`,
+  `tests/install/legacy-auth-migration.test.ts`,
+  `tests/sana/session-publication.test.ts`;
+- `package.json`, `README.md`, `install.sh`,
+  `.github/workflows/release.yml`, `docs/dev/cli-specs.md`;
+- `tests/fixtures/manifest/invalid-unknown-field.json`,
+  `tests/fixtures/manifest/valid-all-targets.json`,
+  `tests/install/manifest.test.ts`,
+  `tests/release/release.test.ts`.
+
+The scope restores the Windows progress bar, transferred/total size, measured
+speed, ETA, and final frame; fixes null-to-empty cleanup handling; recognizes
+only digest-proven official Windows x64 binaries from the pre-receipt releases;
+handles only an exact-path legacy daemon; preserves receipt and PATH ownership
+through rollback; and migrates legacy authentication only after authoritative
+Sana revalidation and CAS publication. Expired or malformed sessions become a
+canonical signed-out generation, with malformed bytes retained at the bounded
+corrupt-session recovery path. Network or local-session unavailability is a
+no-mutation failure that restores the prior runtime.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/legacy_upgrade_scope_review_1` | Validation-unavailable could commit an unusable runtime; malformed/unreadable sessions could strand the new runtime; reset invariants admitted identity; direct Windows legacy coverage was incomplete | Made remote/local unavailability roll back, preserved malformed JSON then published an explicit signed-out reset, required reset identities to be null at API and persisted-state boundaries, and added digest/daemon/transaction harness coverage | correction required fresh review |
+| `/root/legacy_upgrade_scope_review_2` | none | n/a | CLEAN - zero findings |
+| `/root/v041_cross_cutting_review_1` | The shared `v0.1.0-rc1`/`v0.1.0` Windows digest was accepted but labeled only as `v0.1.0`, obscuring the release ambiguity | Labeled the one authoritative digest as shared by both exact releases and added harness coverage | correction required fresh review |
+| `/root/v041_cross_cutting_review_2` | none | n/a | CLEAN - zero findings |
+
+Validation evidence:
+
+- complete `bun test`: 564 passed, 1 platform skip, 0 failed;
+- `bun run typecheck`: passed;
+- PowerShell AST parsing: passed;
+- focused PowerShell digest, daemon, progress, cleanup, and transaction
+  harnesses: passed;
+- focused legacy-auth migration and publication tests: passed;
+- `git diff --check`: clean;
+- all session, store, process, HOME, PATH, and network scenarios used isolated
+  test state rather than the live Sana data tree.

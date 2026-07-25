@@ -175,6 +175,23 @@ program
     );
   });
 
+program
+  .command("__migrate-legacy-auth", { hidden: true })
+  .description("Revalidate and publish a pre-1.0 Sana session")
+  .option("--format <format>", "machine format: properties", "properties")
+  .action(async (opts: { format: string }) => {
+    requireStandaloneInstallerCommand("__migrate-legacy-auth");
+    if (opts.format !== "properties") {
+      throw new Error("__migrate-legacy-auth --format must be properties");
+    }
+    const {
+      migrateLegacyAuthentication,
+      serializeLegacyAuthMigrationResult,
+    } = await import("./install/legacy-auth-migration.js");
+    const result = await migrateLegacyAuthentication();
+    process.stdout.write(serializeLegacyAuthMigrationResult(result));
+  });
+
 function requireStandaloneInstallerCommand(command: string): void {
   if (!BUILD_INFO.standalone) {
     throw new Error(`${command} is available only in a standalone build`);

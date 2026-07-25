@@ -181,7 +181,11 @@ export type DaemonLeaseClaim =
       ownerHeartbeat: "recent" | "stale";
     }>;
 
-export type AuthPublicationKind = "request-code" | "login" | "refresh";
+export type AuthPublicationKind =
+  | "request-code"
+  | "login"
+  | "refresh"
+  | "reset";
 
 export interface SessionVersion {
   readonly generation: number;
@@ -1979,6 +1983,14 @@ function validatePublicationIdentity(
       `${kind} publication requires an authoritative user and workspace identity`,
     );
   }
+  if (
+    kind === "reset" &&
+    (identity.userId !== null || identity.workspaceId !== null)
+  ) {
+    throw new TypeError(
+      "reset publication cannot retain an unvalidated user or workspace identity",
+    );
+  }
 }
 
 function validateSyncCycleIdentity(cycle: SyncCycleIdentity): void {
@@ -2086,7 +2098,8 @@ function authStateInvariantIssue(state: SyncState): string | null {
       !isUuid(state.auth_transition_token) ||
       (state.auth_transition_kind !== "request-code" &&
         state.auth_transition_kind !== "login" &&
-        state.auth_transition_kind !== "refresh") ||
+        state.auth_transition_kind !== "refresh" &&
+        state.auth_transition_kind !== "reset") ||
       (state.auth_transition_user_id === null) !==
         (state.auth_transition_workspace_id === null) ||
       (state.auth_transition_user_id !== null &&
@@ -2096,7 +2109,10 @@ function authStateInvariantIssue(state: SyncState): string | null {
       ((state.auth_transition_kind === "login" ||
         state.auth_transition_kind === "refresh") &&
         (state.auth_transition_user_id === null ||
-          state.auth_transition_workspace_id === null))
+          state.auth_transition_workspace_id === null)) ||
+      (state.auth_transition_kind === "reset" &&
+        (state.auth_transition_user_id !== null ||
+          state.auth_transition_workspace_id !== null))
     ) {
       return "Persisted pending authentication publication tuple is malformed";
     }
@@ -2126,7 +2142,8 @@ function authStateInvariantIssue(state: SyncState): string | null {
           state.auth_issue_generation <= 0 ||
           (state.auth_issue_kind !== "request-code" &&
             state.auth_issue_kind !== "login" &&
-            state.auth_issue_kind !== "refresh"))
+            state.auth_issue_kind !== "refresh" &&
+            state.auth_issue_kind !== "reset"))
   ) {
     return "Persisted authentication issue provenance is malformed";
   }
