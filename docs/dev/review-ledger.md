@@ -1540,3 +1540,47 @@ Validation evidence:
 - `git diff --check`: clean;
 - all session, store, process, HOME, PATH, and network scenarios used isolated
   test state rather than the live Sana data tree.
+
+### v0.4.1 publication consistency correction
+
+GitHub Actions run `30168730634` passed all seven native builds but its first
+publish attempt briefly could not see the draft it had just created through the
+paginated releases listing. Attempt 2 resumed that exact draft, verified and
+uploaded the immutable tuple, and published `v0.4.1` without moving its tag.
+
+Development owner: `/root`.
+
+Exact correction files:
+
+- `.github/workflows/release.yml`;
+- `tests/release/release.test.ts`.
+
+Planning was independently fanned out to `/root/release_race_plan_a` and
+`/root/release_race_plan_b`. The consolidated plan was independently reviewed
+by `/root/release_race_plan_review_1` and
+`/root/release_race_plan_review_2`. Both reviewers required post-create failure
+injection so the tests exercised `require_release`, explicit lookup/sleep
+counts, and immediate-failure coverage for malformed and duplicate release
+results; those requirements were incorporated before development.
+
+The correction retains `fetch_release`'s exact status, retries only a missing
+exact release with five bounded probes and four maximum one-second waits, and
+keeps API, parse, and duplicate-result failures immediate. Every successful
+lookup still passes the existing release identity, tag, draft, and exact-asset
+checks before publication continues.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/release_race_scope_review_1` | none | n/a | CLEAN - zero findings |
+| `/root/release_race_cross_review_1` | none | n/a | CLEAN - zero findings |
+
+Validation evidence:
+
+- focused release suite: 5 passed, 0 failed;
+- `bun run typecheck`: passed;
+- behavioral coverage proves two transient misses recover, five misses exhaust
+  without upload/publication, and API, malformed JSON, and duplicate results
+  fail immediately without retry;
+- public `v0.4.1` is non-draft and the latest `install.ps1` resolves to its
+  published asset;
+- `git diff --check`: clean.
