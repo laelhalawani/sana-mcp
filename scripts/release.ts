@@ -42,6 +42,9 @@ const inspectedBuildSchema = z
     installerProtocol: z.literal(SUPPORTED_RELEASE_PROTOCOLS.installerProtocol),
     lifecycleProtocol: z.literal(SUPPORTED_RELEASE_PROTOCOLS.lifecycleProtocol),
     inspectProtocol: z.literal(SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol),
+    stateCompatibility: z.literal(
+      SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility,
+    ),
     semanticCapability: z.literal(STANDALONE_SEMANTIC_CAPABILITY),
   })
   .strict();
@@ -123,9 +126,24 @@ export function releaseProperties(
   manifest: ReleaseManifest,
   asset: ReleaseAsset,
   manifestSha256: string,
+  installer: Readonly<{
+    assetName: "install.ps1" | "install.sh";
+    sha256: string;
+  }>,
 ): string {
   if (!sha256Pattern.test(manifestSha256)) {
     throw new Error("manifest SHA-256 is invalid");
+  }
+  const expectedInstaller = asset.target.startsWith("bun-windows-")
+    ? "install.ps1"
+    : "install.sh";
+  if (installer.assetName !== expectedInstaller) {
+    throw new Error(
+      `installer asset must be ${expectedInstaller} for target ${asset.target}`,
+    );
+  }
+  if (!sha256Pattern.test(installer.sha256)) {
+    throw new Error("installer SHA-256 is invalid");
   }
   return [
     "format=sana-mcp-release-v1",
@@ -137,7 +155,10 @@ export function releaseProperties(
     `installerProtocol=${manifest.installerProtocol}`,
     `lifecycleProtocol=${manifest.lifecycleProtocol}`,
     `inspectProtocol=${manifest.inspectProtocol}`,
+    `stateCompatibility=${manifest.stateCompatibility}`,
     `semanticCapability=${manifest.semanticCapability}`,
+    `installerAssetName=${installer.assetName}`,
+    `installerSha256=${installer.sha256}`,
     `target=${asset.target}`,
     ...(asset.libc === undefined ? [] : [`libc=${asset.libc}`]),
     `assetName=${asset.assetName}`,
@@ -218,6 +239,11 @@ export async function assembleRelease(options: {
   });
 
   await mkdir(options.outputDirectory, { recursive: true });
+  const root = options.repositoryRoot ?? process.cwd();
+  const installerDigests = {
+    "install.ps1": await sha256File(path.join(root, "install.ps1")),
+    "install.sh": await sha256File(path.join(root, "install.sh")),
+  } as const;
   for (const asset of manifest.assets) {
     const source = path.join(options.artifactsDirectory, asset.assetName);
     const destination = path.join(options.outputDirectory, asset.assetName);
@@ -245,7 +271,14 @@ export async function assembleRelease(options: {
     const metadataPath = path.join(options.outputDirectory, metadataName);
     await writeFile(
       metadataPath,
-      releaseProperties(manifest, asset, manifestSha256),
+      releaseProperties(manifest, asset, manifestSha256, {
+        assetName: asset.target.startsWith("bun-windows-")
+          ? "install.ps1"
+          : "install.sh",
+        sha256: asset.target.startsWith("bun-windows-")
+          ? installerDigests["install.ps1"]
+          : installerDigests["install.sh"],
+      }),
       "utf8",
     );
     await writeFile(
@@ -255,7 +288,6 @@ export async function assembleRelease(options: {
     );
   }
 
-  const root = options.repositoryRoot ?? process.cwd();
   for (const relative of [
     "install.sh",
     "install.ps1",
@@ -265,6 +297,16 @@ export async function assembleRelease(options: {
       path.join(root, relative),
       path.join(options.outputDirectory, path.basename(relative)),
     );
+    if (relative === "install.sh" || relative === "install.ps1") {
+      const installerName = path.basename(relative) as
+        | "install.sh"
+        | "install.ps1";
+      await writeFile(
+        path.join(options.outputDirectory, `${installerName}.sha256`),
+        checksumText(installerDigests[installerName], installerName),
+        "utf8",
+      );
+    }
   }
   return manifest;
 }

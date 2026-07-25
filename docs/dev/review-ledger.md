@@ -1584,3 +1584,62 @@ Validation evidence:
 - public `v0.4.1` is non-draft and the latest `install.ps1` resolves to its
   published asset;
 - `git diff --check`: clean.
+
+## Pre-1.0 incompatible replacement and standalone update (`v0.4.2`)
+
+Development owner: `/root`.
+
+Exact scope files:
+
+- `install.ps1`, `install.sh`;
+- `src/cli.ts`, `src/install/incompatible-reset.ts`,
+  `src/install/update.ts`;
+- removed `src/install/legacy-auth-migration.ts`;
+- `src/install/manifest.ts`, `src/release/contract.ts`,
+  `src/runtime/build-info.ts`, `scripts/release.ts`,
+  `release/manifest.schema.json`;
+- `src/sana/client.ts`, `src/store/db.ts`;
+- `package.json`, `.github/workflows/release.yml`, `AGENTS.md`, `README.md`,
+  `docs/dev/cli-specs.md`, `docs/dev/remediation-plan.md`;
+- the corresponding installer, update, release, runtime, store, Sana, and CLI
+  tests and release-manifest fixtures.
+
+Planning was split between `/root/overwrite_install_plan` and
+`/root/cli_update_plan`. The consolidated design was independently checked by
+`/root/replacement_update_plan_review_1` and
+`/root/replacement_update_plan_review_2`, both of which returned zero findings
+after the pre-1.0 compatibility and ownership constraints were incorporated.
+
+The implementation removes authentication migration from incompatible
+replacement, introduces one explicit state-compatibility epoch across release
+metadata, binaries, and receipts, and adds `sana-mcp update`. Compatible updates
+preserve state without contacting Sana. On Windows, verified incompatible
+installs require explicit consent, then use a serialized, journaled reset with
+durable old/new runtime inventory and restart-safe rollback. POSIX incompatible
+updates fail safely until an equivalent coordinator exists. Release metadata
+binds the exact installer asset and checksum.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/review_windows_reset` | reset publication, crash phases, daemon transition, cleanup, and legacy rollback gaps | added the bounded reset coordinator, persistent phases, verified legacy daemon control, and rollback inventory | correction required fresh review |
+| `/root/review_update_release` | POSIX receipt parsing, incompatible POSIX behavior, stale consent, cancellation, and Windows handoff diagnostics | matched actual receipt formats, refused unsupported destructive POSIX updates, bound consent and installed identity, and retained failed handoff diagnostics | correction required fresh review |
+| `/root/fresh_review_windows_reset_2` | replacement daemon could remain active during rollback and recovery was not restart-discoverable | stopped it before rollback and added a deterministic recovery directory with stable runtime/receipt inventory | correction required fresh review |
+| `/root/fresh_review_update_release_2` | updater authority, post-wait installer hash, shell resolution, diagnostics, and temporary cleanup gaps | bound the originating install, rehashed after parent exit, used `/bin/sh`, and made diagnostics/cleanup outcomes explicit | correction required fresh review |
+| `/root/zero_review_windows_reset_3` | durable inventory was initially too late; recovery proof, serialization, commit retry, and empty-override checks were incomplete | published inventory before daemon/file transition, serialized recovery, validated identities, fixed commit ordering, and rejected defined overrides | correction required fresh review |
+| `/root/zero_review_update_release_3` | recovery restart idempotency/temp ordering/prompt ordering plus SemVer, transport bounds, and unattended consent gaps | made restoration atomic and repeatable, gave recovery isolated temporary state, deferred ordinary locks until consent, used exact BigInt SemVer ordering, and added bounded HTTPS redirect handling and explicit consent propagation | correction required fresh review |
+| `/root/final_cross_review_v042` | reset commit failure could be reported as success, and recursive deletion under the active recovery name was not interruption-safe | made helper commit success and its typed response mandatory; atomically retire every resolved recovery directory before best-effort recursive cleanup | correction required fresh review |
+| `/root/final_zero_review_v042` | none | n/a | CLEAN - zero findings |
+
+Validation evidence:
+
+- complete `bun test`: 574 passed, 1 Windows-only platform skip, 0 failed;
+- focused installer/update/reset suite after the final correction: 60 passed,
+  0 failed;
+- `bun run typecheck`: passed;
+- PowerShell AST parsing and POSIX `sh -n`: passed;
+- compiled `bun-linux-x64` standalone reported version `0.4.2`, installer,
+  lifecycle, inspect, and state-compatibility protocol `1`, plus the keyword
+  semantic capability;
+- compiled standalone `sana-mcp update --help`: passed;
+- `git diff --check`: clean;
+- all tests used isolated state and did not open the live Sana data tree.

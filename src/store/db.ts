@@ -117,14 +117,14 @@ export interface SyncState {
   auth_workspace_id: string | null;
   auth_transition_token: string | null;
   auth_transition_generation: number | null;
-  auth_transition_kind: AuthPublicationKind | null;
+  auth_transition_kind: PersistedAuthPublicationKind | null;
   auth_transition_user_id: string | null;
   auth_transition_workspace_id: string | null;
   auth_issue_code: string | null;
   auth_issue_message: string | null;
   auth_issue_operation_token: string | null;
   auth_issue_generation: number | null;
-  auth_issue_kind: AuthPublicationKind | null;
+  auth_issue_kind: PersistedAuthPublicationKind | null;
   catchup_generation: number | null;
   cache_user_id: string | null;
   cache_workspace_id: string | null;
@@ -184,8 +184,8 @@ export type DaemonLeaseClaim =
 export type AuthPublicationKind =
   | "request-code"
   | "login"
-  | "refresh"
-  | "reset";
+  | "refresh";
+type PersistedAuthPublicationKind = AuthPublicationKind | "reset";
 
 export interface SessionVersion {
   readonly generation: number;
@@ -1981,14 +1981,6 @@ function validatePublicationIdentity(
   ) {
     throw new TypeError(
       `${kind} publication requires an authoritative user and workspace identity`,
-    );
-  }
-  if (
-    kind === "reset" &&
-    (identity.userId !== null || identity.workspaceId !== null)
-  ) {
-    throw new TypeError(
-      "reset publication cannot retain an unvalidated user or workspace identity",
     );
   }
 }

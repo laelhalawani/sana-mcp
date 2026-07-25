@@ -197,6 +197,7 @@ test("the published JSON Schema freezes the same version, fields, and target set
       installerProtocol: { const: number };
       lifecycleProtocol: { const: number };
       inspectProtocol: { const: number };
+      stateCompatibility: { minimum: number };
       semanticCapability: { const: string };
       assets: { maxItems: number };
     };
@@ -235,6 +236,10 @@ test("the published JSON Schema freezes the same version, fields, and target set
     SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol,
   );
   assert.equal(
+    schema.properties.stateCompatibility.minimum,
+    1,
+  );
+  assert.equal(
     schema.properties.semanticCapability.const,
     STANDALONE_SEMANTIC_CAPABILITY,
   );
@@ -249,6 +254,7 @@ test("the published JSON Schema freezes the same version, fields, and target set
     "installerProtocol",
     "lifecycleProtocol",
     "inspectProtocol",
+    "stateCompatibility",
     "semanticCapability",
     "assets",
   ]);
@@ -315,8 +321,8 @@ test("parses the versioned manifest and preserves every exact declared mapping",
   assert.equal(lifecycleProtocol, 1);
   assert.equal(inspectProtocol, 1);
   assert.equal(manifest.manifestVersion, 1);
-  assert.equal(manifest.packageVersion, "0.4.1");
-  assert.equal(manifest.releaseTag, "v0.4.1");
+  assert.equal(manifest.packageVersion, "0.4.2");
+  assert.equal(manifest.releaseTag, "v0.4.2");
   assert.equal(
     manifest.sourceCommit,
     "0123456789abcdef0123456789abcdef01234567",
@@ -368,6 +374,9 @@ test("manifest assets and standalone markers use the identical canonical target"
       ),
       inspectProtocol: JSON.parse(
         requiredDefinition(definitions, "__SANA_INSPECT_PROTOCOL__"),
+      ),
+      stateCompatibility: JSON.parse(
+        requiredDefinition(definitions, "__SANA_STATE_COMPATIBILITY__"),
       ),
       semanticCapability: JSON.parse(
         requiredDefinition(definitions, "__SANA_SEMANTIC_CAPABILITY__"),

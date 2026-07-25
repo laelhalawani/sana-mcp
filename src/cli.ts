@@ -175,28 +175,62 @@ program
     );
   });
 
-program
-  .command("__migrate-legacy-auth", { hidden: true })
-  .description("Revalidate and publish a pre-1.0 Sana session")
-  .option("--format <format>", "machine format: properties", "properties")
-  .action(async (opts: { format: string }) => {
-    requireStandaloneInstallerCommand("__migrate-legacy-auth");
-    if (opts.format !== "properties") {
-      throw new Error("__migrate-legacy-auth --format must be properties");
-    }
-    const {
-      migrateLegacyAuthentication,
-      serializeLegacyAuthMigrationResult,
-    } = await import("./install/legacy-auth-migration.js");
-    const result = await migrateLegacyAuthentication();
-    process.stdout.write(serializeLegacyAuthMigrationResult(result));
-  });
-
 function requireStandaloneInstallerCommand(command: string): void {
   if (!BUILD_INFO.standalone) {
     throw new Error(`${command} is available only in a standalone build`);
   }
 }
+
+program
+  .command("__reset-incompatible-state <operation>", { hidden: true })
+  .description("Run the installer incompatible-state reset protocol")
+  .requiredOption("--journal <directory>", "private reset journal directory")
+  .option("--install-dir <directory>", "binary installation directory")
+  .option("--format <format>", "machine format: properties", "properties")
+  .action(
+    async (
+      operation: string,
+      opts: { journal: string; installDir?: string; format: string },
+    ) => {
+      requireStandaloneInstallerCommand("__reset-incompatible-state");
+      if (opts.format !== "properties") {
+        throw new Error(
+          "__reset-incompatible-state --format must be properties",
+        );
+      }
+      const reset = await import("./install/incompatible-reset.js");
+      if (operation === "status") {
+        process.stdout.write(
+          reset.serializeIncompatibleResetStatus(
+            reset.inspectIncompatibleReset(opts.journal),
+          ),
+        );
+        return;
+      }
+      const result =
+        operation === "prepare"
+          ? reset.prepareIncompatibleReset({
+              journalDirectory: opts.journal,
+              installDirectory:
+                opts.installDir ??
+                (() => {
+                  throw new Error(
+                    "prepare requires --install-dir",
+                  );
+                })(),
+            })
+          : operation === "rollback"
+            ? reset.rollbackIncompatibleReset(opts.journal)
+            : operation === "commit"
+              ? reset.commitIncompatibleReset(opts.journal)
+              : (() => {
+                  throw new Error(
+                    "reset operation must be prepare, rollback, commit, or status",
+                  );
+                })();
+      process.stdout.write(reset.serializeIncompatibleResetResult(result));
+    },
+  );
 
 const configTransaction = program
   .command("__configure-transaction", { hidden: true })
@@ -266,6 +300,60 @@ program
   .action(async () => {
     const { runDaemon } = await import("./sync/daemon.js");
     await runDaemon();
+  });
+
+program
+  .command("update")
+  .description("Update an installed standalone sana-mcp to the latest release")
+  .action(async () => {
+    const { runUpdate } = await import("./install/update.js");
+    const result = await runUpdate({
+      confirmIncompatible: async () => {
+        if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+          throw new Error(
+            "This update needs confirmation in an interactive terminal because local Sana state is incompatible",
+          );
+        }
+        const { confirm } = await import("@inquirer/prompts");
+        writeHumanLine(
+          process.stdout,
+          "This release cannot preserve the current local Sana state. Meetings will be re-synced and you will have to sign in again.",
+        );
+        return await confirm({
+          message: "Do you want to continue?",
+          default: false,
+        });
+      },
+    });
+    switch (result.state) {
+      case "current":
+        writeHumanLine(
+          process.stdout,
+          `sana-mcp ${result.version} is already current.`,
+        );
+        break;
+      case "newer":
+        writeHumanLine(
+          process.stdout,
+          `Installed sana-mcp ${result.version} is newer than latest ${result.latestVersion}; no downgrade was performed.`,
+        );
+        break;
+      case "cancelled":
+        writeHumanLine(process.stdout, "Update cancelled. Nothing was changed.");
+        break;
+      case "updated":
+        writeHumanLine(
+          process.stdout,
+          `Updated sana-mcp to ${result.version}.`,
+        );
+        break;
+      case "handed-off":
+        writeHumanLine(
+          process.stdout,
+          `Update to sana-mcp ${result.version} was handed off and will continue after this command exits.`,
+        );
+        break;
+    }
   });
 
 program

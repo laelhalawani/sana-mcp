@@ -146,26 +146,3 @@ test("authentication generations advance monotonically without wall-clock orderi
   `);
   expect(child.status, child.stderr).toBe(0);
 });
-
-test("pre-1.0 reset publishes an explicit signed-out generation", () => {
-  const child = isolatedPublication(`
-    const reset = writer(0, null, null, null);
-    publishClientSession(database, reset, "reset");
-    const version = reset.sessionVersion();
-    const state = database.getSyncState();
-    if (
-      version.generation !== 1 ||
-      version.publicationToken === null ||
-      version.userId !== null ||
-      version.workspaceId !== null ||
-      state.auth_generation !== 1 ||
-      state.auth_publication_token !== version.publicationToken ||
-      state.auth_user_id !== null ||
-      state.auth_workspace_id !== null ||
-      state.auth_pending !== 0
-    ) {
-      throw new Error("signed-out reset publication was not exact");
-    }
-  `);
-  expect(child.status, child.stderr).toBe(0);
-});

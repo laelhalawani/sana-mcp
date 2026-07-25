@@ -51,7 +51,7 @@ async function createOfflineRelease(
   const binary = [
     "#!/bin/sh",
     'if [ "${1:-}" = "__inspect" ]; then',
-    `  printf '%s\\n' inspectProtocol=1 version=${version} target=bun-linux-x64 installerProtocol=1 lifecycleProtocol=1 semanticCapability=keyword`,
+    `  printf '%s\\n' inspectProtocol=1 version=${version} target=bun-linux-x64 installerProtocol=1 lifecycleProtocol=1 stateCompatibility=1 semanticCapability=keyword`,
     "  exit 0",
     "fi",
     'if [ "${1:-}" = "__lifecycle" ]; then',
@@ -63,7 +63,7 @@ async function createOfflineRelease(
     '  case "$operation" in',
     '    health) if [ -n "${FAKE_CONFIGURED_FILE:-}" ] && [ -f "$FAKE_CONFIGURED_FILE" ]; then if [ -n "${FAKE_HEALTH_READY_FILE:-}" ]; then : > "$FAKE_HEALTH_READY_FILE"; fi; while [ -n "${FAKE_HEALTH_WAIT_FILE:-}" ] && [ ! -f "$FAKE_HEALTH_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_POST_CONFIG_HEALTH_EXIT:-}" ]; then exit "$FAKE_POST_CONFIG_HEALTH_EXIT"; fi; fi; changed=false ;;',
     '    stop) changed=$([ "$state" = running ] && printf true || printf false); state=stopped ;;',
-    '    start) if [ -n "${FAKE_CONFIGURED_FILE:-}" ] && [ -f "$FAKE_CONFIGURED_FILE" ] && [ -n "${FAKE_POST_CONFIG_START_EXIT:-}" ]; then if [ -n "${FAKE_LIFECYCLE_LOG_FILE:-}" ]; then printf "%s:%s\\n" start-attempt "$state" >> "$FAKE_LIFECYCLE_LOG_FILE"; fi; exit "$FAKE_POST_CONFIG_START_EXIT"; fi; changed=$([ "$state" = stopped ] && printf true || printf false); state=running ;;',
+    '    start) if [ -n "${FAKE_CONFIGURED_FILE:-}" ] && [ -f "$FAKE_CONFIGURED_FILE" ] && [ -n "${FAKE_POST_CONFIG_START_EXIT:-}" ]; then if [ -n "${FAKE_START_READY_FILE:-}" ]; then : > "$FAKE_START_READY_FILE"; fi; while [ -n "${FAKE_START_WAIT_FILE:-}" ] && [ ! -f "$FAKE_START_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_LIFECYCLE_LOG_FILE:-}" ]; then printf "%s:%s\\n" start-attempt "$state" >> "$FAKE_LIFECYCLE_LOG_FILE"; fi; exit "$FAKE_POST_CONFIG_START_EXIT"; fi; changed=$([ "$state" = stopped ] && printf true || printf false); state=running ;;',
     "    *) exit 64 ;;",
     "  esac",
     '  if [ -n "${FAKE_LIFECYCLE_STATE_FILE:-}" ]; then printf "%s\\n" "$state" > "$FAKE_LIFECYCLE_STATE_FILE"; fi',
@@ -145,6 +145,9 @@ async function createOfflineRelease(
     "",
   ].join("\n");
   const binaryHash = sha256(binary);
+  const installerHash = sha256(
+    await readFile(path.join(root, "install.sh")),
+  );
   await writeFile(path.join(fixture, binaryName), binary);
 
   const manifest = '{"manifestVersion":1,"offlineInstallerTest":true}\n';
@@ -170,7 +173,10 @@ async function createOfflineRelease(
     "installerProtocol=1",
     "lifecycleProtocol=1",
     "inspectProtocol=1",
+    "stateCompatibility=1",
     "semanticCapability=keyword",
+    "installerAssetName=install.sh",
+    `installerSha256=${installerHash}`,
     "target=bun-linux-x64",
     "libc=glibc",
     `assetName=${binaryName}`,
@@ -580,11 +586,11 @@ test("POSIX upgrades separate receipt-owned PATH state from current-shell availa
         entry.shell,
         entry.configExit,
       );
-      if (entry.configExit === undefined) {
-        assert.equal(upgrade.status, 0, `${entry.name}: ${upgrade.stderr}`);
-      } else {
-        assert.notEqual(upgrade.status, 0, entry.name);
-      }
+      assert.equal(upgrade.status, 0, `${entry.name}: ${upgrade.stderr}`);
+      assert.match(
+        upgrade.stdout,
+        /Existing client configuration was left unchanged\./,
+      );
 
       assert.equal(
         await readFile(bashrc, "utf8"),
@@ -722,11 +728,11 @@ test("POSIX upgrades preserve legacy receipt-owned profiles without claiming cur
         "0.3.3",
         entry.configExit,
       );
-      if (entry.configExit === "0") {
-        assert.equal(upgrade.status, 0, `${entry.name}: ${upgrade.stderr}`);
-      } else {
-        assert.notEqual(upgrade.status, 0, entry.name);
-      }
+      assert.equal(upgrade.status, 0, `${entry.name}: ${upgrade.stderr}`);
+      assert.match(
+        upgrade.stdout,
+        /Existing client configuration was left unchanged\./,
+      );
       assert.equal(
         await readFile(profile, "utf8"),
         legacyProfile,
@@ -1257,6 +1263,7 @@ test("PowerShell IEX failures are catchable and direct-file failures remain nonz
         '$ProgressPreference = "Continue"',
         "$PSNativeCommandUseErrorActionPreference = $true",
         '$env:SANA_MCP_VERSION = "not-a-release-tag"',
+        `$env:LOCALAPPDATA = ${quote(executableTemporary)}`,
         `$env:TEMP = ${quote(executableTemporary)}`,
         `$env:TMP = ${quote(executableTemporary)}`,
         `$Installer = Get-Content -Raw -LiteralPath ${quote(executableInstallerPath)}`,
@@ -1302,10 +1309,11 @@ test("PowerShell IEX failures are catchable and direct-file failures remain nonz
     );
     const environment = {
       ...process.env,
+      LOCALAPPDATA: executableTemporary,
       SANA_MCP_VERSION: "not-a-release-tag",
       WSLENV:
         process.platform === "linux" && command.toLowerCase().endsWith(".exe")
-          ? [process.env.WSLENV, "SANA_MCP_VERSION"]
+          ? [process.env.WSLENV, "LOCALAPPDATA", "SANA_MCP_VERSION"]
               .filter((value) => value && value.length > 0)
               .join(":")
           : process.env.WSLENV,
@@ -1498,10 +1506,10 @@ test("PowerShell cleanup attempts every target after an earlier failure", async 
         '  if ($LiteralPath -ceq $script:FailPath) { throw "injected first cleanup failure" }',
         "  Microsoft.PowerShell.Management\\Remove-Item @PSBoundParameters",
         "}",
-        `$Failures = @(Invoke-InstallerCleanup ${quote(windowsPath("staged-binary"))} ${quote(windowsPath("staged-receipt"))} $true ${quote(windowsPath("install-lock"))} $true ${quote(windowsPath("path-lock"))} $false ${quote(windowsPath("installer-temp"))})`,
+        `$Failures = @(Invoke-InstallerCleanup ${quote(windowsPath("staged-binary"))} ${quote(windowsPath("staged-receipt"))} $null $true ${quote(windowsPath("install-lock"))} $null $true ${quote(windowsPath("path-lock"))} $false ${quote(windowsPath("installer-temp"))})`,
         'if ($script:CleanupAttempts.Count -ne 5) { throw "not every cleanup target was attempted" }',
         'if ($Failures.Count -ne 1 -or $Failures[0] -cnotmatch "could not remove staged binary: injected first cleanup failure") { throw "cleanup failures were not aggregated accurately" }',
-        "$NoopFailures = @(Invoke-InstallerCleanup $null $null $false $null $false $null $false $null)",
+        "$NoopFailures = @(Invoke-InstallerCleanup $null $null $null $false $null $null $false $null $false $null)",
         'if ($NoopFailures.Count -ne 0) { throw "empty optional cleanup paths produced a failure" }',
         'if ($script:CleanupAttempts.Count -ne 5) { throw "empty optional cleanup paths reached Remove-Item" }',
         'if (-not (Test-Path -LiteralPath $script:FailPath)) { throw "failed cleanup target unexpectedly disappeared" }',
@@ -1737,7 +1745,7 @@ test("PowerShell legacy daemon handling targets only the exact executable and da
   }
 });
 
-test("Windows publishes PATH and receipt before replacement configuration touches live state", async () => {
+test("Windows confirms incompatible replacement before download and resets state transactionally", async () => {
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   assert.match(installer, /^# Install[\s\S]*\n& \{\n/u);
   assert.doesNotMatch(installer, /\$script:/u);
@@ -1785,12 +1793,32 @@ test("Windows publishes PATH and receipt before replacement configuration touche
   const receiptMove = installer.indexOf(
     "Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force",
   );
-  const validationUnavailable = installer.indexOf(
-    'throw "Existing Sana authentication could not be validated because Sana is unavailable.',
+  const incompatibleConfirmation = installer.indexOf(
+    "Confirm-IncompatibleReplacement $LegacyRelease",
+  );
+  const temporaryCreation = installer.indexOf(
+    '$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sana-mcp-" +',
+  );
+  const resetPrepare = installer.indexOf(
+    "__reset-incompatible-state prepare",
   );
   assert.ok(receiptMove >= 0);
-  assert.ok(validationUnavailable > receiptMove);
-  assert.ok(validationUnavailable < invokeConfigurer);
+  assert.ok(incompatibleConfirmation >= 0);
+  assert.ok(incompatibleConfirmation < temporaryCreation);
+  assert.ok(resetPrepare > receiptMove);
+  assert.ok(resetPrepare < invokeConfigurer);
+  assert.doesNotMatch(
+    installer,
+    /Existing Sana authentication could not be validated/u,
+  );
+  assert.match(
+    installer,
+    /if \(\$OldPresent\) \{\s+Write-Host "Existing MCP client registrations were kept unchanged\."\s+\$ConfigTransactionState = "no-mutation"/u,
+  );
+  assert.match(
+    installer,
+    /__reset-incompatible-state rollback[\s\S]*?incompatible local-state rollback was incomplete/u,
+  );
   assert.match(
     installer,
     /if \(\$OldPresent -and -not \$LegacyInstall\)[\s\S]*?else \{\s+\$NewPathManaged = \$MatchingEntries\.Count -eq 0/u,
@@ -1976,11 +2004,11 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
 
     await writeFile(stateFile, "running\n");
     const secondFixture = await createOfflineRelease(temporary, "0.3.3");
-    const failedUpgrade = run(secondFixture, "0.3.3", "23");
-    assert.notEqual(failedUpgrade.status, 0);
+    const upgrade = run(secondFixture, "0.3.3", "23");
+    assert.equal(upgrade.status, 0, upgrade.stderr);
     assert.match(
-      failedUpgrade.stderr,
-      /client configuration did not complete before changing client files/,
+      upgrade.stdout,
+      /Existing client configuration was left unchanged\./,
     );
     assert.notEqual(
       await readFile(path.join(installDirectory, "sana-mcp"), "utf8"),
@@ -1996,16 +2024,7 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
     assert.equal(await readFile(profile, "utf8"), oldProfile);
     assert.equal((await readFile(stateFile, "utf8")).trim(), "running");
 
-    const successfulUpgrade = run(secondFixture, "0.3.3", "0");
-    assert.equal(successfulUpgrade.status, 0, successfulUpgrade.stderr);
-    assert.match(successfulUpgrade.stdout, /Verified .* is already on PATH/);
-    assert.match(
-      await readFile(
-        path.join(installDirectory, ".sana-mcp-install-v1"),
-        "utf8",
-      ),
-      /(?:^|\n)version=0\.3\.3\n/,
-    );
+    assert.match(upgrade.stdout, /Verified .* is already on PATH/);
     assert.equal(
       (
         await readFile(profile, "utf8")
@@ -2400,10 +2419,9 @@ test("POSIX lock-token change during rollback stops every later cleanup mutation
     assert.equal((await readFile(stateFile, "utf8")).trim(), "running");
 
     const secondFixture = await createOfflineRelease(temporary, "0.3.3");
-    const rollbackReady = path.join(temporary, "rollback-ready");
-    const releaseRollback = path.join(temporary, "release-rollback");
+    const startReady = path.join(temporary, "start-ready");
+    const releaseStart = path.join(temporary, "release-start");
     await writeFile(lifecycleLog, "");
-    await rm(configured);
     const child = spawn("/bin/sh", [path.join(root, "install.sh")], {
       env: {
         ...process.env,
@@ -2413,8 +2431,8 @@ test("POSIX lock-token change during rollback stops every later cleanup mutation
         FIXTURE_ROOT: secondFixture,
         FAKE_CONFIGURED_FILE: configured,
         FAKE_POST_CONFIG_START_EXIT: "77",
-        FAKE_ROLLBACK_READY_FILE: rollbackReady,
-        FAKE_ROLLBACK_WAIT_FILE: releaseRollback,
+        FAKE_START_READY_FILE: startReady,
+        FAKE_START_WAIT_FILE: releaseStart,
         FAKE_LIFECYCLE_STATE_FILE: stateFile,
         FAKE_LIFECYCLE_LOG_FILE: lifecycleLog,
         SANA_MCP_INSTALL_DIR: installDirectory,
@@ -2430,14 +2448,13 @@ test("POSIX lock-token change during rollback stops every later cleanup mutation
     });
     const closePromise = once(child, "close") as Promise<[number]>;
     await Promise.race([
-      waitForFile(rollbackReady),
+      waitForFile(startReady),
       closePromise.then(([code]) => {
         throw new Error(
-          `installer exited before rollback checkpoint (${code}): ${stderr}`,
+          `installer exited before lifecycle checkpoint (${code}): ${stderr}`,
         );
       }),
     ]);
-    const lifecycleAtRollback = await readFile(lifecycleLog, "utf8");
     const pathLock = path.join(home, ".sana-mcp-installer-path.lock");
     const installLock = path.join(
       installDirectory,
@@ -2446,13 +2463,12 @@ test("POSIX lock-token change during rollback stops every later cleanup mutation
     const entries = await readdir(pathLock);
     assert.equal(entries.length, 1);
     await writeFile(path.join(pathLock, entries[0]), "changed-owner-token\n");
-    await writeFile(releaseRollback, "continue\n");
+    await writeFile(releaseStart, "continue\n");
     const [code] = await closePromise;
     assert.equal(code, 1);
     assert.match(stderr, /installer lock ownership was lost/);
     assert.match(stderr, /no further persistent rollback changes were attempted/);
-    assert.equal(await readFile(lifecycleLog, "utf8"), lifecycleAtRollback);
-    assert.match(lifecycleAtRollback, /start-attempt:stopped\n/);
+    assert.match(await readFile(lifecycleLog, "utf8"), /start-attempt:stopped\n/);
     assert.equal((await readFile(stateFile, "utf8")).trim(), "stopped");
     assert.match(
       await readFile(
@@ -2460,13 +2476,6 @@ test("POSIX lock-token change during rollback stops every later cleanup mutation
         "utf8",
       ),
       /(?:^|\n)version=0\.3\.3\n/,
-    );
-    await access(
-      path.join(
-        installDirectory,
-        ".sana-mcp-config-transaction",
-        "client-config-transaction.json",
-      ),
     );
     assert.equal(
       await readFile(path.join(pathLock, entries[0]), "utf8"),
@@ -2485,7 +2494,6 @@ test("POSIX lock-token change during rollback stops every later cleanup mutation
     const recoveryInventory = recoveryInventoryMatch[1];
     await access(path.join(recoveryInventory, "old-binary"));
     await access(path.join(recoveryInventory, "old-receipt"));
-    await access(path.join(recoveryInventory, "config-rollback.json"));
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

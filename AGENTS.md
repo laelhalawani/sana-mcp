@@ -74,32 +74,45 @@ finding remains unresolved.
 - Treat installers, upgrades, migrations, authentication, local transcript
   storage, daemon control, and release publication as security-sensitive paths.
 
-## Pre-1.0 upgrade and migration policy
+## Pre-1.0 upgrade and replacement policy
 
-Before `1.0.0`, upgrades should behave as a controlled uninstall of the previous
-runtime followed by a clean installation of the new runtime.
+Before `1.0.0`, every release declares an explicit positive state-compatibility
+epoch in the release manifest, standalone binary, and installer receipt.
 
-- Stop the previous daemon and replace only proven installer-owned binaries,
-  registrations, receipts, and PATH entries through verified, bounded operations.
-  Prefer exact in-place replacement to removal/recreation.
+- A receipt-backed installation with the same epoch is a compatible update. Stop
+  its verified daemon, replace only proven installer-owned runtime artifacts, and
+  preserve its local authentication and meeting/cache state without inspecting,
+  parsing, or revalidating authentication. The update must not require Sana to be
+  reachable.
+- A recognized official pre-receipt installation, or a receipt-backed installation
+  with a different epoch, is incompatible. Before any mutation, tell the user that
+  it cannot be updated in place, that replacement requires meetings to be
+  resynced and a new login, and ask for explicit confirmation. Declining is a
+  successful no-op.
+- A platform may offer that consent only after its destructive replacement
+  coordinator has been implemented and reviewed end to end. Until then it must
+  refuse an epoch-changing update before confirmation or persistent mutation;
+  currently the automatic incompatible replacement coordinator is Windows-only.
+- After confirmation, perform a controlled destructive replacement: stop the
+  proven old daemon, replace only proven installer-owned runtime artifacts, and
+  reset the canonical default local state. Do not migrate, copy, or revalidate
+  authentication from the incompatible installation.
+- Never overwrite an unrecognized receiptless executable. Never automatically
+  reset an overridden data or transcript directory; stop with actionable manual
+  guidance instead.
+- Journal and quarantine the incompatible state until binary replacement, receipt
+  and PATH publication, smoke/health checks, and required daemon transition have
+  succeeded. Roll back on failure; delete the quarantine only after commit.
 - Recreate rebuildable local databases, full-text indexes, embeddings, generated
-  configuration, and caches when their schema or ownership model changes. Do not
-  build elaborate compatibility layers for pre-release cache formats.
-- Preserve authentication only when the existing session can be parsed, migrated
-  without invented values, and revalidated against Sana. If that cannot be proven,
-  require a fresh login.
-- Never describe an unvalidated copied session as preserved authentication.
-- Keep the previous working runtime and a journaled inventory available for
-  rollback until the complete post-install transaction has succeeded: download,
-  checksum, smoke check, daemon transition, replacement, receipt/PATH/config
-  changes, authentication validation, new-profile initialization, health check,
-  and required daemon restart.
-- Never implicitly purge non-rebuildable user-owned data. Current Sana meeting
-  databases are treated as rebuildable local caches only after the active account
-  and remote resync path have been verified.
-- Only the reviewed, serialized pre-1.0 upgrade coordinator may quarantine or
-  delete a rebuildable live cache. Ordinary agents, tests, and ad hoc scripts must
-  preserve runtime data.
+  state, and caches after a confirmed incompatible replacement. Do not build
+  elaborate compatibility layers for pre-release formats.
+- `sana-mcp update` must prove the installed standalone runtime and adjacent
+  receipt before network access, resolve an exact release tuple, and hand off to
+  that release's checksum-verified installer. A current version is a no-op and an
+  installed version newer than the latest release is never downgraded.
+- Only the reviewed, serialized pre-1.0 replacement coordinator may quarantine or
+  delete the canonical rebuildable live state. Ordinary agents, tests, and ad hoc
+  scripts must preserve runtime data.
 
 ## Review evidence
 

@@ -41,6 +41,9 @@ describe("build identity", () => {
     expect(info.standalone).toBe(false);
     expect(info.version).toBe(BUILD_INFO.version);
     expect(info.target).toBeNull();
+    expect(info.stateCompatibility).toBe(
+      SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility,
+    );
     expect(info.semanticCapability).toBe(SOURCE_SEMANTIC_CAPABILITY);
   });
 
@@ -61,6 +64,7 @@ describe("build identity", () => {
         "target=bun-linux-x64",
         "installerProtocol=1",
         "lifecycleProtocol=1",
+        "stateCompatibility=1",
         "semanticCapability=keyword",
         "",
       ].join("\n"),
@@ -121,6 +125,15 @@ describe("build identity", () => {
     ).toThrow(BuildIdentityError);
     expect(() =>
       resolveBuildInfo({ ...completeMarkers, inspectProtocol: 2 }),
+    ).toThrow(BuildIdentityError);
+    expect(() =>
+      resolveBuildInfo({ ...completeMarkers, stateCompatibility: 0 }),
+    ).toThrow(BuildIdentityError);
+    expect(() =>
+      resolveBuildInfo({ ...completeMarkers, stateCompatibility: 2 }),
+    ).toThrow(BuildIdentityError);
+    expect(() =>
+      resolveBuildInfo({ ...completeMarkers, stateCompatibility: "1" }),
     ).toThrow(BuildIdentityError);
     expect(() =>
       resolveBuildInfo({ ...completeMarkers, semanticCapability: "invented" }),
@@ -199,6 +212,9 @@ describe("build identity", () => {
         ),
         __SANA_INSPECT_PROTOCOL__: String(
           SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol,
+        ),
+        __SANA_STATE_COMPATIBILITY__: String(
+          SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility,
         ),
         __SANA_SEMANTIC_CAPABILITY__: JSON.stringify(
           STANDALONE_SEMANTIC_CAPABILITY,

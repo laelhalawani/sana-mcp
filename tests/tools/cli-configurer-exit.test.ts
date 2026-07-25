@@ -86,6 +86,7 @@ beforeAll(async () => {
       __SANA_INSTALLER_PROTOCOL__: "1",
       __SANA_LIFECYCLE_PROTOCOL__: "1",
       __SANA_INSPECT_PROTOCOL__: "1",
+      __SANA_STATE_COMPATIBILITY__: "1",
       __SANA_SEMANTIC_CAPABILITY__: JSON.stringify("keyword"),
     },
   });
@@ -262,6 +263,7 @@ test("standalone inspect protocol stdout remains exact", () => {
       installerProtocol: 1,
       lifecycleProtocol: 1,
       inspectProtocol: 1,
+      stateCompatibility: 1,
       semanticCapability: "keyword",
     })}\n`,
   );
