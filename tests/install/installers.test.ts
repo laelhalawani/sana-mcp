@@ -1501,6 +1501,9 @@ test("PowerShell cleanup attempts every target after an earlier failure", async 
         `$Failures = @(Invoke-InstallerCleanup ${quote(windowsPath("staged-binary"))} ${quote(windowsPath("staged-receipt"))} $true ${quote(windowsPath("install-lock"))} $true ${quote(windowsPath("path-lock"))} $false ${quote(windowsPath("installer-temp"))})`,
         'if ($script:CleanupAttempts.Count -ne 5) { throw "not every cleanup target was attempted" }',
         'if ($Failures.Count -ne 1 -or $Failures[0] -cnotmatch "could not remove staged binary: injected first cleanup failure") { throw "cleanup failures were not aggregated accurately" }',
+        "$NoopFailures = @(Invoke-InstallerCleanup $null $null $false $null $false $null $false $null)",
+        'if ($NoopFailures.Count -ne 0) { throw "empty optional cleanup paths produced a failure" }',
+        'if ($script:CleanupAttempts.Count -ne 5) { throw "empty optional cleanup paths reached Remove-Item" }',
         'if (-not (Test-Path -LiteralPath $script:FailPath)) { throw "failed cleanup target unexpectedly disappeared" }',
         `foreach ($Removed in @(${[
           "staged-receipt",
@@ -1510,6 +1513,216 @@ test("PowerShell cleanup attempts every target after an earlier failure", async 
         ]
           .map((name) => quote(windowsPath(name)))
           .join(",")})) { if (Test-Path -LiteralPath $Removed) { throw "later cleanup target was skipped: $Removed" } }`,
+        "",
+      ].join("\n"),
+    );
+    const result = spawnSync(
+      command,
+      ["-NoProfile", "-NonInteractive", "-File", executableHarnessPath],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell download progress retains bar, size, speed, ETA, and bounded completion", async () => {
+  const command =
+    process.platform === "win32"
+      ? "powershell.exe"
+      : (
+          spawnSync(
+            "/bin/sh",
+            ["-c", "command -v pwsh || command -v powershell.exe"],
+            { encoding: "utf8" },
+          ).stdout.trim()
+        );
+  if (command.length === 0) return;
+
+  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  const functionStart = installer.indexOf("function Format-DownloadProgress");
+  const functionEnd = installer.indexOf("\nfunction Read-Properties");
+  assert.notEqual(functionStart, -1);
+  assert.notEqual(functionEnd, -1);
+  const formatter = installer.slice(functionStart, functionEnd);
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-progress-"));
+  try {
+    const harnessPath = path.join(temporary, "progress.ps1");
+    let executableHarnessPath = harnessPath;
+    if (
+      process.platform === "linux" &&
+      command.toLowerCase().endsWith(".exe")
+    ) {
+      const converted = spawnSync("wslpath", ["-w", harnessPath], {
+        encoding: "utf8",
+      });
+      if (converted.status !== 0) return;
+      executableHarnessPath = converted.stdout.trim();
+    }
+    await writeFile(
+      harnessPath,
+      [
+        '$ErrorActionPreference = "Stop"',
+        formatter,
+        "$Known = Format-DownloadProgress 50MB 100MB 10",
+        'if ($Known -cnotmatch "\\[############------------\\]") { throw "known-length bar changed" }',
+        'if ($Known -cnotmatch " 50%") { throw "known-length percent changed" }',
+        'if ($Known -cnotmatch "50/100 MB") { throw "known-length size changed" }',
+        'if ($Known -cnotmatch "5 MB/s") { throw "known-length speed changed" }',
+        'if ($Known -cnotmatch "ETA 00:10") { throw "known-length ETA changed" }',
+        "$Complete = Format-DownloadProgress 120MB 100MB 10",
+        'if ($Complete -cnotmatch "\\[########################\\] 100%") { throw "completion was not clamped" }',
+        'if ($Complete -cnotmatch "ETA 00:00") { throw "completion ETA changed" }',
+        "$Unknown = Format-DownloadProgress 50MB -1 10",
+        'if ($Unknown -cnotmatch "50 MB  5 MB/s") { throw "unknown-length size or speed changed" }',
+        'if ($Unknown -match "%|ETA") { throw "unknown length invented percent or ETA" }',
+        "",
+      ].join("\n"),
+    );
+    const result = spawnSync(
+      command,
+      ["-NoProfile", "-NonInteractive", "-File", executableHarnessPath],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell receiptless recognition accepts only published legacy digests", async () => {
+  const command =
+    process.platform === "win32"
+      ? "powershell.exe"
+      : (
+          spawnSync(
+            "/bin/sh",
+            ["-c", "command -v pwsh || command -v powershell.exe"],
+            { encoding: "utf8" },
+          ).stdout.trim()
+        );
+  if (command.length === 0) return;
+
+  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  const functionStart = installer.indexOf(
+    "function Get-VerifiedLegacyReleaseDigest",
+  );
+  const functionEnd = installer.indexOf(
+    "\nfunction Get-VerifiedLegacyRelease(",
+  );
+  assert.notEqual(functionStart, -1);
+  assert.notEqual(functionEnd, -1);
+  const verifier = installer.slice(functionStart, functionEnd);
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-legacy-"));
+  try {
+    const harnessPath = path.join(temporary, "legacy.ps1");
+    let executableHarnessPath = harnessPath;
+    if (
+      process.platform === "linux" &&
+      command.toLowerCase().endsWith(".exe")
+    ) {
+      const converted = spawnSync("wslpath", ["-w", harnessPath], {
+        encoding: "utf8",
+      });
+      if (converted.status !== 0) return;
+      executableHarnessPath = converted.stdout.trim();
+    }
+    await writeFile(
+      harnessPath,
+      [
+        '$ErrorActionPreference = "Stop"',
+        verifier,
+        '$Release = Get-VerifiedLegacyReleaseDigest "4e905d9dd43d801ed3662ad4c1a7d774175207d92a1fd761d3b283af291c29de"',
+        'if ($Release -cne "v0.3.2") { throw "official v0.3.2 digest was not recognized" }',
+        '$SharedRelease = Get-VerifiedLegacyReleaseDigest "da20ac9ec3accb3aed715a064dcd6c250721b1afa2882465d5edef680a813b3d"',
+        'if ($SharedRelease -cne "v0.1.0-rc1 or v0.1.0") { throw "shared v0.1.0 release digest was not recognized accurately" }',
+        '$Foreign = Get-VerifiedLegacyReleaseDigest "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+        'if ($null -ne $Foreign) { throw "foreign receiptless digest was accepted" }',
+        "",
+      ].join("\n"),
+    );
+    const result = spawnSync(
+      command,
+      ["-NoProfile", "-NonInteractive", "-File", executableHarnessPath],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell legacy daemon handling targets only the exact executable and daemon mode", async () => {
+  const command =
+    process.platform === "win32"
+      ? "powershell.exe"
+      : (
+          spawnSync(
+            "/bin/sh",
+            ["-c", "command -v pwsh || command -v powershell.exe"],
+            { encoding: "utf8" },
+          ).stdout.trim()
+        );
+  if (command.length === 0) return;
+
+  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  const functionStart = installer.indexOf("function Get-LegacyDaemonProcesses");
+  const functionEnd = installer.indexOf("\nfunction Assert-NotReparse");
+  assert.notEqual(functionStart, -1);
+  assert.notEqual(functionEnd, -1);
+  const daemonFunctions = installer.slice(functionStart, functionEnd);
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-daemon-"));
+  try {
+    const harnessPath = path.join(temporary, "daemon.ps1");
+    let executableHarnessPath = harnessPath;
+    if (
+      process.platform === "linux" &&
+      command.toLowerCase().endsWith(".exe")
+    ) {
+      const converted = spawnSync("wslpath", ["-w", harnessPath], {
+        encoding: "utf8",
+      });
+      if (converted.status !== 0) return;
+      executableHarnessPath = converted.stdout.trim();
+    }
+    await writeFile(
+      harnessPath,
+      [
+        '$ErrorActionPreference = "Stop"',
+        daemonFunctions,
+        '$script:Mode = "daemon"',
+        '$script:Target = "C:\\Tools\\sana-mcp.exe"',
+        "function Get-CimInstance {",
+        "  param([string] $ClassName, [string] $Filter)",
+        '  if ($script:Mode -eq "stopped") { return @() }',
+        `  $Command = if ($script:Mode -eq "other") { '"C:\\Tools\\sana-mcp.exe" status' } else { '"C:\\Tools\\sana-mcp.exe" daemon' }`,
+        "  return @(",
+        `    [pscustomobject]@{ ExecutablePath = "C:\\Other\\sana-mcp.exe"; CommandLine = '"C:\\Other\\sana-mcp.exe" daemon'; ProcessId = 8 },`,
+        '    [pscustomobject]@{ ExecutablePath = $script:Target; CommandLine = $Command; ProcessId = 9 }',
+        "  )",
+        "}",
+        "function Invoke-CimMethod {",
+        "  param([object] $InputObject, [string] $MethodName)",
+        '  if ($InputObject.ProcessId -ne 9 -or $MethodName -cne "Terminate") { throw "wrong process was terminated" }',
+        '  $script:Mode = "stopped"',
+        "  return [pscustomobject]@{ ReturnValue = 0 }",
+        "}",
+        "function Start-Process {",
+        "  param([string] $FilePath, [object[]] $ArgumentList, [object] $WindowStyle)",
+        '  if ($FilePath -cne $script:Target -or $ArgumentList[0] -cne "daemon") { throw "legacy restart target changed" }',
+        '  $script:Mode = "daemon"',
+        "}",
+        '$Found = @(Get-LegacyDaemonProcesses $script:Target)',
+        'if ($Found.Count -ne 1 -or $Found[0].ProcessId -ne 9) { throw "exact daemon classification failed" }',
+        "Stop-LegacyDaemon $script:Target",
+        'if ($script:Mode -cne "stopped") { throw "exact daemon was not stopped" }',
+        "Start-LegacyDaemon $script:Target",
+        'if ($script:Mode -cne "daemon") { throw "legacy daemon was not restarted" }',
+        '$script:Mode = "other"',
+        "$Rejected = $false",
+        "try { Get-LegacyDaemonProcesses $script:Target | Out-Null } catch { $Rejected = $true }",
+        'if (-not $Rejected) { throw "exact non-daemon process was accepted" }',
         "",
       ].join("\n"),
     );
@@ -1569,6 +1782,27 @@ test("Windows publishes PATH and receipt before replacement configuration touche
     installer,
     /if \(\$RetainNewRuntime\) \{[\s\S]*?try \{\s+if \(\$null -ne \$ConfigJournalFile -and\s+\(Test-Path/u,
   );
+  const receiptMove = installer.indexOf(
+    "Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force",
+  );
+  const validationUnavailable = installer.indexOf(
+    'throw "Existing Sana authentication could not be validated because Sana is unavailable.',
+  );
+  assert.ok(receiptMove >= 0);
+  assert.ok(validationUnavailable > receiptMove);
+  assert.ok(validationUnavailable < invokeConfigurer);
+  assert.match(
+    installer,
+    /if \(\$OldPresent -and -not \$LegacyInstall\)[\s\S]*?else \{\s+\$NewPathManaged = \$MatchingEntries\.Count -eq 0/u,
+  );
+  assert.match(
+    installer,
+    /if \(\$LegacyInstall\) \{\s+if \(Test-Path -LiteralPath \$ReceiptPath\) \{\s+Remove-Item -LiteralPath \$ReceiptPath -Force/u,
+  );
+  assert.match(
+    installer,
+    /if \(\$LegacyInstall\) \{\s+Start-LegacyDaemon \$Destination/u,
+  );
 });
 
 test("advertised install commands stay concise and match installer headers", async () => {
@@ -1579,7 +1813,7 @@ test("advertised install commands stay concise and match installer headers", asy
   const posixCommand =
     "sh -c 't=$(mktemp) && curl -fsSL \"$1\" -o \"$t\" && sh \"$t\"; s=$?; [ -z \"${t:-}\" ] || rm -f \"$t\"; exit \"$s\"' sh https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.sh";
   const windowsCommand =
-    "irm -ErrorAction Stop https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex";
+    "irm https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex";
 
   assert.ok(readme.split("\n").includes(posixCommand));
   assert.ok(readme.split("\n").includes(windowsCommand));

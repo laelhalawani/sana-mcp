@@ -315,8 +315,8 @@ test("parses the versioned manifest and preserves every exact declared mapping",
   assert.equal(lifecycleProtocol, 1);
   assert.equal(inspectProtocol, 1);
   assert.equal(manifest.manifestVersion, 1);
-  assert.equal(manifest.packageVersion, "0.4.0");
-  assert.equal(manifest.releaseTag, "v0.4.0");
+  assert.equal(manifest.packageVersion, "0.4.1");
+  assert.equal(manifest.releaseTag, "v0.4.1");
   assert.equal(
     manifest.sourceCommit,
     "0123456789abcdef0123456789abcdef01234567",
