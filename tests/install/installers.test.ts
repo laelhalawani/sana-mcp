@@ -1025,194 +1025,6 @@ test("PowerShell tag validation uses the shared strict SemVer corpus", async () 
   }
 });
 
-test("PowerShell transaction parser requires one typed protocol response", async () => {
-  const command =
-    process.platform === "win32"
-      ? "powershell.exe"
-      : (
-          spawnSync(
-            "/bin/sh",
-            ["-c", "command -v pwsh || command -v powershell.exe"],
-            { encoding: "utf8" },
-          ).stdout.trim()
-        );
-  if (command.length === 0) return;
-
-  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
-  const functionStart = installer.indexOf(
-    "function Read-ConfigTransactionResult",
-  );
-  const functionEnd = installer.indexOf(
-    "\nfunction Test-ConfigJournal",
-  );
-  assert.notEqual(functionStart, -1);
-  assert.notEqual(functionEnd, -1);
-  const parser = installer.slice(functionStart, functionEnd);
-  const valid =
-    '{"transactionProtocol":1,"operation":"apply","outcome":"applied","appliedCount":1,"noopCount":0,"journal":"C:\\\\journal\\\\client-config-transaction.json","disposition":"configured","authentication":"ready"}';
-  const stringProtocol =
-    '{"transactionProtocol":"1","operation":"apply","outcome":"applied","appliedCount":1,"noopCount":0}';
-  const contradictoryCounts =
-    '{"transactionProtocol":1,"operation":"apply","outcome":"no-mutation","appliedCount":1,"noopCount":0,"disposition":"no-changes","authentication":"ready"}';
-  const readyFailure =
-    '{"transactionProtocol":1,"operation":"apply","outcome":"configuration-unavailable","appliedCount":0,"noopCount":0,"disposition":"configuration-unavailable","authentication":"ready","errorCode":"CONFIG_TRANSACTION_CONFIGURATION_UNAVAILABLE","message":"configuration unavailable"}';
-  const script = [
-    '$ErrorActionPreference = "Stop"',
-    parser,
-    `$Parsed = Read-ConfigTransactionResult @('${valid}') "apply" 0 'C:\\journal\\client-config-transaction.json'`,
-    'if ($Parsed.outcome -cne "applied") { throw "valid response was not parsed" }',
-    "$Rejected = $false",
-    `try { Read-ConfigTransactionResult @('${valid}', '${valid}') "apply" 0 'C:\\journal\\client-config-transaction.json' } catch { $Rejected = $true }`,
-    'if (-not $Rejected) { throw "multiple response lines were accepted" }',
-    "$Rejected = $false",
-    `try { Read-ConfigTransactionResult @('${stringProtocol}') "apply" 0 'C:\\journal\\client-config-transaction.json' } catch { $Rejected = $true }`,
-    'if (-not $Rejected) { throw "a string protocol version was accepted" }',
-    "$Rejected = $false",
-    `try { Read-ConfigTransactionResult @('${contradictoryCounts}') "apply" 0 'C:\\journal\\client-config-transaction.json' } catch { $Rejected = $true }`,
-    'if (-not $Rejected) { throw "contradictory mutation counts were accepted" }',
-    "$Rejected = $false",
-    `try { Read-ConfigTransactionResult @('${readyFailure}') "apply" 1 'C:\\journal\\client-config-transaction.json' } catch { $Rejected = $true }`,
-    'if (-not $Rejected) { throw "failed configuration claimed ready authentication" }',
-    "$ReadyPresentation = @()",
-    "$UncertaintyRetained = $false",
-    "try {",
-    `  $ReadyResult = Read-ConfigTransactionResult @('${readyFailure}') "apply" 1 'C:\\journal\\client-config-transaction.json'`,
-    "  $ReadyPresentation = @(Write-AuthenticationState $ReadyResult 6>&1)",
-    "} catch { $UncertaintyRetained = $true }",
-    'if (-not $UncertaintyRetained) { throw "ready failure did not retain uncertainty" }',
-    'if (($ReadyPresentation -join "`n") -match "confirmed ready") { throw "ready failure printed authentication success" }',
-    "",
-  ].join("\n");
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-config-"));
-  try {
-    const scriptPath = path.join(temporary, "config-parser.ps1");
-    await writeFile(scriptPath, script);
-    let executableScriptPath = scriptPath;
-    if (
-      process.platform === "linux" &&
-      command.toLowerCase().endsWith(".exe")
-    ) {
-      const converted = spawnSync("wslpath", ["-w", scriptPath], {
-        encoding: "utf8",
-      });
-      if (converted.status !== 0) return;
-      executableScriptPath = converted.stdout.trim();
-    }
-    const result = spawnSync(
-      command,
-      ["-NoProfile", "-NonInteractive", "-File", executableScriptPath],
-      { encoding: "utf8" },
-    );
-    assert.equal(result.status, 0, result.stderr);
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
-test("PowerShell native error preference preserves typed apply and rollback exits", async () => {
-  let command: string;
-  if (process.platform === "win32") {
-    const pwsh = spawnSync("where.exe", ["pwsh.exe"], {
-      encoding: "utf8",
-    });
-    command =
-      pwsh.status === 0 && pwsh.stdout.trim().length > 0
-        ? pwsh.stdout.trim().split(/\r?\n/u)[0]
-        : "powershell.exe";
-  } else {
-    command = (
-      spawnSync(
-        "/bin/sh",
-        ["-c", "command -v pwsh || command -v powershell.exe"],
-        { encoding: "utf8" },
-      ).stdout.trim()
-    );
-  }
-  if (command.length === 0 || !command.toLowerCase().endsWith(".exe")) return;
-
-  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
-  const functionStart = installer.indexOf(
-    "function Read-ConfigTransactionResult",
-  );
-  const functionEnd = installer.indexOf("\nfunction Test-ConfigJournal");
-  assert.notEqual(functionStart, -1);
-  assert.notEqual(functionEnd, -1);
-  const parser = installer.slice(functionStart, functionEnd);
-  assert.match(
-    installer,
-    /\$PSNativeCommandUseErrorActionPreference = \$false/u,
-  );
-
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-native-exit-"));
-  try {
-    const nativeFixture = path.join(temporary, "transaction.cmd");
-    await writeFile(
-      nativeFixture,
-      [
-        "@echo off",
-        'if "%1"=="apply" (',
-        '  echo {"transactionProtocol":1,"operation":"apply","outcome":"configuration-unavailable","appliedCount":0,"noopCount":0,"disposition":"configuration-unavailable","authentication":"not-attempted","errorCode":"FAKE_APPLY","message":"apply unavailable"}',
-        "  exit /b 1",
-        ")",
-        'if "%1"=="rollback" (',
-        '  echo {"transactionProtocol":1,"operation":"rollback","outcome":"conflict","appliedCount":0,"noopCount":0,"journal":"C:\\\\journal\\\\client-config-transaction.json","errorCode":"FAKE_ROLLBACK","message":"rollback conflict"}',
-        "  exit /b 2",
-        ")",
-        "exit /b 64",
-        "",
-      ].join("\r\n"),
-    );
-    let executableTemporary = temporary;
-    if (process.platform === "linux") {
-      const converted = spawnSync("wslpath", ["-w", temporary], {
-        encoding: "utf8",
-      });
-      if (converted.status !== 0) return;
-      executableTemporary = converted.stdout.trim();
-    }
-    const executableFixture =
-      process.platform === "linux"
-        ? `${executableTemporary}\\transaction.cmd`
-        : nativeFixture;
-    const harnessPath = path.join(temporary, "native-exit.ps1");
-    const executableHarness =
-      process.platform === "linux"
-        ? `${executableTemporary}\\native-exit.ps1`
-        : harnessPath;
-    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
-    await writeFile(
-      harnessPath,
-      [
-        '$ErrorActionPreference = "Stop"',
-        "$PSNativeCommandUseErrorActionPreference = $true",
-        parser,
-        "& {",
-        '  $ErrorActionPreference = "Stop"',
-        "  $PSNativeCommandUseErrorActionPreference = $false",
-        `  $ApplyOutput = @(& ${quote(executableFixture)} apply)`,
-        "  $ApplyExit = $LASTEXITCODE",
-        `  $Apply = Read-ConfigTransactionResult $ApplyOutput "apply" $ApplyExit "C:\\journal\\client-config-transaction.json"`,
-        '  if ($ApplyExit -ne 1 -or $Apply.outcome -cne "configuration-unavailable") { throw "typed apply exit was not preserved" }',
-        `  $RollbackOutput = @(& ${quote(executableFixture)} rollback)`,
-        "  $RollbackExit = $LASTEXITCODE",
-        `  $Rollback = Read-ConfigTransactionResult $RollbackOutput "rollback" $RollbackExit "C:\\journal\\client-config-transaction.json"`,
-        '  if ($RollbackExit -ne 2 -or $Rollback.outcome -cne "conflict") { throw "typed rollback exit was not preserved" }',
-        "}",
-        'if ($PSNativeCommandUseErrorActionPreference -ne $true) { throw "caller native error preference changed" }',
-        "",
-      ].join("\n"),
-    );
-    const result = spawnSync(
-      command,
-      ["-NoProfile", "-NonInteractive", "-File", executableHarness],
-      { encoding: "utf8" },
-    );
-    assert.equal(result.status, 0, result.stderr);
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
 test("PowerShell IEX failures are catchable and direct-file failures remain nonzero", async () => {
   const command =
     process.platform === "win32"
@@ -1765,14 +1577,8 @@ test("Windows confirms incompatible replacement before download and resets state
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   assert.match(installer, /^# Install[\s\S]*\n& \{\n/u);
   assert.doesNotMatch(installer, /\$script:/u);
-  const invokeConfigurer = installer.indexOf(
-    "& $Destination __configure-transaction apply",
-  );
-  const configureComplete = installer.indexOf(
-    "$ConfigResult = Read-ConfigTransactionResult",
-  );
   const acquireSharedLock = installer.indexOf(
-    '$PathLock = Join-Path $PathLockRoot ".sana-mcp-installer-path.lock"',
+    '$Directory = Join-Path $Root ".sana-mcp-installer-path.lock"',
   );
   const snapshotPath = installer.indexOf(
     '$OldUserPath = [Environment]::GetEnvironmentVariable("Path", "User")',
@@ -1780,16 +1586,21 @@ test("Windows confirms incompatible replacement before download and resets state
   const publishPath = installer.indexOf(
     '[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")',
   );
-  assert.ok(invokeConfigurer >= 0);
-  assert.ok(configureComplete >= 0);
-  assert.ok(acquireSharedLock < invokeConfigurer);
-  assert.ok(snapshotPath < invokeConfigurer);
-  assert.ok(publishPath > snapshotPath);
-  assert.ok(publishPath < invokeConfigurer);
-  assert.ok(
-    installer.indexOf("$LiveStateTouched = $true", publishPath) <
-      invokeConfigurer,
+  const runtimeStateTouched = installer.indexOf(
+    "$RuntimeStateTouched = $true",
+    publishPath,
   );
+  const runtimeHealth = installer.indexOf(
+    'Invoke-Lifecycle $Destination "health"',
+    runtimeStateTouched,
+  );
+  assert.ok(acquireSharedLock >= 0);
+  assert.ok(snapshotPath > acquireSharedLock);
+  assert.ok(publishPath > snapshotPath);
+  assert.ok(runtimeStateTouched > publishPath);
+  assert.ok(runtimeHealth > runtimeStateTouched);
+  assert.doesNotMatch(installer, /__configure-transaction/u);
+  assert.doesNotMatch(installer, /ConfigTransaction|ConfigJournal/u);
   assert.match(
     installer,
     /if \(\$PathBeforePublication -cne \$OldUserPath\)/,
@@ -1801,10 +1612,6 @@ test("Windows confirms incompatible replacement before download and resets state
   assert.match(
     installer,
     /if \(\$FilesRestored -and \$OldPresent -and \$OldWasRunning\) \{\s+try \{\s+if \(\$null -eq \$Destination -or\s+-not \(Test-Path/u,
-  );
-  assert.match(
-    installer,
-    /if \(\$RetainNewRuntime\) \{[\s\S]*?try \{\s+if \(\$null -ne \$ConfigJournalFile -and\s+\(Test-Path/u,
   );
   const receiptMove = installer.indexOf(
     "Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force",
@@ -1822,14 +1629,9 @@ test("Windows confirms incompatible replacement before download and resets state
   assert.ok(incompatibleConfirmation >= 0);
   assert.ok(incompatibleConfirmation < temporaryCreation);
   assert.ok(resetPrepare > receiptMove);
-  assert.ok(resetPrepare < invokeConfigurer);
   assert.doesNotMatch(
     installer,
     /Existing Sana authentication could not be validated/u,
-  );
-  assert.match(
-    installer,
-    /if \(\$OldPresent\) \{\s+if \(\$IncompatibleStateReset\) \{\s+Write-Host "Existing MCP client registrations will be reviewed after installation\."\s+\} else \{\s+Write-Host "Existing MCP client registrations were kept unchanged\."/u,
   );
   const committedReset = installer.indexOf(
     '$ResetCommit["state"] -cne "committed"',
@@ -1842,21 +1644,61 @@ test("Windows confirms incompatible replacement before download and resets state
     "$TransactionActive = $false",
     incompatibleCommitted,
   );
+  const cleanupCall = installer.lastIndexOf("Invoke-InstallerCleanup");
+  const cleanupPromotion = installer.indexOf(
+    "if ($CleanupErrors.Count -gt 0)",
+    cleanupCall,
+  );
+  const failureProof = installer.indexOf(
+    "if ($null -ne $InstallFailure)",
+    cleanupPromotion,
+  );
+  const updateBranch = installer.indexOf(
+    'if ($env:SANA_MCP_UPDATE -eq "1") {',
+    failureProof,
+  );
+  const yesBranch = installer.indexOf(
+    '} elseif ($env:SANA_MCP_YES -eq "1") {',
+    updateBranch,
+  );
   const postCommitSetup = installer.indexOf(
     "Invoke-PostInstallConfigurer $Destination",
-    incompatibleTransactionClosed,
+    yesBranch,
   );
   assert.ok(committedReset >= 0);
   assert.ok(incompatibleCommitted > committedReset);
   assert.ok(incompatibleTransactionClosed > incompatibleCommitted);
-  assert.ok(postCommitSetup > incompatibleTransactionClosed);
-  assert.match(
-    installer,
-    /if \(\$env:SANA_MCP_UPDATE -eq "1"\)[\s\S]*?elseif \(\$env:SANA_MCP_YES -eq "1"\)[\s\S]*?Invoke-PostInstallConfigurer \$Destination -Yes/u,
+  assert.ok(cleanupCall > incompatibleTransactionClosed);
+  assert.ok(cleanupPromotion > cleanupCall);
+  assert.ok(failureProof > cleanupPromotion);
+  assert.ok(updateBranch > failureProof);
+  assert.ok(yesBranch > updateBranch);
+  assert.ok(postCommitSetup > yesBranch);
+  assert.ok(resetPrepare < cleanupCall);
+  assert.doesNotMatch(
+    installer.slice(updateBranch, yesBranch),
+    /Invoke-PostInstallConfigurer/u,
   );
   assert.match(
     installer,
+    /if \(\$env:SANA_MCP_UPDATE -eq "1"\) \{\s+if \(\$IncompatibleStateReset\) \{[\s\S]*?Run this command to configure clients and sign in:[\s\S]*?\}\s+\} elseif \(\$env:SANA_MCP_YES -eq "1"\) \{[\s\S]*?Invoke-PostInstallConfigurer \$Destination -Yes[\s\S]*?\} else \{[\s\S]*?Invoke-PostInstallConfigurer \$Destination/u,
+  );
+  assert.equal(
+    installer.match(/Invoke-PostInstallConfigurer \$Destination/g)?.length,
+    2,
+  );
+  assert.doesNotMatch(installer, /InteractiveSetup|no interactive terminal/u);
+  assert.match(
+    installer,
     /Start-Process\s+`\s+-FilePath \$Executable\s+`\s+-ArgumentList \$Arguments\s+`\s+-NoNewWindow\s+`\s+-Wait\s+`\s+-PassThru/u,
+  );
+  assert.match(
+    installer,
+    /state = "exited"\s+exitCode = \$Configurer\.ExitCode[\s\S]*?state = "launch-failed"\s+message = \$_\.Exception\.Message/u,
+  );
+  assert.match(
+    installer,
+    /client registration exited with code \$\(\$SetupOutcome\.exitCode\)[\s\S]*?client registration could not start: \$\(\$SetupOutcome\.message\)[\s\S]*?setup exited with code \$\(\$SetupOutcome\.exitCode\)[\s\S]*?setup could not start: \$\(\$SetupOutcome\.message\)/u,
   );
   assert.doesNotMatch(installer, /& \$Destination install/u);
   assert.match(
@@ -1964,6 +1806,7 @@ test("PowerShell deferred-install command quotes the executable and invokes it",
         `$YesCommand = Format-InstallCommand '${executableTarget.replaceAll("'", "''")}' -Yes`,
         'if ($YesCommand -cnotmatch " install --yes$") { throw "unattended retry command omitted --yes" }',
         '$script:ConfigurerExitCode = 0',
+        '$script:ConfigurerThrows = $false',
         "function Start-Process {",
         "  param(",
         "    [string] $FilePath,",
@@ -1974,17 +1817,21 @@ test("PowerShell deferred-install command quotes the executable and invokes it",
         "  )",
         `  if ($FilePath -cne '${executableTarget.replaceAll("'", "''")}') { throw "configurer used the wrong executable" }`,
         '  if (-not $NoNewWindow -or -not $Wait -or -not $PassThru) { throw "configurer did not inherit and synchronously hold the console" }',
+        '  if ($script:ConfigurerThrows) { throw "simulated process launch failure" }',
         '  $script:ConfigurerArguments = @($ArgumentList)',
         "  return [pscustomobject]@{ ExitCode = $script:ConfigurerExitCode }",
         "}",
         `$PipelineResult = @("irm-body" | ForEach-Object { Invoke-PostInstallConfigurer '${executableTarget.replaceAll("'", "''")}' })`,
-        'if ($PipelineResult.Count -ne 1 -or $PipelineResult[0] -ne $true) { throw "pipeline-shaped configurer launch was contaminated" }',
+        'if ($PipelineResult.Count -ne 1 -or $PipelineResult[0].state -cne "success" -or (($PipelineResult[0].PSObject.Properties.Name -join ",") -cne "state")) { throw "pipeline-shaped success outcome was contaminated" }',
         'if ($script:ConfigurerArguments.Count -ne 1 -or $script:ConfigurerArguments[0] -cne "install") { throw "interactive configurer arguments changed" }',
         `$YesResult = Invoke-PostInstallConfigurer '${executableTarget.replaceAll("'", "''")}' -Yes`,
-        'if (-not $YesResult -or $script:ConfigurerArguments.Count -ne 2 -or $script:ConfigurerArguments[1] -cne "--yes") { throw "unattended configurer arguments changed" }',
+        'if ($YesResult.state -cne "success" -or $script:ConfigurerArguments.Count -ne 2 -or $script:ConfigurerArguments[1] -cne "--yes") { throw "unattended configurer arguments changed" }',
         "$script:ConfigurerExitCode = 9",
         `$FailedResult = Invoke-PostInstallConfigurer '${executableTarget.replaceAll("'", "''")}'`,
-        'if ($FailedResult) { throw "nonzero configurer exit became success" }',
+        'if ($FailedResult.state -cne "exited" -or $FailedResult.exitCode -ne 9 -or $FailedResult.PSObject.Properties.Name -ccontains "message") { throw "nonzero configurer exit lost its exact structured outcome" }',
+        "$script:ConfigurerThrows = $true",
+        `$ThrownResult = @(Invoke-PostInstallConfigurer '${executableTarget.replaceAll("'", "''")}')`,
+        'if ($ThrownResult.Count -ne 1 -or $ThrownResult[0].state -cne "launch-failed" -or $ThrownResult[0].message -cne "simulated process launch failure" -or $ThrownResult[0].PSObject.Properties.Name -ccontains "exitCode") { throw "process launch exception lost its exact structured outcome" }',
         'Write-Output "command-format-ok"',
         "",
       ].join("\n"),
@@ -2005,6 +1852,48 @@ test("PowerShell deferred-install command quotes the executable and invokes it",
     );
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /command-format-ok/u);
+
+    const nativeWindowsHost =
+      process.platform === "win32" || powershell.toLowerCase().endsWith(".exe");
+    if (!nativeWindowsHost) {
+      const actualTarget = path.join(temporary, "actual-sana-configurer");
+      const observed = path.join(temporary, "actual-arguments.txt");
+      await writeFile(
+        actualTarget,
+        [
+          "#!/bin/sh",
+          'printf "%s\\n" "$*" > "$SANA_MCP_CONFIGURER_OBSERVED"',
+          'exit "$SANA_MCP_CONFIGURER_EXIT"',
+          "",
+        ].join("\n"),
+      );
+      await chmod(actualTarget, 0o755);
+      const actualHarness = path.join(temporary, "actual-process.ps1");
+      await writeFile(
+        actualHarness,
+        [
+          '$ErrorActionPreference = "Stop"',
+          formatter,
+          `$Result = @("irm-body" | ForEach-Object { Invoke-PostInstallConfigurer '${actualTarget.replaceAll("'", "''")}' -Yes })`,
+          'if ($Result.Count -ne 1 -or $Result[0].state -cne "success" -or (($Result[0].PSObject.Properties.Name -join ",") -cne "state")) { throw "actual pipeline launch failed or emitted process metadata" }',
+          "",
+        ].join("\n"),
+      );
+      const actualResult = spawnSync(
+        powershell,
+        ["-NoProfile", "-NonInteractive", "-File", actualHarness],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            SANA_MCP_CONFIGURER_OBSERVED: observed,
+            SANA_MCP_CONFIGURER_EXIT: "0",
+          },
+        },
+      );
+      assert.equal(actualResult.status, 0, actualResult.stderr);
+      assert.equal((await readFile(observed, "utf8")).trim(), "install --yes");
+    }
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
@@ -3063,7 +2952,7 @@ test("POSIX keeps the replacement runtime, PATH, and recovery journal when rollb
   }
 });
 
-test("installers preserve interactive configuration and strict transaction parsing", async () => {
+test("POSIX retains transactional configuration while Windows defers public setup until commit", async () => {
   const posix = await readFile(path.join(root, "install.sh"), "utf8");
   const windows = await readFile(path.join(root, "install.ps1"), "utf8");
   assert.match(
@@ -3078,22 +2967,11 @@ test("installers preserve interactive configuration and strict transaction parsi
     posix,
     /--server-command "\$dest" \\\n    --yes \\\n    < \/dev\/tty/,
   );
-  assert.match(windows, /ConvertFrom-Json -ErrorAction Stop/);
-  const catchStart = windows.indexOf("$InstallError = $_.Exception.Message");
-  const rollback = windows.indexOf(
-    "__configure-transaction rollback",
-    catchStart,
-  );
-  const restoreFiles = windows.indexOf(
-    "if ($CanRestoreFiles) {",
-    rollback,
-  );
-  assert.ok(catchStart >= 0);
-  assert.ok(rollback > catchStart);
-  assert.ok(restoreFiles > rollback);
-  assert.equal(
-    windows.indexOf("__configure-transaction rollback", rollback + 1),
-    -1,
+  assert.doesNotMatch(windows, /__configure-transaction/u);
+  assert.doesNotMatch(windows, /Read-ConfigTransactionResult/u);
+  assert.match(
+    windows,
+    /\$RuntimeStateTouched = \$true[\s\S]*?Invoke-Lifecycle \$Destination "health"/u,
   );
 });
 

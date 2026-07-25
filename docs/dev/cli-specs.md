@@ -15,7 +15,7 @@ flags, environment variables, and exit/edge behaviour.
 
 Status legend used throughout:
 
-- [shipped] - implemented in the current `v0.4.3` release candidate.
+- [shipped] - implemented in the current `v0.4.4` release candidate.
 - [planned] - designed in the per-area documents but not implemented in the
   current release candidate.
 
@@ -34,6 +34,7 @@ Style: hyphens only, never em/en dashes. All timestamps are UTC unless stated.
 | One-shot tool | `sana-mcp <tool> [json]` + flags | Non-interactive, scriptable output of a single capability (help/status/list/read/search/...). |
 | MCP server | `sana-mcp mcp` | Speak MCP over stdio; this is what AI clients launch. |
 | Background daemon | `sana-mcp daemon` | The only component that talks to Sana; syncs meetings into local SQLite. |
+| Updater | `sana-mcp update` | Verify and install the latest release from an installed standalone runtime. |
 | Uninstaller | `sana-mcp uninstall` | Remove the server from chosen clients. |
 
 The binary is produced with `bun build --compile` for seven verified targets:
@@ -69,23 +70,38 @@ irm https://github.com/Etals-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
 
 Both scripts:
 
-1. Resolve the release tag: `SANA_MCP_VERSION` if set, else the latest release
-   via the GitHub API (`releases/latest`).
-2. Detect OS + architecture and pick the matching asset
-   `sana-mcp-{linux,darwin,windows}-{x64,arm64}[.exe]`.
-3. Download it with a live progress bar showing percent, bytes, speed, and ETA.
-   - `install.sh`: `curl --progress-bar`.
-   - `install.ps1`: a custom streamed download rendering
+1. Resolve the release tag from `SANA_MCP_VERSION` when explicitly pinned.
+   Otherwise, detect the target first and download
+   `releases/latest/download/manifest-<target>.properties` together with its
+   `.sha256`; only the checksum-verified projection supplies the exact release
+   tag.
+2. Select one canonical asset:
+   - glibc Linux: `sana-mcp-linux-{x64,arm64}`;
+   - musl Linux: `sana-mcp-linux-{x64,arm64}-musl`;
+   - macOS: `sana-mcp-darwin-{x64,arm64}`;
+   - Windows: `sana-mcp-windows-x64.exe` (Windows ARM64 is not published).
+3. Download the binary with platform-specific progress:
+   - `install.sh` uses `curl --progress-bar` without deriving separate speed or
+     ETA fields.
+   - `install.ps1` uses a custom streamed renderer such as
      `[####----] 45%  43.2/95.5 MB  2.4 MB/s  ETA 00:21`.
-4. Verify SHA-256 against the published `<asset>.sha256` (skipped with a note if
-   the checksum asset is absent). A mismatch aborts before install; nothing is
-   placed on PATH. [shipped]
+4. Require and verify the SHA-256 sidecars for release metadata, the release
+   manifest, and the selected binary. A missing, malformed, mismatched, or
+   incorrectly named checksum aborts before installation; checksum verification
+   is never skipped. [shipped]
 5. Place the binary:
    - macOS/Linux: `${SANA_MCP_INSTALL_DIR:-~/.local/bin}/sana-mcp`.
    - Windows: `${SANA_MCP_INSTALL_DIR:-%LOCALAPPDATA%\sana-mcp}\sana-mcp.exe`.
-6. Add the install dir to PATH (persisted for new shells and the current
-   session). Re-runs do not duplicate PATH entries.
-7. Hand off to the binary to run the configurer.
+6. Add the install dir to PATH without duplicating entries:
+   - POSIX exports it for the current installer process and persists it in an
+     applicable supported shell profile when needed.
+   - Windows writes User PATH for new shells only; it launches the configurer by
+     the authoritative absolute executable path.
+7. Complete the platform handoff:
+   - A direct Windows script run commits the runtime transaction, releases its
+     locks and temporary resources, then attempts to start the public configurer.
+   - POSIX keeps client configuration inside its installer transaction.
+   - An updater handoff does not start the configurer.
 
 Manual install: download the asset for your platform from the
 [Releases page](https://github.com/Etals-AiApp/sana-ai-mcp/releases), verify its
@@ -97,51 +113,58 @@ Manual install: download the asset for your platform from the
 |---|---|---|
 | `SANA_MCP_VERSION` | latest release | Pin the release tag to install. |
 | `SANA_MCP_INSTALL_DIR` | `~/.local/bin` (POSIX), `%LOCALAPPDATA%\sana-mcp` (Windows) | Where the binary is placed. |
-| `SANA_MCP_YES` | unset | Unattended: register with all detected clients, no prompts. |
+| `SANA_MCP_YES` | unset | Unattended: register with all detected clients without a picker and skip authentication. |
 
-### 2.3 Handoff and screen flow [planned - installer-flow-polish.md]
+### 2.3 Handoff and screen flow
 
-Today the script prints download + `Checksum verified.` + `Installed ->` +
-`Added ... to PATH`, then the binary prints the configurer, and steps append to
-the console like a log [shipped]. The v0.4.0 redesign makes it one cohesive,
-in-place flow:
+Windows and POSIX intentionally use different transaction boundaries:
 
-- The script prints only a header and the progress bar; checksum/move/PATH go
-  silent on success (still fail loudly) and pass their outcomes to the binary via
-  env vars (`SANA_MCP_FROM_INSTALLER`, `SANA_MCP_INSTALLED_VERSION`,
-  `SANA_MCP_INSTALLED_PATH`, `SANA_MCP_INSTALLED_TARGET`, `SANA_MCP_CHECKSUM`,
-  `SANA_MCP_PATH_ADDED`).
-- The binary is exec'd as `sana-mcp install --from-installer` (POSIX also
-  redirects `< /dev/tty > /dev/tty` so the configurer is interactive under
-  `curl | sh`). It does a soft screen reset (`ESC[H ESC[J`, not the alternate
-  buffer, so scrollback survives; skipped when `SANA_MCP_KEEP_SCROLLBACK=1`) and
-  renders four unified screens:
-  1. Welcome + install summary (version, path, checksum, PATH note).
-  2. Configure AI clients as a live checklist (rows flip pending -> active ->
-     done/failed in place).
-  3. Sign in to Sana (optional; human-facing, no MCP text).
-  4. "You are all set" success screen: what was configured, grouped restart
-     hints, and how to use it going forward.
-- Non-TTY / piped: the script does not exec the configurer; it prints
-  `Installed. Run 'sana-mcp' ...` and exits. `--from-installer` on a non-TTY
-  prints the same screens as plain, unanimated lines.
+- Every successful direct Windows script run - local or one-line, fresh,
+  compatible, or incompatible - attempts to start the public
+  `sana-mcp install` configurer exactly once after runtime commit, installer
+  cleanup, and lock release.
+- The Windows configurer presents registrations that exactly match the installed
+  command as checked starting selections. In interactive setup it also recognizes
+  valid saved Sana authentication. `SANA_MCP_YES=1` runs
+  `sana-mcp install --yes` without the picker or authentication, after which the
+  Windows installer prints the exact command to sign in. A direct non-TTY run
+  still attempts the public configurer; if interaction is unavailable,
+  installation remains successful and the script prints an exact retry command.
+- An updater handoff never starts the configurer, even when `SANA_MCP_YES=1`.
+  A compatible Windows update preserves registration, authentication, and local
+  meeting state without setup output. Only an incompatible Windows update prints
+  the exact deferred command that opens client configuration and sign-in.
+- POSIX behavior is unchanged. A fresh interactive direct install runs the
+  private, journaled configuration transaction before installer commit. A fresh
+  direct non-TTY install defers configuration and prints the exact public
+  command; `SANA_MCP_YES=1` performs unattended transactional configuration.
+  A receipt-backed compatible existing direct install preserves client
+  configuration and does not reopen it.
+
+The public configurer detects supported AI clients, allows checked selections to
+be toggled, and applies registrations. When at least one safely configurable row
+is available and client selection/configuration completes, an interactive run
+reaches sign-in and recognizes valid saved authentication. With no safely
+configurable rows it reports no clients and returns before authentication. Run
+`sana-mcp install` later to reopen it.
 
 ---
 
 ## 3. Command reference
 
-Commander parses named subcommands (`mcp`, `daemon`, `install`, `uninstall`)
-before the default `[tool] [json]` action. Global: `--help`, `--version` (version
-comes from `package.json`, the single source of truth).
+Commander parses named subcommands (`mcp`, `daemon`, `update`, `install`,
+`uninstall`) before the default `[tool] [json]` action. Global: `--help`,
+`--version` (version comes from `package.json`, the single source of truth).
 
 ### 3.1 Routing (the default action)
 
 | Invocation | tool | flags | TTY | Routes to |
 |---|---|---|---|---|
-| `sana-mcp` | none | none | stdin+stdout TTY | interactive app `runApp()` [planned]; configurer [shipped] |
+| `sana-mcp` | none | none | stdin+stdout TTY | shipped interactive app `runApp()` |
 | `sana-mcp` | none | none | not a TTY | print a short hint, exit 0 |
 | `sana-mcp help` / `status` / `list '{...}'` / ... | present | any | any | one-shot `sana(tool, args)` |
 | `sana-mcp --limit 5` | none | present | any | one-shot `sana("help", args)` (legacy) |
+| `sana-mcp update` | subcommand | none | any for compatible/current/newer; incompatible consent requires stdin+stdout TTY | `runUpdate()` |
 | `sana-mcp install` / `config` / `configure` | subcommand | `--dry-run --yes --name` | any | `runInstall(opts)` |
 | `sana-mcp uninstall` | subcommand | `--dry-run --yes --name` | any | `runUninstall(opts)` |
 | `sana-mcp mcp` | subcommand | - | any | `runMcp()` |
@@ -149,7 +172,7 @@ comes from `package.json`, the single source of truth).
 | `sana-mcp --help` / `--version` | - | - | any | commander built-ins |
 
 "Meaningful flags" that keep a bare invocation on the one-shot path:
-`--email --code --id --limit --query --no-timestamps`.
+`--email --code --id --page --limit --query --no-timestamps`.
 
 Non-interactive detection is two-layered: `cli.ts` checks
 `process.stdin.isTTY && process.stdout.isTTY` before launching the app, and the
@@ -172,35 +195,63 @@ Options:
 
 Interactive behaviour [shipped, refined in planned]:
 
-- Detects clients (section 4) and opens a wizard showing ONLY detected clients as
-  toggles, each seeded from its current registration state (on = already
-  registered).
+- Detects clients (section 4) and opens a wizard showing detected, safely
+  configurable clients plus every proven-owned registration. A proven-owned
+  registration remains visible and checked even when executable detection says
+  absent or unavailable.
 - Keys: up/down move, `space` toggle, `a` toggle-all, `v` reveal undetected
-  clients (dimmed, unselectable), `enter` apply, `esc`/`q` cancel. A persistent
-  footer lists the shortcuts.
+  safely configurable clients, which are selectable manual opt-ins, `enter`
+  apply, `esc`/`q` cancel. A persistent footer lists the shortcuts.
+- A registration for the same server name but a different command target is
+  foreign and blocked rather than selected or overwritten. Foreign or unreadable
+  client configuration remains nonactionable, is reported with its path and
+  reason, and can make the overall configuration result incomplete.
 - On apply, only the diff is written: newly-on clients are registered, newly-off
-  clients are unregistered, unchanged clients are left alone (a still-on client
-  is re-applied idempotently, refreshing a stale command path). [planned: this
-  renders as a live checklist rather than appended lines.]
-- Then an optional sign-in step (human-facing).
+  clients are unregistered, and exact owned registrations that remain selected
+  are no-ops left unchanged. A different or stale command target is foreign and
+  blocked, not refreshed. [planned: this renders as a live checklist rather than
+  appended lines.]
+- When at least one safely configurable row is available and selection and
+  configuration complete, continue to the optional human-facing sign-in step.
+  With no safely configurable rows, report no clients and return before
+  authentication.
 - Idempotent and non-destructive: existing servers and unrelated config keys are
   preserved; a config file that cannot be parsed is left untouched and reported
   as skipped.
 
 Unattended (`--yes`): registers with every detected client, prints a per-client
-result, no prompts. If no clients are detected, says so and exits.
+result, and skips authentication. If no clients are detected, says so and exits.
+When invoked by the direct Windows installer through `SANA_MCP_YES=1`, the
+installer then prints the exact command to sign in.
 
 `config` / `configure` are aliases so "configure" reads naturally; there is no
-path by which a bare invocation silently edits all configs. [planned]
+path by which a bare invocation silently edits all configs.
 
-### 3.3 `sana-mcp uninstall`
+### 3.3 `sana-mcp update`
+
+Shipped standalone updater with no command options. It proves the running binary
+and adjacent installer receipt before network access, resolves and verifies the
+latest exact release tuple, reports current versions as no-ops, and never
+downgrades an installed version newer than latest. Compatible updates need no
+terminal or Sana availability and preserve registration, authentication, and
+local meeting state.
+
+Windows hands the checksum-verified installer to an external process so the
+running executable can exit before replacement. Linux and macOS run a compatible
+installer synchronously. A state-incompatible update is currently automatic only
+on Windows and requires interactive confirmation unless
+`SANA_MCP_REPLACE_INCOMPATIBLE=1` explicitly authorizes replacement; POSIX
+refuses it before confirmation or mutation. Updater handoffs do not launch the
+configurer.
+
+### 3.4 `sana-mcp uninstall`
 
 Same detection + selection UI as `install`, but removes the named server from
 the chosen clients. Same flags (`--dry-run`, `--yes`, `--name`). Removal
 preserves every other server/key; removing the last server may drop the now-empty
 container key.
 
-### 3.4 `sana-mcp` (interactive app) [planned - cli-app-architecture.md, cli-feature-screens.md]
+### 3.5 `sana-mcp` (interactive app) [shipped]
 
 Bare `sana-mcp` in a terminal launches a full interactive app: a main menu that
 routes to feature screens. It reads structured data directly from `SanaStore` /
@@ -241,22 +292,25 @@ Feature screens (all human-facing; data sources noted):
   URL + expiry note; offers open-in-browser (`start`/`open`/`xdg-open`) or copy
   to clipboard; re-open to mint a fresh link.
 - LOGIN - human two-step email + code (section 6).
-- CONFIGURE AI CLIENTS - reuses `runInstall({fromApp:true})` (skips the trailing
-  login prompt and closing text since the app owns those).
+- CONFIGURE AI CLIENTS - calls the normal `runInstall()` configurer. Its normal
+  client-selection and optional login flow runs inside the app; the app refreshes
+  its runtime state after the configurer returns.
 
 Data screens gate on entry: logged out -> route to LOGIN; blocking -> show a
 sync panel that auto-dismisses when the block clears; empty -> a screen-specific
 empty state.
 
-### 3.5 One-shot tool commands: `sana-mcp <tool> [json]`
+### 3.6 One-shot tool commands: `sana-mcp <tool> [json]`
 
 Non-interactive single-capability output, designed for scripting and pipes. The
-tool name plus an optional JSON args object, or flags, map into the dispatcher.
-This path is unchanged and is the same surface the MCP tool exposes.
+tool name plus an optional JSON args object, or flags, is parsed by `cli.ts` and
+routed to `runHumanCommand(tool, args)`. That human command layer calls
+structured core APIs and renders human-facing text. It is distinct from the
+MCP/agent surface, which routes through the agent dispatcher and preserves its
+LLM-facing output contracts.
 
 Tools: `help`, `login`, `status`, `list`, `read`, `search`, `summary`,
-`participants`, `recording`. Aliases `list_meetings` -> `list` and
-`read_transcript` -> `read` are accepted for back-compat.
+`participants`, `recording`. Human CLI command names are exact.
 
 Flags mapped into args:
 
@@ -265,6 +319,7 @@ Flags mapped into args:
 | `--email <email>` | `email` | login |
 | `--code <code>` | `confirmation_code` | login |
 | `--id <id>` | `meeting_id` / `id` | read, summary, participants, recording |
+| `--page <n>` | `page` | list, search |
 | `--limit <n>` | `limit` | list, search |
 | `--query <q>` | `query` | list (title filter), search |
 | `--no-timestamps` | `timestamps=false` | read |
@@ -272,12 +327,10 @@ Flags mapped into args:
 JSON args (positional) allow the full argument set for each tool; see section 5
 for per-tool arguments. Example: `sana-mcp list '{"sort":"oldest","limit":20}'`.
 
-Note: one-shot output is currently the agent-facing string (it references the MCP
-tool call form). [planned] the human CLI screens use a human renderer; the raw
-`sana-mcp <tool> [json]` passthrough may remain as a documented debug escape
-hatch that still prints agent strings.
+List and search treat `--page` as a one-based page number and combine it with
+their validated limit to select the requested result window.
 
-### 3.6 `sana-mcp mcp`
+### 3.7 `sana-mcp mcp`
 
 Run the MCP server on stdio (JSON-RPC 2.0). Registers a single tool,
 `meeting_transcripts`, whose body calls `sana(tool, args)` and returns the string
@@ -285,7 +338,7 @@ as text content. The startup line goes to stderr so it never corrupts the
 protocol stream. This is what a registered AI client launches
 (`<binary> mcp`).
 
-### 3.7 `sana-mcp daemon`
+### 3.8 `sana-mcp daemon`
 
 Run the background sync daemon in the foreground. Normally the daemon is spawned
 detached and automatically by other commands (see section 7); this subcommand
@@ -490,8 +543,16 @@ No data leaves the machine except authenticated requests to Sana itself.
 
 ## 10. TTY, color, and non-interactive behaviour
 
+- A bare `sana-mcp` invocation without a TTY prints a hint and exits 0 rather
+  than hanging.
+- `sana-mcp install` without a TTY and without `--yes` reports
+  interaction-unavailable and exits 1. When a direct Windows installer launches
+  it after commit and cleanup, that local setup failure does not change the
+  successful runtime installation; the outer installer prints an exact retry
+  command. The POSIX installer instead detects non-TTY operation before invoking
+  configuration, keeps the installed runtime, and prints the later command.
 - Interactive surfaces (app, configurer wizard) require a TTY on both stdin and
-  stdout. Without one, the tool prints a hint and exits 0 rather than hanging.
+  stdout.
 - Color is applied only on a TTY and when `NO_COLOR`/`TERM=dumb` are unset.
   Status glyphs remain meaningful ASCII (`+ - = x ~`) when color is off; Unicode
   glyphs are used only where they render safely (POSIX terminals, Windows

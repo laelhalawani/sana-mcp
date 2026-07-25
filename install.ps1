@@ -52,12 +52,8 @@ $OldReceiptBackup = $null
 $NewPathManaged = $false
 $StagedReceipt = $null
 $WrittenUserPath = $null
-$ConfigJournalDir = $null
-$ConfigJournalFile = $null
-$ConfigTransactionState = "none"
 $RetainNewRuntime = $false
-$ConfigJournalPreexisting = $false
-$LiveStateTouched = $false
+$RuntimeStateTouched = $false
 $InstallFailure = $null
 $CleanupErrors = @()
 $IncompatibleInstall = $false
@@ -108,11 +104,19 @@ function Invoke-PostInstallConfigurer(
       -Wait `
       -PassThru
     if ($Configurer.ExitCode -ne 0) {
-      return $false
+      return [pscustomobject] @{
+        state = "exited"
+        exitCode = $Configurer.ExitCode
+      }
     }
-    return $true
+    return [pscustomobject] @{
+      state = "success"
+    }
   } catch {
-    return $false
+    return [pscustomobject] @{
+      state = "launch-failed"
+      message = $_.Exception.Message
+    }
   }
 }
 
@@ -625,253 +629,6 @@ function Invoke-Lifecycle([string] $Executable, [string] $Operation) {
     throw "Runtime lifecycle response is invalid."
   }
   return $Lifecycle
-}
-
-function Read-ConfigTransactionResult(
-  [object[]] $Output,
-  [string] $ExpectedOperation,
-  [int] $ExitCode,
-  [string] $ExpectedJournal
-) {
-  if ($Output.Count -ne 1 -or $null -eq $Output[0]) {
-    throw "Client configuration returned an invalid number of response lines."
-  }
-  $Raw = [string] $Output[0]
-  if ([string]::IsNullOrWhiteSpace($Raw)) {
-    throw "Client configuration returned an empty response."
-  }
-  try {
-    $Value = $Raw | ConvertFrom-Json -ErrorAction Stop
-  } catch {
-    throw "Client configuration returned malformed JSON."
-  }
-  $Allowed = @(
-    "transactionProtocol", "operation", "outcome", "appliedCount", "noopCount",
-    "journal", "errorCode", "message", "disposition", "authentication"
-  )
-  $Properties = @($Value.PSObject.Properties)
-  $Names = @($Properties | ForEach-Object { $_.Name })
-  foreach ($Property in $Properties) {
-    if ($Allowed -cnotcontains $Property.Name) {
-      throw "Client configuration returned an unknown response field."
-    }
-  }
-  foreach ($Required in @(
-    "transactionProtocol", "operation", "outcome", "appliedCount", "noopCount"
-  )) {
-    if ($Properties.Name -cnotcontains $Required) {
-      throw "Client configuration response is missing $Required."
-    }
-  }
-  $RequiredOrder = @(
-    "transactionProtocol", "operation", "outcome", "appliedCount", "noopCount"
-  )
-  if ($Names.Count -lt $RequiredOrder.Count) {
-    throw "Client configuration response is missing required fields."
-  }
-  for ($Index = 0; $Index -lt $RequiredOrder.Count; $Index++) {
-    if ($Names[$Index] -cne $RequiredOrder[$Index]) {
-      throw "Client configuration response fields are not in canonical order."
-    }
-  }
-  $OptionalOrder = if ($Names.Count -eq 5) {
-    ""
-  } else {
-    ($Names[5..($Names.Count - 1)] -join ",")
-  }
-  if (@(
-        "", "disposition,authentication",
-        "disposition,authentication,errorCode,message",
-        "errorCode,message", "journal", "journal,errorCode,message",
-        "journal,disposition,authentication",
-        "journal,errorCode,message,disposition,authentication",
-        "journal,disposition,authentication,errorCode,message"
-      ) -cnotcontains $OptionalOrder) {
-    throw "Client configuration response optional fields are not in canonical order."
-  }
-  if ($Value.transactionProtocol -isnot [int] -or
-      $Value.transactionProtocol -ne 1 -or
-      $Value.operation -isnot [string] -or
-      $Value.operation -cne $ExpectedOperation -or
-      $Value.outcome -isnot [string] -or
-      @(
-        "applied", "no-mutation", "interaction-unavailable",
-        "configuration-unavailable", "authentication-incomplete",
-        "failed-rolled-back", "rollback-incomplete", "conflict",
-        "journal-ambiguous", "journal-persistence-unknown",
-        "journal-unavailable"
-      ) -cnotcontains $Value.outcome) {
-    throw "Client configuration response has an invalid protocol, operation, or outcome."
-  }
-  foreach ($CountName in @("appliedCount", "noopCount")) {
-    $Count = $Value.$CountName
-    if (($Count -isnot [int] -and $Count -isnot [long]) -or $Count -lt 0) {
-      throw "Client configuration response has an invalid $CountName."
-    }
-  }
-  if ($Properties.Name -ccontains "authentication" -and
-      @("not-attempted", "ready", "skipped", "retained", "unconfirmed") -cnotcontains
-        $Value.authentication) {
-    throw "Client configuration response has an invalid authentication state."
-  }
-  if ($Properties.Name -ccontains "disposition" -and
-      @(
-        "configured", "no-clients", "no-changes", "cancelled",
-        "interaction-unavailable", "configuration-unavailable",
-        "authentication-incomplete"
-      ) -cnotcontains $Value.disposition) {
-    throw "Client configuration response has an invalid disposition."
-  }
-  foreach ($StringName in @("journal", "errorCode", "message")) {
-    if ($Properties.Name -ccontains $StringName -and
-        ($Value.$StringName -isnot [string] -or
-         [string]::IsNullOrEmpty($Value.$StringName))) {
-      throw "Client configuration response has an invalid $StringName."
-    }
-  }
-  $HasJournal = $Names -ccontains "journal"
-  $HasError = $Names -ccontains "errorCode"
-  $HasMessage = $Names -ccontains "message"
-  if ($HasError -ne $HasMessage) {
-    throw "Client configuration response has incomplete error fields."
-  }
-  if ($HasJournal -and $Value.journal -cne $ExpectedJournal) {
-    throw "Client configuration response names an unexpected journal."
-  }
-  if ($Value.outcome -ceq "applied") {
-    if ($Value.appliedCount -le 0 -or -not $HasJournal) {
-      throw "Applied client configuration requires mutations and a journal."
-    }
-  } elseif ($Value.appliedCount -ne 0) {
-    throw "Non-applied client configuration must report zero applied mutations."
-  }
-  if ($ExpectedOperation -ceq "apply") {
-    if ($Names -cnotcontains "disposition" -or
-        $Names -cnotcontains "authentication") {
-      throw "Client configuration apply response is missing its disposition."
-    }
-    switch -CaseSensitive ("$ExitCode`:$($Value.outcome)") {
-      "0:applied" {
-        if ($Value.disposition -cne "configured" -or
-            @("unconfirmed", "retained") -ccontains $Value.authentication -or
-            $HasError) {
-          throw "Applied client configuration response is contradictory."
-        }
-      }
-      "0:no-mutation" {
-        if ($HasJournal -or
-            @("no-clients", "no-changes", "cancelled") -cnotcontains
-              $Value.disposition -or
-            @("unconfirmed", "retained") -ccontains $Value.authentication -or
-            $HasError) {
-          throw "No-mutation client configuration response is contradictory."
-        }
-      }
-      { @(
-          "1:interaction-unavailable", "1:configuration-unavailable",
-          "1:authentication-incomplete", "1:failed-rolled-back",
-          "1:journal-unavailable",
-          "2:rollback-incomplete", "2:conflict", "2:journal-ambiguous",
-          "2:journal-persistence-unknown"
-        ) -ccontains $_ } {
-        if (-not $HasError) {
-          throw "Failed client configuration response is missing error context."
-        }
-        if ($Value.authentication -ceq "ready") {
-          throw "Failed client configuration cannot report ready authentication."
-        }
-        $AllowedDisposition = switch -CaseSensitive ($Value.outcome) {
-          "interaction-unavailable" { @("interaction-unavailable") }
-          "configuration-unavailable" { @("configuration-unavailable") }
-          "authentication-incomplete" { @("authentication-incomplete") }
-          "failed-rolled-back" {
-            @(
-              "interaction-unavailable", "configuration-unavailable",
-              "authentication-incomplete"
-            )
-          }
-          "conflict" { @("configuration-unavailable") }
-          "journal-ambiguous" { @("configuration-unavailable") }
-          "journal-unavailable" { @("configuration-unavailable") }
-          default {
-            @(
-              "interaction-unavailable", "configuration-unavailable",
-              "authentication-incomplete"
-            )
-          }
-        }
-        if ($AllowedDisposition -cnotcontains $Value.disposition) {
-          throw "Failed client configuration response has a contradictory disposition."
-        }
-      }
-      default {
-        throw "Client configuration response outcome does not match its exit status."
-      }
-    }
-  } else {
-    if ($Names -ccontains "disposition" -or
-        $Names -ccontains "authentication") {
-      throw "Client configuration rollback response contains apply-only fields."
-    }
-    switch -CaseSensitive ("$ExitCode`:$($Value.outcome)") {
-      "0:failed-rolled-back" {
-        if (-not $HasJournal -or $HasError) {
-          throw "Successful client configuration rollback response is contradictory."
-        }
-      }
-      { @(
-          "1:journal-unavailable", "2:rollback-incomplete", "2:conflict",
-          "2:journal-persistence-unknown"
-        ) -ccontains $_ } {
-        if (-not $HasError) {
-          throw "Failed client configuration rollback response is missing error context."
-        }
-      }
-      default {
-        throw "Client configuration rollback outcome does not match its exit status."
-      }
-    }
-  }
-  return $Value
-}
-
-function Write-AuthenticationState([object] $Result) {
-  $Authentication = if (
-    $Result.PSObject.Properties.Name -ccontains "authentication"
-  ) {
-    [string] $Result.authentication
-  } else {
-    $null
-  }
-  switch -CaseSensitive ($Authentication) {
-    "ready" { Write-Host "Sana authentication was confirmed ready." }
-    "retained" { Write-Host "Existing Sana authentication was retained." }
-    "unconfirmed" {
-      Write-Host "Sana authentication may have been retained but could not be confirmed."
-    }
-    "skipped" { Write-Host "Sana authentication was not changed." }
-  }
-}
-
-function Test-ConfigJournal {
-  if ($null -eq $ConfigJournalFile -or
-      -not (Test-Path -LiteralPath $ConfigJournalFile -PathType Leaf)) {
-    return $false
-  }
-  Assert-NotReparse $ConfigJournalFile "Client configuration journal"
-  return $true
-}
-
-function Remove-CompletedConfigJournal {
-  if (Test-ConfigJournal) {
-    Remove-Item -LiteralPath $ConfigJournalFile -Force
-  } elseif (Test-Path -LiteralPath $ConfigJournalFile) {
-    throw "Client configuration journal is not a regular file."
-  }
-  if (Test-Path -LiteralPath $ConfigJournalDir) {
-    Assert-NotReparse $ConfigJournalDir "Client configuration journal directory"
-    Remove-Item -LiteralPath $ConfigJournalDir -Force
-  }
 }
 
 function Set-RetainedRuntimeState {
@@ -1756,127 +1513,8 @@ try {
     Write-Host "Removed the incompatible local session and meeting cache."
   }
 
-  $ConfigJournalDir = Join-Path $InstallDir ".sana-mcp-config-transaction"
-  $ConfigJournalFile = Join-Path $ConfigJournalDir "client-config-transaction.json"
-  Assert-NotReparse $ConfigJournalDir "Client configuration journal directory"
-  $ConfigJournalPreexisting = Test-Path -LiteralPath $ConfigJournalFile
-  $ConfigInteractiveAttempted = $false
-  if ($OldPresent) {
-    if ($IncompatibleStateReset) {
-      Write-Host "Existing MCP client registrations will be reviewed after installation."
-    } else {
-      Write-Host "Existing MCP client registrations were kept unchanged."
-    }
-    $ConfigTransactionState = "no-mutation"
-    $ConfigureExit = 0
-  } elseif ($env:SANA_MCP_YES -eq "1") {
-    $LiveStateTouched = $true
-    $ConfigOutput = @(
-      & $Destination __configure-transaction apply `
-        --journal $ConfigJournalDir `
-        --server-command $Destination `
-        --yes
-    )
-    $ConfigureExit = $LASTEXITCODE
-  } elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
-    $ConfigInteractiveAttempted = $true
-    $LiveStateTouched = $true
-    $ConfigOutput = @(
-      & $Destination __configure-transaction apply `
-        --journal $ConfigJournalDir `
-        --server-command $Destination
-    )
-    $ConfigureExit = $LASTEXITCODE
-  } else {
-    Write-Host "Client configuration was skipped because no interactive terminal is available."
-    Write-Host "Run this command: $(Format-InstallCommand $Destination)"
-    $ConfigTransactionState = "no-mutation"
-    $ConfigureExit = 0
-  }
-  if ($ConfigTransactionState -cne "no-mutation") {
-    try {
-      $ConfigResult = Read-ConfigTransactionResult `
-        $ConfigOutput "apply" $ConfigureExit $ConfigJournalFile
-    } catch {
-      $RetainNewRuntime = $true
-      $PreserveTemp = $true
-      throw "$($_.Exception.Message) The replacement runtime and recovery files were retained."
-    }
-    if ($ConfigureExit -eq 1 -and
-        $ConfigInteractiveAttempted -and
-        $ConfigResult.outcome -ceq "interaction-unavailable" -and
-        $ConfigResult.appliedCount -eq 0 -and
-        $ConfigResult.noopCount -eq 0 -and
-        $ConfigResult.disposition -ceq "interaction-unavailable" -and
-        $ConfigResult.authentication -ceq "not-attempted" -and
-        $ConfigResult.errorCode -ceq
-          "CONFIG_TRANSACTION_INTERACTION_UNAVAILABLE" -and
-        $ConfigResult.message -ceq
-          "an interactive terminal is required for client selection" -and
-        -not $ConfigJournalPreexisting -and
-        -not (Test-Path -LiteralPath $ConfigJournalFile)) {
-      $ConfigTransactionState = "no-mutation"
-      Write-Host "Client configuration was deferred because interactive controls are unavailable."
-      Write-Host "Run this command: $(Format-InstallCommand $Destination)"
-    } elseif ($ConfigureExit -eq 0 -and $ConfigResult.outcome -ceq "applied") {
-      Write-AuthenticationState $ConfigResult
-      if ($ConfigJournalPreexisting -or -not (Test-ConfigJournal)) {
-        $RetainNewRuntime = $true
-        $PreserveTemp = $true
-        throw "Client configuration reported applied changes without a usable recovery journal. The replacement runtime was retained."
-      }
-      $ConfigTransactionState = "applied"
-    } elseif ($ConfigureExit -eq 0 -and $ConfigResult.outcome -ceq "no-mutation") {
-      Write-AuthenticationState $ConfigResult
-      if (Test-Path -LiteralPath $ConfigJournalFile) {
-        $RetainNewRuntime = $true
-        $PreserveTemp = $true
-        throw "Client configuration reported no changes but left a recovery journal. The replacement runtime was retained."
-      }
-      $ConfigTransactionState = "no-mutation"
-    } elseif ($ConfigureExit -eq 1 -and
-              $ConfigResult.outcome -ceq "failed-rolled-back") {
-      Write-AuthenticationState $ConfigResult
-      $ConfigTransactionState = "safe-rolled-back"
-      try {
-        Remove-CompletedConfigJournal
-      } catch {
-        [Console]::Error.WriteLine(
-          "sana-mcp: client configuration was rolled back, but its completed journal could not be removed: $ConfigJournalDir"
-        )
-      }
-      $PreserveTemp = $true
-      throw "Client configuration did not complete, but its changes were rolled back. The replacement runtime remains installed because it has accessed live state."
-    } elseif ($ConfigureExit -eq 1 -and
-              @(
-                "interaction-unavailable", "configuration-unavailable",
-                "authentication-incomplete", "no-mutation"
-              ) -ccontains $ConfigResult.outcome) {
-      Write-AuthenticationState $ConfigResult
-      if ($ConfigJournalPreexisting -or
-          -not (Test-Path -LiteralPath $ConfigJournalFile)) {
-        $ConfigTransactionState = "no-mutation"
-        $PreserveTemp = $true
-        throw "Client configuration did not complete before changing client files. The replacement runtime remains installed because it has accessed live state."
-      }
-      $RetainNewRuntime = $true
-      $PreserveTemp = $true
-      throw "Client configuration did not complete and may have changed client files. The replacement runtime and recovery journal were retained."
-    } elseif ($ConfigureExit -eq 1 -and $ConfigJournalPreexisting) {
-      Write-AuthenticationState $ConfigResult
-      $ConfigTransactionState = "no-mutation"
-      $PreserveTemp = $true
-      throw "Client configuration could not start while an existing recovery journal is present. The replacement runtime and existing journal were preserved."
-    } else {
-      Write-AuthenticationState $ConfigResult
-      $RetainNewRuntime = $true
-      $PreserveTemp = $true
-      throw "Client configuration rollback status is uncertain (exit $ConfigureExit, outcome $($ConfigResult.outcome)). The replacement runtime and recovery journal were retained."
-    }
-  }
-
   if (-not $IncompatibleStateReset) {
-    $LiveStateTouched = $true
+    $RuntimeStateTouched = $true
   }
   if ($OldWasRunning) {
     $Started = Invoke-Lifecycle $Destination "start"
@@ -1946,55 +1584,7 @@ try {
 
   $Committed = $true
   $TransactionActive = $false
-  if ($ConfigTransactionState -ceq "applied") {
-    try {
-      Remove-CompletedConfigJournal
-      $ConfigTransactionState = "no-mutation"
-    } catch {
-      [Console]::Error.WriteLine(
-        "sana-mcp: install succeeded, but the completed configuration journal could not be removed: $ConfigJournalDir"
-      )
-    }
-  }
   Write-Host "Installed $Destination"
-  if ($IncompatibleStateReset) {
-    $InteractiveSetup =
-      [Environment]::UserInteractive -and
-      -not [Console]::IsInputRedirected -and
-      -not [Console]::IsOutputRedirected
-    if ($env:SANA_MCP_UPDATE -eq "1") {
-      Write-Host "Setup was deferred because this replacement was started by sana-mcp update."
-      Write-Host "Run this command: $(Format-InstallCommand $Destination)"
-    } elseif ($env:SANA_MCP_YES -eq "1") {
-      Write-Host "Registering sana-mcp with detected MCP clients."
-      $SetupSucceeded =
-        Invoke-PostInstallConfigurer $Destination -Yes
-      if (-not $SetupSucceeded) {
-        [Console]::Error.WriteLine(
-          "sana-mcp: installation succeeded, but client registration did not complete."
-        )
-        [Console]::Error.WriteLine(
-          "sana-mcp: retry with: $(Format-InstallCommand $Destination -Yes)"
-        )
-      }
-      Write-Host "Run this command to sign in: $(Format-ExecutableCommand $Destination)"
-    } elseif ($InteractiveSetup) {
-      Write-Host "Starting sana-mcp setup."
-      $SetupSucceeded =
-        Invoke-PostInstallConfigurer $Destination
-      if (-not $SetupSucceeded) {
-        [Console]::Error.WriteLine(
-          "sana-mcp: installation succeeded, but setup did not complete."
-        )
-        [Console]::Error.WriteLine(
-          "sana-mcp: retry with: $(Format-InstallCommand $Destination)"
-        )
-      }
-    } else {
-      Write-Host "Setup was deferred because no interactive terminal is available."
-      Write-Host "Run this command: $(Format-InstallCommand $Destination)"
-    }
-  }
   if (-not $NewPathManaged -and $MatchingEntries.Count -eq 0) {
     Write-Host "Add $InstallDir to PATH to run sana-mcp from new shells."
   }
@@ -2043,33 +1633,11 @@ try {
         }
       }
     }
-    $CanRestoreFiles = -not $RetainNewRuntime -and -not $LiveStateTouched
+    $CanRestoreFiles = -not $RetainNewRuntime -and -not $RuntimeStateTouched
     $FilesRestored = $false
-    if ($LiveStateTouched) {
+    if ($RuntimeStateTouched) {
       $RetainNewRuntime = $true
       $PreserveTemp = $true
-      if ($ConfigTransactionState -ceq "applied") {
-        try {
-          $RollbackOutput = @(
-            & $Destination __configure-transaction rollback --journal $ConfigJournalDir
-          )
-          $ConfigRollbackExit = $LASTEXITCODE
-          $ConfigRollbackResult = Read-ConfigTransactionResult `
-            $RollbackOutput "rollback" $ConfigRollbackExit $ConfigJournalFile
-          if ($ConfigRollbackExit -ne 0 -or
-              $ConfigRollbackResult.outcome -cne "failed-rolled-back") {
-            throw "Client configuration rollback returned exit $ConfigRollbackExit and outcome $($ConfigRollbackResult.outcome)."
-          }
-          $ConfigTransactionState = "safe-rolled-back"
-          try {
-            Remove-CompletedConfigJournal
-          } catch {
-            $RollbackErrors += "could not remove the completed client configuration journal: $($_.Exception.Message)"
-          }
-        } catch {
-          $RollbackErrors += "client configuration rollback was incomplete: $($_.Exception.Message)"
-        }
-      }
       try {
         Set-RetainedRuntimeState
       } catch {
@@ -2171,16 +1739,6 @@ try {
       [Console]::Error.WriteLine(
         "sana-mcp: retained the replacement runtime at $Destination"
       )
-      try {
-        if ($null -ne $ConfigJournalFile -and
-            (Test-Path -LiteralPath $ConfigJournalFile)) {
-          [Console]::Error.WriteLine(
-            "sana-mcp: client configuration recovery journal: $ConfigJournalDir"
-          )
-        }
-      } catch {
-        $RollbackErrors += "could not inspect the client configuration recovery journal: $($_.Exception.Message)"
-      }
       if ($null -ne $TempDir) {
         [Console]::Error.WriteLine(
           "sana-mcp: previous runtime backup and recovery inventory: $TempDir"
@@ -2223,6 +1781,51 @@ if ($CleanupErrors.Count -gt 0) {
 }
 if ($null -ne $InstallFailure) {
   throw [InvalidOperationException]::new($InstallFailure)
+}
+if ($env:SANA_MCP_UPDATE -eq "1") {
+  if ($IncompatibleStateReset) {
+    Write-Host "Setup was deferred because this incompatible replacement was started by sana-mcp update."
+    Write-Host "Run this command to configure clients and sign in: $(Format-InstallCommand $Destination)"
+  }
+} elseif ($env:SANA_MCP_YES -eq "1") {
+  Write-Host "Registering sana-mcp with detected MCP clients."
+  $SetupOutcome =
+    Invoke-PostInstallConfigurer $Destination -Yes
+  if ($SetupOutcome.state -ceq "exited") {
+    [Console]::Error.WriteLine(
+      "sana-mcp: installation succeeded, but client registration exited with code $($SetupOutcome.exitCode)."
+    )
+    [Console]::Error.WriteLine(
+      "sana-mcp: retry with: $(Format-InstallCommand $Destination -Yes)"
+    )
+  } elseif ($SetupOutcome.state -ceq "launch-failed") {
+    [Console]::Error.WriteLine(
+      "sana-mcp: installation succeeded, but client registration could not start: $($SetupOutcome.message)"
+    )
+    [Console]::Error.WriteLine(
+      "sana-mcp: retry with: $(Format-InstallCommand $Destination -Yes)"
+    )
+  }
+  Write-Host "Run this command to sign in: $(Format-ExecutableCommand $Destination)"
+} else {
+  Write-Host "Starting sana-mcp setup."
+  $SetupOutcome =
+    Invoke-PostInstallConfigurer $Destination
+  if ($SetupOutcome.state -ceq "exited") {
+    [Console]::Error.WriteLine(
+      "sana-mcp: installation succeeded, but setup exited with code $($SetupOutcome.exitCode)."
+    )
+    [Console]::Error.WriteLine(
+      "sana-mcp: retry with: $(Format-InstallCommand $Destination)"
+    )
+  } elseif ($SetupOutcome.state -ceq "launch-failed") {
+    [Console]::Error.WriteLine(
+      "sana-mcp: installation succeeded, but setup could not start: $($SetupOutcome.message)"
+    )
+    [Console]::Error.WriteLine(
+      "sana-mcp: retry with: $(Format-InstallCommand $Destination)"
+    )
+  }
 }
 } finally {
   if ($CallerHadLastExitCode) {
