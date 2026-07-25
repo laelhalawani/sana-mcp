@@ -1,87 +1,217 @@
-// Cross-platform path + presence helpers for client detection. Read-only.
+// Cross-platform, presentation-free client detection helpers.
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
-import { execFileSync } from "node:child_process";
+import {
+  isAuthoritativeWindowsAbsolute,
+  resolveCanonicalAbsoluteDirectory,
+  resolveAuthoritativeHome,
+} from "../runtime/home.js";
 
-// ---- path roots ----------------------------------------------------------
+export { isAuthoritativeWindowsAbsolute };
 
-export function home(...parts: string[]): string {
-  return path.join(os.homedir(), ...parts);
+export type DetectionResult =
+  | { state: "present"; evidence: readonly string[] }
+  | { state: "absent" }
+  | { state: "unavailable"; reason: string };
+
+export type PathResolution =
+  | { state: "available"; path: string }
+  | { state: "unavailable"; reason: string };
+
+export type CommandResolution =
+  | { state: "present"; path: string }
+  | { state: "absent" }
+  | { state: "unavailable"; reason: string };
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-// macOS ~/Library/Application Support/...
-export function appSupport(...parts: string[]): string {
+export function home(...parts: string[]): PathResolution {
+  const resolved = resolveAuthoritativeHome();
+  return resolved.state === "available"
+    ? { state: "available", path: path.join(resolved.path, ...parts) }
+    : { state: "unavailable", reason: resolved.reason };
+}
+
+export function appSupport(...parts: string[]): PathResolution {
   return home("Library", "Application Support", ...parts);
 }
 
-// Windows %APPDATA% (Roaming); null off-Windows or if unset.
-export function appData(): string | null {
-  return process.env.APPDATA ?? null;
+export function appData(): PathResolution {
+  if (process.platform !== "win32")
+    return { state: "unavailable", reason: "APPDATA is only defined for Windows clients" };
+  const value = process.env.APPDATA;
+  if (!value)
+    return { state: "unavailable", reason: "APPDATA is required to locate this client" };
+  return resolveCanonicalAbsoluteDirectory(value, "APPDATA", "win32");
 }
 
-// Windows %LOCALAPPDATA%; null off-Windows or if unset.
-export function localAppData(): string | null {
-  return process.env.LOCALAPPDATA ?? null;
+export function localAppData(): PathResolution {
+  if (process.platform !== "win32")
+    return { state: "unavailable", reason: "LOCALAPPDATA is only defined for Windows clients" };
+  const value = process.env.LOCALAPPDATA;
+  if (!value)
+    return { state: "unavailable", reason: "LOCALAPPDATA is required to detect this client" };
+  return resolveCanonicalAbsoluteDirectory(value, "LOCALAPPDATA", "win32");
 }
 
-// XDG config dir (Linux/BSD); falls back to ~/.config.
-export function xdgConfig(): string {
-  return process.env.XDG_CONFIG_HOME || home(".config");
+export function xdgConfig(): PathResolution {
+  const configured = process.env.XDG_CONFIG_HOME;
+  if (configured !== undefined) {
+    return resolveCanonicalAbsoluteDirectory(
+      configured,
+      "XDG_CONFIG_HOME",
+      process.platform,
+    );
+  }
+  return home(".config");
 }
 
-// ---- presence ------------------------------------------------------------
-
-export function exists(p: string | null | undefined): boolean {
-  if (!p) return false;
+/** A failed stat is unavailable, never silently equivalent to absence. */
+export function detectPath(candidate: string | null | undefined): DetectionResult {
+  if (!candidate) return { state: "unavailable", reason: "client path is unavailable" };
   try {
-    return fs.existsSync(p);
-  } catch {
-    return false;
+    fs.lstatSync(candidate);
+    return { state: "present", evidence: [candidate] };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "absent" };
+    return { state: "unavailable", reason: `cannot inspect ${candidate}: ${errorText(error)}` };
   }
 }
 
-export function anyExists(paths: Array<string | null | undefined>): boolean {
-  return paths.some(exists);
+export function combineDetections(results: readonly DetectionResult[]): DetectionResult {
+  const evidence = results.flatMap((result) =>
+    result.state === "present" ? [...result.evidence] : []
+  );
+  if (evidence.length > 0) return { state: "present", evidence };
+  const unavailable = results.find(
+    (result): result is Extract<DetectionResult, { state: "unavailable" }> =>
+      result.state === "unavailable"
+  );
+  return unavailable ?? { state: "absent" };
 }
 
-/**
- * Resolve a binary on PATH (which on unix, where on Windows). Returns the
- * absolute path, or null if not found / the lookup tool is unavailable.
- */
-export function which(bin: string): string | null {
-  const tool = process.platform === "win32" ? "where" : "which";
-  try {
-    const out = execFileSync(tool, [bin], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const first = out
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .filter(Boolean)[0];
-    return first ?? null;
-  } catch {
-    return null;
+function pathCandidates(bin: string, platform = process.platform): string[] {
+  if (path.basename(bin) !== bin) {
+    const absolute =
+      platform === "win32"
+        ? isAuthoritativeWindowsAbsolute(bin) && !bin.startsWith("\\\\")
+        : path.isAbsolute(bin);
+    return absolute ? [bin] : [];
   }
+  const rawPath = process.env.PATH;
+  if (rawPath === undefined) return [];
+  const directories = rawPath.split(path.delimiter).filter(Boolean);
+  if (platform !== "win32") return directories.map((directory) => path.join(directory, bin));
+
+  const extension = path.extname(bin);
+  const configured = process.env.PATHEXT;
+  const extensions = extension
+    ? [""]
+    : (configured ?? "")
+        .split(";")
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean);
+  return directories
+    .filter(
+      (directory) =>
+        isAuthoritativeWindowsAbsolute(directory) && !directory.startsWith("\\\\")
+    )
+    .flatMap((directory) =>
+      extensions.map((candidateExtension) =>
+        path.win32.join(directory, `${bin}${candidateExtension}`)
+      )
+    );
 }
 
-/** True if the named extension prefix is present in any VS Code-family extensions dir. */
-export function hasVscodeExt(prefix: string): boolean {
-  const dirs = [
+/** Resolve a command without invoking a shell or an external lookup program. */
+export function resolveCommand(bin: string): CommandResolution {
+  if (!bin || bin.includes("\0"))
+    return { state: "unavailable", reason: "command name is empty or invalid" };
+  if (
+    process.platform === "win32" &&
+    path.basename(bin) === bin &&
+    !path.extname(bin) &&
+    process.env.PATHEXT === undefined
+  )
+    return { state: "unavailable", reason: "PATHEXT is required for Windows command detection" };
+  const candidates = pathCandidates(bin);
+  if (candidates.length === 0)
+    return { state: "unavailable", reason: "PATH is not available for command detection" };
+
+  for (const candidate of candidates) {
+    try {
+      const stat = fs.statSync(candidate);
+      if (!stat.isFile()) continue;
+      if (process.platform !== "win32") {
+        try {
+          fs.accessSync(candidate, fs.constants.X_OK);
+        } catch {
+          continue;
+        }
+      }
+      return { state: "present", path: candidate };
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code === "ENOENT" ||
+        (error as NodeJS.ErrnoException).code === "ENOTDIR"
+      )
+        continue;
+      return {
+        state: "unavailable",
+        reason: `cannot inspect command candidate ${candidate}: ${errorText(error)}`,
+      };
+    }
+  }
+  return { state: "absent" };
+}
+
+export function detectCommand(bin: string): DetectionResult {
+  const result = resolveCommand(bin);
+  if (result.state === "present") return { state: "present", evidence: [result.path] };
+  return result;
+}
+
+export function detectVscodeExtension(prefix: string): DetectionResult {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*-$/.test(prefix))
+    return { state: "unavailable", reason: "extension prefix is invalid" };
+  const directories = [
     home(".vscode", "extensions"),
     home(".vscode-insiders", "extensions"),
     home(".cursor", "extensions"),
     home(".windsurf", "extensions"),
     home(".vscodium", "extensions"),
   ];
-  for (const d of dirs) {
-    if (!exists(d)) continue;
+  const outcomes: DetectionResult[] = [];
+  for (const resolution of directories) {
+    if (resolution.state === "unavailable") {
+      outcomes.push(resolution);
+      continue;
+    }
+    const directory = resolution.path;
+    const detected = detectPath(directory);
+    if (detected.state === "absent") {
+      outcomes.push(detected);
+      continue;
+    }
+    if (detected.state === "unavailable") {
+      outcomes.push(detected);
+      continue;
+    }
     try {
-      if (fs.readdirSync(d).some((n) => n.startsWith(prefix))) return true;
-    } catch {
-      /* ignore unreadable dir */
+      const match = fs.readdirSync(directory).find((name) => name.startsWith(prefix));
+      outcomes.push(
+        match
+          ? { state: "present", evidence: [path.join(directory, match)] }
+          : { state: "absent" }
+      );
+    } catch (error) {
+      outcomes.push({
+        state: "unavailable",
+        reason: `cannot inspect extensions in ${directory}: ${errorText(error)}`,
+      });
     }
   }
-  return false;
+  return combineDetections(outcomes);
 }

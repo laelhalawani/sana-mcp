@@ -1,76 +1,127 @@
-import fs from "node:fs";
-import path from "node:path";
-import type { SanaStore } from "../store/db.js";
-import { DATA_DIR } from "../config.js";
+import crypto from "node:crypto";
+import type {
+  DaemonLeaseClaim,
+  SanaStore,
+  SyncState,
+} from "../store/db.js";
 
-// A daemon is considered alive if it wrote a heartbeat recently AND its PID
-// still exists. Heartbeats are written every few seconds by the running daemon.
-// Note: PID reuse (an unrelated process inheriting a dead daemon's PID within
-// the stale window) is a known, very-low-probability edge that could briefly
-// wedge respawns; the heartbeat staleness check bounds it to ~STALE_MS.
-const STALE_MS = 30_000;
+export const DAEMON_STALE_MS = 30_000;
+export type { DaemonLeaseClaim } from "../store/db.js";
 
-const LOCK_FILE = path.join(DATA_DIR, "daemon.lock");
+export class DaemonLeaseLostError extends Error {
+  readonly code = "DAEMON_LEASE_LOST";
 
-/** Atomically claim the daemon lock; false if a live/starting daemon holds it. */
-export function acquireDaemonLock(): boolean {
-  if (tryCreate()) return true;
-  // Lock exists - inspect the holder.
-  let pid: number | null = null;
-  try {
-    pid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim()) || null;
-  } catch {
-    return false; // unreadable: don't steal
-  }
-  if (!pid) return false; // empty/garbage (mid-create window): don't steal
-  if (pidAlive(pid)) return false;
-  // Stale holder (dead PID): remove and re-attempt the atomic create. Only one
-  // caller's wx can then succeed; the other gets EEXIST -> false. No double-spawn.
-  try {
-    fs.unlinkSync(LOCK_FILE);
-  } catch {
-    /* ignore */
-  }
-  return tryCreate();
-
-  function tryCreate(): boolean {
-    try {
-      const fd = fs.openSync(LOCK_FILE, "wx");
-      fs.writeFileSync(fd, String(process.pid));
-      fs.closeSync(fd);
-      return true;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      return false;
-    }
+  constructor(pid: number) {
+    super(`Daemon lease no longer belongs to process ${pid}`);
+    this.name = "DaemonLeaseLostError";
   }
 }
 
-export function releaseDaemonLock(): void {
-  // Only delete the lock if it still belongs to us (don't clobber a successor).
-  try {
-    const pid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
-    if (pid === process.pid) fs.unlinkSync(LOCK_FILE);
-  } catch {
-    /* ignore */
+export class DaemonStaleOwnerError extends Error {
+  readonly code = "DAEMON_STALE_OWNER";
+
+  constructor(readonly ownerPid: number) {
+    super(
+      `Daemon process ${ownerPid} is still running but its heartbeat is stale; stop that process and retry`,
+    );
+    this.name = "DaemonStaleOwnerError";
+  }
+}
+
+export type DaemonStateStatus =
+  | Readonly<{ kind: "missing" }>
+  | Readonly<{ kind: "alive"; pid: number }>
+  | Readonly<{ kind: "dead"; pid: number }>
+  | Readonly<{ kind: "stale-live"; pid: number }>;
+
+/**
+ * Claim the single daemon identity in SQLite. The store serializes the read,
+ * liveness decision, and replacement in one immediate transaction.
+ */
+export function acquireDaemonLease(
+  store: Pick<SanaStore, "claimDaemonLease">,
+  pid: number = process.pid,
+  now: number = Date.now(),
+  alive: (ownerPid: number) => boolean = pidAlive,
+  instanceId: string = crypto.randomUUID(),
+): DaemonLeaseClaim {
+  return store.claimDaemonLease(
+    pid,
+    instanceId,
+    now,
+    DAEMON_STALE_MS,
+    alive,
+  );
+}
+
+/** Renew only the lease still owned by this daemon. */
+export function heartbeatDaemonLease(
+  store: Pick<SanaStore, "renewDaemonLease">,
+  instanceId: string,
+  pid: number = process.pid,
+  now: number = Date.now(),
+): void {
+  if (store.renewDaemonLease(pid, instanceId, now) === "not-owner") {
+    throw new DaemonLeaseLostError(pid);
   }
 }
 
 export function pidAlive(pid: number | null): boolean {
-  if (!pid) return false;
+  if (pid === null) return false;
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new TypeError("pid must be null or a positive safe integer");
+  }
   try {
-    process.kill(pid, 0); // signal 0 = existence check, cross-platform
+    process.kill(pid, 0);
     return true;
-  } catch (e) {
-    // EPERM means it exists but we can't signal it - still alive.
-    return (e as NodeJS.ErrnoException).code === "EPERM";
+  } catch (error) {
+    if (errno(error, "ESRCH")) return false;
+    if (errno(error, "EPERM")) return true;
+    throw new Error(`Could not determine whether process ${pid} is alive`, {
+      cause: error,
+    });
   }
 }
 
-export function isDaemonAlive(store: SanaStore): boolean {
-  const s = store.getSyncState();
-  if (!s.daemon_pid || !s.daemon_heartbeat_ms) return false;
-  if (Date.now() - s.daemon_heartbeat_ms > STALE_MS) return false;
-  if (s.daemon_pid === process.pid) return true;
-  return pidAlive(s.daemon_pid);
+export function daemonStateIsAlive(
+  state: Pick<SyncState, "daemon_pid" | "daemon_heartbeat_ms">,
+  now: number = Date.now(),
+  alive: (pid: number) => boolean = pidAlive,
+): boolean {
+  return daemonStateStatus(state, now, alive).kind === "alive";
+}
+
+export function daemonStateStatus(
+  state: Pick<SyncState, "daemon_pid" | "daemon_heartbeat_ms">,
+  now: number = Date.now(),
+  alive: (pid: number) => boolean = pidAlive,
+): DaemonStateStatus {
+  const pid = state.daemon_pid;
+  const heartbeat = state.daemon_heartbeat_ms;
+  if (pid === null) return { kind: "missing" };
+  const processIsAlive = pid === process.pid || alive(pid);
+  const heartbeatIsRecent =
+    heartbeat !== null && now - heartbeat <= DAEMON_STALE_MS;
+  if (processIsAlive && !heartbeatIsRecent) {
+    return { kind: "stale-live", pid };
+  }
+  return processIsAlive
+    ? { kind: "alive", pid }
+    : { kind: "dead", pid };
+}
+
+export function isDaemonAlive(
+  store: Pick<SanaStore, "getSyncState">,
+  now: number = Date.now(),
+  alive: (pid: number) => boolean = pidAlive,
+): boolean {
+  return daemonStateIsAlive(store.getSyncState(), now, alive);
+}
+
+function errno(error: unknown, code: string): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === code
+  );
 }

@@ -1,6 +1,16 @@
 import { Database } from "bun:sqlite";
+import fs from "node:fs";
 import path from "node:path";
-import { DATA_DIR, ensureDataDir, MAX_TRANSCRIPT_ATTEMPTS } from "../config.js";
+import {
+  dataDirectory,
+  ensureDataDir,
+  MAX_TRANSCRIPT_ATTEMPTS,
+} from "../config.js";
+import {
+  ensureSecureDirectory,
+  openSensitiveFile,
+  repairSensitiveFilePermissions,
+} from "../runtime/secure-files.js";
 import { transcriptLines } from "../sana/transcript.js";
 
 /** Named-parameter values accepted by bun:sqlite (object binding form). */
@@ -25,7 +35,28 @@ export type MeetingListRow = MeetingRow & {
   attempts: number;
 };
 
-export const DB_FILE = path.join(DATA_DIR, "sana.db");
+export function databaseFile(): string {
+  return path.join(dataDirectory(), "sana.db");
+}
+
+function existingRegularArtifact(file: string): boolean {
+  try {
+    const stats = fs.lstatSync(file);
+    if (stats.isSymbolicLink() || !stats.isFile()) {
+      throw new Error(`Database artifact is a link or non-regular file: ${file}`);
+    }
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return false;
+    }
+    throw error;
+  }
+}
 
 export type SyncPhase =
   | "idle" // never synced
@@ -46,6 +77,8 @@ export interface MeetingRow {
   processing_phase: string | null; // "done" when Sana has finished processing
 }
 
+export const MAX_MEETING_LIST_LIMIT = 1000;
+
 export interface TranscriptRow {
   meeting_id: string;
   text: string;
@@ -65,26 +98,205 @@ export interface SyncState {
   last_incremental_ms: number | null;
   daemon_pid: number | null;
   daemon_heartbeat_ms: number | null;
+  daemon_instance_id: string | null;
   // 1 while a login-triggered catch-up sync is running; data tools are blocked
   // until it clears. Set on login, cleared by the daemon once fully caught up.
   blocking: number;
-  // Timestamp of the most recent catch-up request (set on login). The daemon
-  // only clears `blocking` if the sync cycle it is finishing STARTED at/after
-  // this time, so a login racing an in-flight cycle isn't reported "complete".
+  // Legacy pre-generation catch-up marker retained only in the pre-1.0 schema.
+  // Ordering and cache release use catchup_generation, never wall-clock time.
   catchup_epoch_ms: number | null;
+  // 1 between cache isolation and confirmed session persistence. A sync cycle
+  // must never unblock cache reads while this transition is incomplete.
+  auth_pending: number;
+  // Process holding the short begin -> session publish -> confirm boundary.
+  // Null while no publication is active, including persistence-unknown states.
+  auth_transition_pid: number | null;
+  auth_generation: number;
+  auth_publication_token: string | null;
+  auth_user_id: string | null;
+  auth_workspace_id: string | null;
+  auth_transition_token: string | null;
+  auth_transition_generation: number | null;
+  auth_transition_kind: AuthPublicationKind | null;
+  auth_transition_user_id: string | null;
+  auth_transition_workspace_id: string | null;
+  auth_issue_code: string | null;
+  auth_issue_message: string | null;
+  auth_issue_operation_token: string | null;
+  auth_issue_generation: number | null;
+  auth_issue_kind: AuthPublicationKind | null;
+  catchup_generation: number | null;
+  cache_user_id: string | null;
+  cache_workspace_id: string | null;
+  sync_issue_code: string | null;
+  sync_issue_cause: string | null;
+  sync_issue_message: string | null;
   error: string | null;
   updated_ms: number;
 }
 
+export type PersistedAuthIssue =
+  | Readonly<{ kind: "none" }>
+  | Readonly<{ kind: "issue"; code: string; message: string }>
+  | Readonly<{
+      kind: "malformed";
+      code: "AUTH_STATE_MALFORMED";
+      message: string;
+    }>;
+
+/**
+ * Interpret the persisted authentication issue as one authoritative tuple.
+ * A missing half is corrupt state, never permission to invent the other half.
+ */
+export function inspectPersistedAuthIssue(
+  state: Pick<SyncState, "auth_issue_code" | "auth_issue_message">,
+): PersistedAuthIssue {
+  const { auth_issue_code: code, auth_issue_message: message } = state;
+  if (code === null && message === null) return { kind: "none" };
+  if (
+    code === null ||
+    message === null ||
+    !/^[A-Z][A-Z0-9_]{2,63}$/u.test(code) ||
+    message.trim() === "" ||
+    message.length > 1_000
+  ) {
+    return {
+      kind: "malformed",
+      code: "AUTH_STATE_MALFORMED",
+      message: "Persisted authentication issue tuple is malformed",
+    };
+  }
+  return { kind: "issue", code, message };
+}
+
+export type DaemonLeaseClaim =
+  | Readonly<{
+      kind: "acquired";
+      replacedPid: number | null;
+      instanceId: string;
+    }>
+  | Readonly<{
+      kind: "busy";
+      ownerPid: number;
+      ownerHeartbeat: "recent" | "stale";
+    }>;
+
+export type AuthPublicationKind = "request-code" | "login" | "refresh";
+
+export interface SessionVersion {
+  readonly generation: number;
+  readonly publicationToken: string | null;
+  readonly userId?: string | null;
+  readonly workspaceId?: string | null;
+}
+
+export interface AuthPublicationIntent {
+  readonly operationToken: string;
+  readonly targetGeneration: number;
+  readonly ownerPid: number;
+  readonly kind: AuthPublicationKind;
+  readonly userId: string | null;
+  readonly workspaceId: string | null;
+  readonly sourceGeneration: number;
+  readonly sourcePublicationToken: string | null;
+  readonly sourceUserId: string | null;
+  readonly sourceWorkspaceId: string | null;
+}
+
+export interface SyncCycleIdentity {
+  readonly generation: number;
+  readonly publicationToken: string;
+  readonly userId: string;
+  readonly workspaceId: string;
+}
+
+export interface ConfirmedAuthTuple {
+  readonly generation: number;
+  readonly publicationToken: string;
+  readonly userId: string | null;
+  readonly workspaceId: string | null;
+}
+
+export type CacheOperationGuard = ConfirmedAuthTuple & {
+  readonly userId: string;
+  readonly workspaceId: string;
+};
+
+export class CacheOperationChangedError extends Error {
+  readonly code = "CACHE_OPERATION_CHANGED";
+
+  constructor() {
+    super(
+      "Authentication or active cache identity changed during the operation",
+    );
+    this.name = "CacheOperationChangedError";
+  }
+}
+
+export class SyncGenerationChangedError extends Error {
+  readonly code = "SYNC_GENERATION_CHANGED";
+
+  constructor() {
+    super(
+      "Authentication changed while the sync cycle was running; stale writes were rejected",
+    );
+    this.name = "SyncGenerationChangedError";
+  }
+}
+
+export type AuthPublicationClaim =
+  | Readonly<{ kind: "acquired"; intent: AuthPublicationIntent }>
+  | Readonly<{ kind: "busy"; ownerPid: number }>
+  | Readonly<{ kind: "stale"; currentGeneration: number }>
+  | Readonly<{ kind: "incomplete"; code: string; message: string }>;
+
 export class SanaStore {
   readonly db: Database;
+  readonly file: string;
 
-  constructor(file: string = DB_FILE) {
-    ensureDataDir();
-    this.db = new Database(file, { strict: true });
-    this.db.exec("PRAGMA journal_mode = WAL;");
-    this.db.exec("PRAGMA busy_timeout = 5000;");
-    this.migrate();
+  constructor(file?: string) {
+    const usingDefaultFile = file === undefined;
+    this.file = path.resolve(file ?? databaseFile());
+    if (usingDefaultFile) ensureDataDir();
+    else ensureSecureDirectory(path.dirname(this.file));
+
+    const artifacts = [this.file, `${this.file}-wal`, `${this.file}-shm`];
+    for (const artifact of artifacts) {
+      if (existingRegularArtifact(artifact)) {
+        repairSensitiveFilePermissions(artifact);
+      }
+    }
+    if (!existingRegularArtifact(this.file)) {
+      const descriptor = openSensitiveFile(this.file, "wx");
+      fs.closeSync(descriptor);
+    }
+
+    let opened: Database | undefined;
+    try {
+      opened = new Database(this.file, { strict: true });
+      this.db = opened;
+      this.db.exec("PRAGMA journal_mode = WAL;");
+      this.db.exec("PRAGMA busy_timeout = 5000;");
+      this.migrate();
+      for (const artifact of artifacts) {
+        if (existingRegularArtifact(artifact)) {
+          repairSensitiveFilePermissions(artifact);
+        }
+      }
+    } catch (error) {
+      const errors: unknown[] = [error];
+      if (opened) {
+        try {
+          opened.close();
+        } catch (closeError) {
+          errors.push(closeError);
+        }
+      }
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "Database construction and cleanup failed");
+      }
+      throw error;
+    }
   }
 
   private migrate(): void {
@@ -154,8 +366,31 @@ export class SanaStore {
         last_incremental_ms INTEGER,
         daemon_pid INTEGER,
         daemon_heartbeat_ms INTEGER,
+        daemon_instance_id TEXT,
         blocking INTEGER NOT NULL DEFAULT 1,
         catchup_epoch_ms INTEGER,
+        auth_pending INTEGER NOT NULL DEFAULT 0,
+        auth_transition_pid INTEGER,
+        auth_generation INTEGER NOT NULL DEFAULT 0,
+        auth_publication_token TEXT,
+        auth_user_id TEXT,
+        auth_workspace_id TEXT,
+        auth_transition_token TEXT,
+        auth_transition_generation INTEGER,
+        auth_transition_kind TEXT,
+        auth_transition_user_id TEXT,
+        auth_transition_workspace_id TEXT,
+        auth_issue_code TEXT,
+        auth_issue_message TEXT,
+        auth_issue_operation_token TEXT,
+        auth_issue_generation INTEGER,
+        auth_issue_kind TEXT,
+        catchup_generation INTEGER,
+        cache_user_id TEXT,
+        cache_workspace_id TEXT,
+        sync_issue_code TEXT,
+        sync_issue_cause TEXT,
+        sync_issue_message TEXT,
         error TEXT,
         updated_ms INTEGER NOT NULL
       );
@@ -169,8 +404,54 @@ export class SanaStore {
       );
     if (!hasCol("sync_state", "blocking"))
       this.db.exec(`ALTER TABLE sync_state ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1`);
+    if (!hasCol("sync_state", "daemon_instance_id"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN daemon_instance_id TEXT`);
     if (!hasCol("sync_state", "catchup_epoch_ms"))
       this.db.exec(`ALTER TABLE sync_state ADD COLUMN catchup_epoch_ms INTEGER`);
+    if (!hasCol("sync_state", "auth_pending"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_pending INTEGER NOT NULL DEFAULT 0`);
+    if (!hasCol("sync_state", "auth_transition_pid"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_transition_pid INTEGER`);
+    if (!hasCol("sync_state", "auth_generation"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_generation INTEGER NOT NULL DEFAULT 0`);
+    if (!hasCol("sync_state", "auth_publication_token"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_publication_token TEXT`);
+    if (!hasCol("sync_state", "auth_user_id"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_user_id TEXT`);
+    if (!hasCol("sync_state", "auth_workspace_id"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_workspace_id TEXT`);
+    if (!hasCol("sync_state", "auth_transition_token"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_transition_token TEXT`);
+    if (!hasCol("sync_state", "auth_transition_generation"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_transition_generation INTEGER`);
+    if (!hasCol("sync_state", "auth_transition_kind"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_transition_kind TEXT`);
+    if (!hasCol("sync_state", "auth_transition_user_id"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_transition_user_id TEXT`);
+    if (!hasCol("sync_state", "auth_transition_workspace_id"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_transition_workspace_id TEXT`);
+    if (!hasCol("sync_state", "auth_issue_code"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_issue_code TEXT`);
+    if (!hasCol("sync_state", "auth_issue_message"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_issue_message TEXT`);
+    if (!hasCol("sync_state", "auth_issue_operation_token"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_issue_operation_token TEXT`);
+    if (!hasCol("sync_state", "auth_issue_generation"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_issue_generation INTEGER`);
+    if (!hasCol("sync_state", "auth_issue_kind"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN auth_issue_kind TEXT`);
+    if (!hasCol("sync_state", "catchup_generation"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN catchup_generation INTEGER`);
+    if (!hasCol("sync_state", "cache_user_id"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN cache_user_id TEXT`);
+    if (!hasCol("sync_state", "cache_workspace_id"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN cache_workspace_id TEXT`);
+    if (!hasCol("sync_state", "sync_issue_code"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN sync_issue_code TEXT`);
+    if (!hasCol("sync_state", "sync_issue_cause"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN sync_issue_cause TEXT`);
+    if (!hasCol("sync_state", "sync_issue_message"))
+      this.db.exec(`ALTER TABLE sync_state ADD COLUMN sync_issue_message TEXT`);
     if (!hasCol("meetings", "processing_phase"))
       this.db.exec(`ALTER TABLE meetings ADD COLUMN processing_phase TEXT`);
     if (!hasCol("meeting_metadata", "has_recording"))
@@ -248,7 +529,10 @@ export class SanaStore {
   }
 
   listMeetings(opts: MeetingListOpts = {}): MeetingListRow[] {
-    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 1000);
+    const limit = Math.min(
+      Math.max(opts.limit ?? 50, 1),
+      MAX_MEETING_LIST_LIMIT,
+    );
     const offset = Math.max(opts.offset ?? 0, 0);
     const order = opts.sort === "oldest" ? "ASC" : "DESC";
     const { where, params } = this.meetingFilter(opts);
@@ -556,7 +840,16 @@ export class SanaStore {
   private static readonly SYNC_COLS = [
     "phase", "message", "meetings_total", "transcripts_done", "transcripts_total",
     "last_full_sync_ms", "last_incremental_ms", "daemon_pid", "daemon_heartbeat_ms",
-    "blocking", "catchup_epoch_ms", "error",
+    "daemon_instance_id",
+    "blocking", "catchup_epoch_ms", "auth_pending", "auth_transition_pid",
+    "auth_generation", "auth_publication_token", "auth_user_id",
+    "auth_workspace_id", "auth_transition_token",
+    "auth_transition_generation", "auth_transition_kind",
+    "auth_transition_user_id", "auth_transition_workspace_id",
+    "auth_issue_code", "auth_issue_message", "auth_issue_operation_token",
+    "auth_issue_generation", "auth_issue_kind", "catchup_generation",
+    "cache_user_id", "cache_workspace_id", "sync_issue_code",
+    "sync_issue_cause", "sync_issue_message", "error",
   ] as const;
 
   updateSyncState(patch: Partial<Omit<SyncState, "updated_ms">>): void {
@@ -572,11 +865,814 @@ export class SanaStore {
   }
 
   /**
+   * Serialize daemon ownership in SQLite. A recent live owner wins; a missing,
+   * dead, or same-process owner is replaced while the write lock is held.
+   * A live owner with a stale heartbeat remains observable for manual recovery.
+   */
+  claimDaemonLease(
+    candidatePid: number,
+    candidateInstanceId: string,
+    now: number,
+    staleAfterMs: number,
+    ownerAlive: (pid: number) => boolean,
+  ): DaemonLeaseClaim {
+    assertPositiveSafeInteger(candidatePid, "candidatePid");
+    if (!isUuid(candidateInstanceId)) {
+      throw new TypeError("candidateInstanceId must be a UUID");
+    }
+    assertNonNegativeSafeInteger(now, "now");
+    assertPositiveSafeInteger(staleAfterMs, "staleAfterMs");
+
+    return this.immediateTransaction(() => {
+      const current = this.getSyncState();
+      const ownerPid = current.daemon_pid;
+      const heartbeat = current.daemon_heartbeat_ms;
+      const recent =
+        heartbeat !== null && now - heartbeat <= staleAfterMs;
+
+      if (
+        ownerPid !== null &&
+        ownerPid !== candidatePid &&
+        ownerAlive(ownerPid)
+      ) {
+        return {
+          kind: "busy",
+          ownerPid,
+          ownerHeartbeat: recent ? "recent" : "stale",
+        };
+      }
+
+      this.db
+        .prepare(
+          `UPDATE sync_state
+           SET daemon_pid = @candidate_pid,
+               daemon_heartbeat_ms = @heartbeat_ms,
+               daemon_instance_id = @candidate_instance_id,
+               updated_ms = @updated_ms
+           WHERE id = 1`,
+        )
+        .run({
+          candidate_pid: candidatePid,
+          candidate_instance_id: candidateInstanceId,
+          heartbeat_ms: now,
+          updated_ms: now,
+        });
+      return {
+        kind: "acquired",
+        replacedPid: ownerPid,
+        instanceId: candidateInstanceId,
+      };
+    });
+  }
+
+  renewDaemonLease(
+    expectedPid: number,
+    expectedInstanceId: string,
+    now: number,
+  ): "renewed" | "not-owner" {
+    assertPositiveSafeInteger(expectedPid, "expectedPid");
+    if (!isUuid(expectedInstanceId)) {
+      throw new TypeError("expectedInstanceId must be a UUID");
+    }
+    assertNonNegativeSafeInteger(now, "now");
+    const result = this.db
+      .prepare(
+        `UPDATE sync_state
+         SET daemon_heartbeat_ms = @heartbeat_ms, updated_ms = @updated_ms
+         WHERE id = 1
+           AND daemon_pid = @expected_pid
+           AND daemon_instance_id = @expected_instance_id`,
+      )
+      .run({
+        heartbeat_ms: now,
+        updated_ms: now,
+        expected_pid: expectedPid,
+        expected_instance_id: expectedInstanceId,
+      });
+    return result.changes === 1 ? "renewed" : "not-owner";
+  }
+
+  /**
+   * Clear daemon identity only while it still belongs to the expected process.
+   * The predicate and update are one SQLite operation so a successor cannot be
+   * cleared by its predecessor.
+   */
+  clearDaemonIdentityIfOwned(
+    expectedPid: number,
+    expectedInstanceId: string,
+  ): "cleared" | "not-owner" {
+    assertPositiveSafeInteger(expectedPid, "expectedPid");
+    if (!isUuid(expectedInstanceId)) {
+      throw new TypeError("expectedInstanceId must be a UUID");
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE sync_state
+         SET daemon_pid = NULL,
+             daemon_heartbeat_ms = NULL,
+             daemon_instance_id = NULL,
+             updated_ms = @updated_ms
+         WHERE id = 1
+           AND daemon_pid = @expected_pid
+           AND daemon_instance_id = @expected_instance_id`,
+      )
+      .run({
+        updated_ms: Date.now(),
+        expected_pid: expectedPid,
+        expected_instance_id: expectedInstanceId,
+      });
+    return result.changes === 1 ? "cleared" : "not-owner";
+  }
+
+  markNeedsLoginIfCurrent(
+    observed: SessionVersion,
+    message: string,
+  ): "marked" | "stale" {
+    validateSessionVersion(observed);
+    if (message.trim() === "") {
+      throw new TypeError("Needs-login message must not be empty");
+    }
+    return this.immediateTransaction(() => {
+      const state = this.getSyncState();
+      if (
+        authStateInvariantIssue(state) !== null ||
+        state.auth_transition_token !== null ||
+        !confirmedTupleMatches(state, observed)
+      ) {
+        return "stale";
+      }
+      this.db
+        .prepare(
+          `UPDATE sync_state
+           SET phase = 'needs_login',
+               message = @message,
+               error = NULL,
+               updated_ms = @updated_ms
+           WHERE id = 1`,
+        )
+        .run({ message, updated_ms: Date.now() });
+      return "marked";
+    });
+  }
+
+  claimAuthPublication(
+    source: SessionVersion,
+    target: Readonly<{ userId: string | null; workspaceId: string | null }>,
+    publicationKind: AuthPublicationKind,
+    operationToken: string,
+    candidatePid: number,
+    ownerAlive: (pid: number) => boolean,
+  ): AuthPublicationClaim {
+    validateSessionVersion(source);
+    validatePublicationIdentity(target, publicationKind);
+    validateOperationToken(operationToken);
+    assertPositiveSafeInteger(candidatePid, "candidatePid");
+    return this.immediateTransaction(() => {
+      let current = this.getSyncState();
+      const invariantIssue = authStateInvariantIssue(current);
+      if (invariantIssue !== null) {
+        this.persistAuthIssue(
+          "AUTH_STATE_MALFORMED",
+          invariantIssue,
+          Date.now(),
+        );
+        return {
+          kind: "incomplete",
+          code: "AUTH_STATE_MALFORMED",
+          message: invariantIssue,
+        };
+      }
+      if (current.auth_transition_token !== null) {
+        const observedPending =
+          pendingTupleMatches(current, source);
+        if (
+          current.auth_transition_pid !== null &&
+          ownerAlive(current.auth_transition_pid)
+        ) {
+          return {
+            kind: "busy",
+            ownerPid: current.auth_transition_pid,
+          };
+        } else if (observedPending) {
+          // Recovery is allowed only after the recorded owner is absent/dead.
+          // A live publisher is the only actor allowed to explicitly confirm.
+          this.confirmAuthPublicationRow(current, Date.now());
+          current = this.getSyncState();
+        } else if (
+          confirmedTupleMatches(current, source)
+        ) {
+          const abandonedLogin = current.auth_transition_kind === "login";
+          this.db
+            .prepare(
+              `UPDATE sync_state
+               SET auth_transition_pid = NULL,
+                   auth_transition_token = NULL,
+                   auth_transition_generation = NULL,
+                   auth_transition_kind = NULL,
+                   auth_transition_user_id = NULL,
+                   auth_transition_workspace_id = NULL,
+                   blocking = CASE WHEN @abandoned_login = 1 THEN 1 ELSE blocking END,
+                   auth_pending = CASE WHEN @abandoned_login = 1 THEN 1 ELSE auth_pending END,
+                   auth_issue_code = CASE
+                     WHEN @abandoned_login = 1 THEN 'AUTH_PUBLICATION_ABORTED'
+                     ELSE auth_issue_code END,
+                   auth_issue_message = CASE
+                     WHEN @abandoned_login = 1
+                     THEN 'A login session publication stopped before persistence; sign in again.'
+                     ELSE auth_issue_message END,
+                   auth_issue_operation_token = CASE
+                     WHEN @abandoned_login = 1 THEN @issue_token
+                     ELSE auth_issue_operation_token END,
+                   auth_issue_generation = CASE
+                     WHEN @abandoned_login = 1 THEN @issue_generation
+                     ELSE auth_issue_generation END,
+                   auth_issue_kind = CASE
+                     WHEN @abandoned_login = 1 THEN @issue_kind
+                     ELSE auth_issue_kind END,
+                   updated_ms = @updated_ms
+               WHERE id = 1`,
+            )
+            .run({
+              abandoned_login: abandonedLogin ? 1 : 0,
+              issue_token: current.auth_transition_token,
+              issue_generation: current.auth_transition_generation,
+              issue_kind: current.auth_transition_kind,
+              updated_ms: Date.now(),
+            });
+          current = this.getSyncState();
+        } else {
+          const message =
+            "Persisted session identity does not match either the confirmed or pending publication";
+          this.persistAuthIssue(
+            "AUTH_PUBLICATION_INCOMPLETE",
+            message,
+            Date.now(),
+          );
+          return {
+            kind: "incomplete",
+            code: "AUTH_PUBLICATION_INCOMPLETE",
+            message,
+          };
+        }
+      }
+
+      if (
+        source.generation < current.auth_generation
+      ) {
+        return {
+          kind: "stale",
+          currentGeneration: current.auth_generation,
+        };
+      }
+      if (
+        !confirmedTupleMatches(current, source)
+      ) {
+        const message =
+          "Persisted session identity does not match the confirmed authentication generation";
+        this.persistAuthIssue(
+          "AUTH_GENERATION_MISMATCH",
+          message,
+          Date.now(),
+        );
+        return {
+          kind: "incomplete",
+          code: "AUTH_GENERATION_MISMATCH",
+          message,
+        };
+      }
+      if (
+        publicationKind === "request-code" &&
+        (target.userId !== current.auth_user_id ||
+          target.workspaceId !== current.auth_workspace_id)
+      ) {
+        const message =
+          "A code request cannot establish or change the authenticated identity";
+        this.persistAuthIssue(
+          "AUTH_IDENTITY_UNVALIDATED",
+          message,
+          Date.now(),
+        );
+        return {
+          kind: "incomplete",
+          code: "AUTH_IDENTITY_UNVALIDATED",
+          message,
+        };
+      }
+      if (
+        publicationKind === "refresh" &&
+        (target.userId !== current.auth_user_id ||
+          target.workspaceId !== current.auth_workspace_id)
+      ) {
+        const message =
+          "A session refresh cannot change the confirmed Sana identity";
+        this.persistAuthIssue(
+          "AUTH_REFRESH_IDENTITY_MISMATCH",
+          message,
+          Date.now(),
+        );
+        return {
+          kind: "incomplete",
+          code: "AUTH_REFRESH_IDENTITY_MISMATCH",
+          message,
+        };
+      }
+      if (
+        publicationKind === "refresh" &&
+        (current.auth_pending === 1 || current.auth_issue_code !== null)
+      ) {
+        return {
+          kind: "incomplete",
+          code: current.auth_issue_code ?? "AUTH_TRANSITION_PENDING",
+          message:
+            current.auth_issue_message ??
+            "Authentication must be completed before the session can refresh",
+        };
+      }
+      if (current.auth_generation === Number.MAX_SAFE_INTEGER) {
+        throw new Error("Authentication generation sequence is exhausted");
+      }
+      const targetGeneration = current.auth_generation + 1;
+      const login = publicationKind === "login";
+      this.db
+        .prepare(
+          `UPDATE sync_state
+           SET blocking = CASE WHEN @login = 1 THEN 1 ELSE blocking END,
+               auth_pending = CASE WHEN @login = 1 THEN 1 ELSE auth_pending END,
+               catchup_generation = CASE
+                 WHEN @login = 1 THEN @target_generation
+                 ELSE catchup_generation END,
+               auth_transition_pid = @candidate_pid,
+               auth_transition_token = @operation_token,
+               auth_transition_generation = @target_generation,
+               auth_transition_kind = @publication_kind,
+               auth_transition_user_id = @transition_user_id,
+               auth_transition_workspace_id = @transition_workspace_id,
+               auth_issue_code = CASE WHEN @login = 1 THEN NULL ELSE auth_issue_code END,
+               auth_issue_message = CASE WHEN @login = 1 THEN NULL ELSE auth_issue_message END,
+               auth_issue_operation_token = CASE
+                 WHEN @login = 1 THEN NULL ELSE auth_issue_operation_token END,
+               auth_issue_generation = CASE
+                 WHEN @login = 1 THEN NULL ELSE auth_issue_generation END,
+               auth_issue_kind = CASE
+                 WHEN @login = 1 THEN NULL ELSE auth_issue_kind END,
+               updated_ms = @updated_ms
+           WHERE id = 1`,
+        )
+        .run({
+          login: login ? 1 : 0,
+          target_generation: targetGeneration,
+          candidate_pid: candidatePid,
+          operation_token: operationToken,
+          publication_kind: publicationKind,
+          transition_user_id: target.userId,
+          transition_workspace_id: target.workspaceId,
+          updated_ms: Date.now(),
+        });
+      return {
+        kind: "acquired",
+        intent: {
+          operationToken,
+          targetGeneration,
+          ownerPid: candidatePid,
+          kind: publicationKind,
+          userId: target.userId,
+          workspaceId: target.workspaceId,
+          sourceGeneration: source.generation,
+          sourcePublicationToken: source.publicationToken,
+          sourceUserId: source.userId ?? null,
+          sourceWorkspaceId: source.workspaceId ?? null,
+        },
+      };
+    });
+  }
+
+  confirmAuthPublication(
+    intent: AuthPublicationIntent,
+    now: number,
+  ): "confirmed" | "not-current" {
+    assertNonNegativeSafeInteger(now, "now");
+    return this.immediateTransaction(() => {
+      const current = this.getSyncState();
+      if (authStateInvariantIssue(current) !== null) {
+        this.persistAuthIssue(
+          "AUTH_STATE_MALFORMED",
+          "Persisted authentication state became malformed before publication confirmation",
+          now,
+        );
+        return "not-current";
+      }
+      if (!authIntentMatches(current, intent)) return "not-current";
+      this.confirmAuthPublicationRow(current, now);
+      return "confirmed";
+    });
+  }
+
+  markAuthPublicationIncomplete(
+    intent: AuthPublicationIntent,
+    code: string,
+    message: string,
+    now: number,
+  ): "released" | "not-current" {
+    validateIssue(code, message);
+    assertNonNegativeSafeInteger(now, "now");
+    const result = this.db
+      .prepare(
+        `UPDATE sync_state
+         SET auth_transition_pid = NULL,
+             blocking = 1,
+             auth_pending = 1,
+             auth_issue_code = @issue_code,
+             auth_issue_message = @issue_message,
+             auth_issue_operation_token = @operation_token,
+             auth_issue_generation = @target_generation,
+             auth_issue_kind = @publication_kind,
+             updated_ms = @updated_ms
+         WHERE id = 1
+           AND auth_transition_token = @operation_token
+           AND auth_transition_generation = @target_generation
+           AND auth_transition_pid = @owner_pid
+           AND auth_transition_kind = @publication_kind
+           AND auth_transition_user_id IS @transition_user_id
+           AND auth_transition_workspace_id IS @transition_workspace_id
+           AND auth_generation = @source_generation
+           AND auth_publication_token IS @source_publication_token
+           AND auth_user_id IS @source_user_id
+           AND auth_workspace_id IS @source_workspace_id`,
+      )
+      .run({
+        issue_code: code,
+        issue_message: message,
+        updated_ms: now,
+        operation_token: intent.operationToken,
+        target_generation: intent.targetGeneration,
+        owner_pid: intent.ownerPid,
+        publication_kind: intent.kind,
+        transition_user_id: intent.userId,
+        transition_workspace_id: intent.workspaceId,
+        source_generation: intent.sourceGeneration,
+        source_publication_token: intent.sourcePublicationToken,
+        source_user_id: intent.sourceUserId,
+        source_workspace_id: intent.sourceWorkspaceId,
+      });
+    return result.changes === 1 ? "released" : "not-current";
+  }
+
+  reconcileAuthState(
+    observed: SessionVersion,
+    ownerAlive: (pid: number) => boolean,
+  ):
+    | Readonly<{ kind: "current"; generation: number }>
+    | Readonly<{ kind: "incomplete"; code: string; message: string }> {
+    validateSessionVersion(observed);
+    return this.immediateTransaction(() => {
+      let state = this.getSyncState();
+      const invariantIssue = authStateInvariantIssue(state);
+      if (invariantIssue !== null) {
+        this.persistAuthIssue(
+          "AUTH_STATE_MALFORMED",
+          invariantIssue,
+          Date.now(),
+        );
+        return {
+          kind: "incomplete",
+          code: "AUTH_STATE_MALFORMED",
+          message: invariantIssue,
+        };
+      }
+      if (state.auth_transition_token !== null) {
+        if (
+          state.auth_transition_pid !== null &&
+          ownerAlive(state.auth_transition_pid)
+        ) {
+          return {
+            kind: "incomplete",
+            code: "AUTH_PUBLICATION_IN_PROGRESS",
+            message: "Another local session publication is still in progress",
+          };
+        } else if (pendingTupleMatches(state, observed)) {
+          // Only a dead/absent owner's durable file may be recovered here.
+          this.confirmAuthPublicationRow(state, Date.now());
+          state = this.getSyncState();
+        } else if (
+          confirmedTupleMatches(state, observed)
+        ) {
+          const message =
+            "A session publication stopped before persistence; sign in again.";
+          this.db
+            .prepare(
+              `UPDATE sync_state
+               SET auth_transition_pid = NULL,
+                   auth_transition_token = NULL,
+                   auth_transition_generation = NULL,
+                   auth_transition_kind = NULL,
+                   auth_transition_user_id = NULL,
+                   auth_transition_workspace_id = NULL,
+                   blocking = 1,
+                   auth_pending = 1,
+                   auth_issue_code = 'AUTH_PUBLICATION_ABORTED',
+                   auth_issue_message = @issue_message,
+                   auth_issue_operation_token = @issue_token,
+                   auth_issue_generation = @issue_generation,
+                   auth_issue_kind = @issue_kind,
+                   updated_ms = @updated_ms
+               WHERE id = 1`,
+            )
+            .run({
+              issue_message: message,
+              issue_token: state.auth_transition_token,
+              issue_generation: state.auth_transition_generation,
+              issue_kind: state.auth_transition_kind,
+              updated_ms: Date.now(),
+            });
+          return {
+            kind: "incomplete",
+            code: "AUTH_PUBLICATION_ABORTED",
+            message,
+          };
+        } else {
+          const message =
+            "Persisted session identity does not match the interrupted publication";
+          this.persistAuthIssue(
+            "AUTH_PUBLICATION_INCOMPLETE",
+            message,
+            Date.now(),
+          );
+          return {
+            kind: "incomplete",
+            code: "AUTH_PUBLICATION_INCOMPLETE",
+            message,
+          };
+        }
+      }
+      if (state.auth_issue_code !== null) {
+        return {
+          kind: "incomplete",
+          code: state.auth_issue_code,
+          message:
+            state.auth_issue_message ??
+            "Authentication transition is incomplete",
+        };
+      }
+      if (
+        !confirmedTupleMatches(state, observed)
+      ) {
+        const message =
+          "Persisted session is not the currently confirmed authentication generation";
+        this.persistAuthIssue(
+          "AUTH_GENERATION_MISMATCH",
+          message,
+          Date.now(),
+        );
+        return {
+          kind: "incomplete",
+          code: "AUTH_GENERATION_MISMATCH",
+          message,
+        };
+      }
+      return { kind: "current", generation: state.auth_generation };
+    });
+  }
+
+  writeSyncGeneration<Value>(
+    cycle: SyncCycleIdentity,
+    operation: () => Value,
+  ): Value {
+    validateSyncCycleIdentity(cycle);
+    return this.immediateTransaction(() => {
+      const state = this.getSyncState();
+      if (
+        authStateInvariantIssue(state) !== null ||
+        state.auth_transition_token !== null ||
+        state.auth_issue_code !== null ||
+        state.auth_generation !== cycle.generation ||
+        state.auth_publication_token !== cycle.publicationToken ||
+        state.auth_user_id !== cycle.userId ||
+        state.auth_workspace_id !== cycle.workspaceId
+      ) {
+        throw new SyncGenerationChangedError();
+      }
+      const result = operation();
+      if (
+        typeof result === "object" &&
+        result !== null &&
+        "then" in result
+      ) {
+        throw new TypeError(
+          "Generation-fenced sync writes must be synchronous",
+        );
+      }
+      return result;
+    });
+  }
+
+  writeCacheGeneration<Value>(
+    cycle: SyncCycleIdentity,
+    operation: () => Value,
+  ): Value {
+    return this.writeSyncGeneration(cycle, () => {
+      const state = this.getSyncState();
+      if (
+        state.cache_user_id !== cycle.userId ||
+        state.cache_workspace_id !== cycle.workspaceId
+      ) {
+        throw new SyncGenerationChangedError();
+      }
+      return operation();
+    });
+  }
+
+  assertSyncGeneration(cycle: SyncCycleIdentity): void {
+    this.writeSyncGeneration(cycle, () => {});
+  }
+
+  captureCacheOperation(
+    tuple: ConfirmedAuthTuple,
+  ): CacheOperationGuard {
+    validateConfirmedAuthTuple(tuple);
+    if (tuple.userId === null || tuple.workspaceId === null) {
+      throw new CacheOperationChangedError();
+    }
+    return this.immediateTransaction(() => {
+      this.assertCacheOperationRow(tuple);
+      return {
+        ...tuple,
+        userId: tuple.userId!,
+        workspaceId: tuple.workspaceId!,
+      };
+    });
+  }
+
+  withCacheOperation<Value>(
+    guard: CacheOperationGuard,
+    operation: () => Value,
+  ): Value {
+    return this.immediateTransaction(() => {
+      this.assertCacheOperationRow(guard);
+      const result = operation();
+      if (
+        typeof result === "object" &&
+        result !== null &&
+        "then" in result
+      ) {
+        throw new TypeError(
+          "Cache operation transactions must be synchronous",
+        );
+      }
+      return result;
+    });
+  }
+
+  assertCacheOperation(guard: CacheOperationGuard): void {
+    this.immediateTransaction(() => {
+      this.assertCacheOperationRow(guard);
+    });
+  }
+
+  readConsistent<Value>(operation: () => Value): Value {
+    this.db.exec("BEGIN");
+    try {
+      const result = operation();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Consistent read and transaction rollback failed",
+        );
+      }
+      throw error;
+    }
+  }
+
+  activateCacheIdentity(cycle: SyncCycleIdentity): "unchanged" | "replaced" {
+    return this.writeSyncGeneration(cycle, () => {
+      const state = this.getSyncState();
+      if (
+        state.cache_user_id === cycle.userId &&
+        state.cache_workspace_id === cycle.workspaceId
+      ) {
+        return "unchanged";
+      }
+      // Meeting data is a rebuildable cache. This transition runs only after
+      // an authoritative identity and a successful complete list response.
+      this.db.exec(`
+        DELETE FROM line_fts;
+        DELETE FROM line_embeddings;
+        DELETE FROM meeting_metadata;
+        DELETE FROM transcripts;
+        DELETE FROM fetch_failures;
+        DELETE FROM meetings;
+      `);
+      const vectorTable = this.db
+        .prepare(
+          `SELECT 1 AS present
+           FROM sqlite_master
+           WHERE type = 'table' AND name = 'vec_lines'`,
+        )
+        .get() as { present: number } | null;
+      if (vectorTable !== null) {
+        this.db.exec(`DELETE FROM vec_lines`);
+      }
+      this.searchIndexReady = true;
+      this.db
+        .prepare(
+          `UPDATE sync_state
+           SET cache_user_id = @user_id,
+               cache_workspace_id = @workspace_id,
+               meetings_total = 0,
+               transcripts_done = 0,
+               transcripts_total = 0,
+               last_full_sync_ms = NULL,
+               last_incremental_ms = NULL,
+               updated_ms = @updated_ms
+           WHERE id = 1`,
+        )
+        .run({
+          user_id: cycle.userId,
+          workspace_id: cycle.workspaceId,
+          updated_ms: Date.now(),
+        });
+      return "replaced";
+    });
+  }
+
+  recordSyncUnavailable(
+    code: string,
+    cause: string,
+    message: string,
+  ): void {
+    validateIssue(code, message);
+    if (cause.trim() === "" || cause.length > 200) {
+      throw new TypeError("Sync unavailable cause is invalid");
+    }
+    this.db
+      .prepare(
+        `UPDATE sync_state
+         SET sync_issue_code = @code,
+             sync_issue_cause = @cause,
+             sync_issue_message = @message,
+             updated_ms = @updated_ms
+         WHERE id = 1`,
+      )
+      .run({
+        code,
+        cause,
+        message,
+        updated_ms: Date.now(),
+      });
+  }
+
+  resetFailuresIfCurrent(
+    tuple: ConfirmedAuthTuple,
+  ): "reset" | "stale" {
+    return this.authTupleTransaction(tuple, () => {
+      this.resetFailures();
+      return "reset";
+    });
+  }
+
+  recordSyncUnavailableIfCurrent(
+    tuple: ConfirmedAuthTuple,
+    code: string,
+    cause: string,
+    message: string,
+  ): "recorded" | "stale" {
+    return this.authTupleTransaction(tuple, () => {
+      this.recordSyncUnavailable(code, cause, message);
+      return "recorded";
+    });
+  }
+
+  clearSyncUnavailableIfCurrent(
+    tuple: ConfirmedAuthTuple,
+  ): "cleared" | "stale" {
+    return this.authTupleTransaction(tuple, () => {
+      this.clearSyncUnavailable();
+      return "cleared";
+    });
+  }
+
+  clearSyncUnavailable(): void {
+    this.db
+      .prepare(
+        `UPDATE sync_state
+         SET sync_issue_code = NULL,
+             sync_issue_cause = NULL,
+             sync_issue_message = NULL,
+             updated_ms = @updated_ms
+         WHERE id = 1`,
+      )
+      .run({ updated_ms: Date.now() });
+  }
+
+  /**
    * Finalize a sync cycle and, atomically, clear the login block ONLY if the
-   * cycle both finished its work and started at/after the pending catch-up
-   * request. Doing the epoch comparison and the `blocking` write in one SQL
-   * statement closes the cross-process read-modify-write window against a login
-   * that commits `blocking:1` mid-cycle.
+   * cycle both finished its work and used the currently confirmed session
+   * generation. This prevents an older-account cycle from unblocking a newer
+   * login regardless of wall-clock movement.
    */
   finishSyncCycle(patch: {
     message: string;
@@ -586,10 +1682,11 @@ export class SanaStore {
     last_full_sync_ms: number | null;
     last_incremental_ms: number;
     workDone: boolean;
-    cycleStart: number;
+    cycle: SyncCycleIdentity;
   }): void {
-    this.db
-      .prepare(
+    const result = this.writeSyncGeneration(patch.cycle, () =>
+      this.db
+        .prepare(
         `UPDATE sync_state SET
            phase = 'synced',
            message = @message,
@@ -600,26 +1697,507 @@ export class SanaStore {
            last_incremental_ms = @last_incremental_ms,
            blocking = CASE
              WHEN @workDone = 1
-               AND (catchup_epoch_ms IS NULL OR catchup_epoch_ms <= @cycleStart)
+               AND auth_pending = 0
+               AND auth_issue_code IS NULL
+               AND auth_transition_token IS NULL
+               AND auth_generation = @cycle_auth_generation
+               AND auth_publication_token = @cycle_publication_token
+               AND (
+                 catchup_generation IS NULL OR
+                 catchup_generation <= @cycle_auth_generation
+               )
              THEN 0 ELSE blocking END,
            error = NULL,
+           sync_issue_code = NULL,
+           sync_issue_cause = NULL,
+           sync_issue_message = NULL,
            updated_ms = @updated_ms
-         WHERE id = 1`
-      )
-      .run({
-        message: patch.message,
-        meetings_total: patch.meetings_total,
-        transcripts_total: patch.transcripts_total,
-        transcripts_done: patch.transcripts_done,
-        last_full_sync_ms: patch.last_full_sync_ms,
-        last_incremental_ms: patch.last_incremental_ms,
-        workDone: patch.workDone ? 1 : 0,
-        cycleStart: patch.cycleStart,
-        updated_ms: Date.now(),
-      });
+         WHERE id = 1
+           AND auth_generation = @cycle_auth_generation
+           AND auth_publication_token = @cycle_publication_token
+           AND auth_user_id = @cycle_user_id
+           AND auth_workspace_id = @cycle_workspace_id
+           AND cache_user_id = @cycle_user_id
+           AND cache_workspace_id = @cycle_workspace_id
+           AND auth_transition_token IS NULL
+           AND auth_issue_code IS NULL`
+        )
+        .run({
+          message: patch.message,
+          meetings_total: patch.meetings_total,
+          transcripts_total: patch.transcripts_total,
+          transcripts_done: patch.transcripts_done,
+          last_full_sync_ms: patch.last_full_sync_ms,
+          last_incremental_ms: patch.last_incremental_ms,
+          workDone: patch.workDone ? 1 : 0,
+          cycle_auth_generation: patch.cycle.generation,
+          cycle_publication_token: patch.cycle.publicationToken,
+          cycle_user_id: patch.cycle.userId,
+          cycle_workspace_id: patch.cycle.workspaceId,
+          updated_ms: Date.now(),
+        }),
+    );
+    if (result.changes !== 1) throw new SyncGenerationChangedError();
   }
 
   close(): void {
-    this.db.close();
+    const errors: unknown[] = [];
+    try {
+      this.db.close();
+    } catch (closeError) {
+      errors.push(closeError);
+    }
+    for (const artifact of [this.file, `${this.file}-wal`, `${this.file}-shm`]) {
+      try {
+        if (existingRegularArtifact(artifact)) {
+          repairSensitiveFilePermissions(artifact);
+        }
+      } catch (permissionError) {
+        errors.push(permissionError);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Database close or permission repair failed");
+    }
   }
+
+  private confirmAuthPublicationRow(state: SyncState, now: number): void {
+    if (
+      state.auth_transition_token === null ||
+      state.auth_transition_generation === null ||
+      state.auth_transition_kind === null
+    ) {
+      throw new Error("Authentication publication transition is incomplete");
+    }
+    const login = state.auth_transition_kind === "login";
+    const clearsOwnIssue =
+      state.auth_issue_operation_token === state.auth_transition_token &&
+      state.auth_issue_generation === state.auth_transition_generation &&
+      state.auth_issue_kind === state.auth_transition_kind;
+    const clearsIssue = login || clearsOwnIssue;
+    this.db
+      .prepare(
+        `UPDATE sync_state
+         SET auth_generation = @confirmed_generation,
+             auth_publication_token = @confirmed_token,
+             auth_user_id = auth_transition_user_id,
+             auth_workspace_id = auth_transition_workspace_id,
+             auth_transition_pid = NULL,
+             auth_transition_token = NULL,
+             auth_transition_generation = NULL,
+             auth_transition_kind = NULL,
+             auth_transition_user_id = NULL,
+             auth_transition_workspace_id = NULL,
+             phase = CASE WHEN @login = 1 THEN 'idle' ELSE phase END,
+             message = CASE
+               WHEN @login = 1 THEN 'Login confirmed; transcript sync is pending'
+               ELSE message END,
+             error = CASE WHEN @login = 1 THEN NULL ELSE error END,
+             blocking = CASE
+               WHEN @login = 1
+                 OR auth_transition_user_id IS NOT cache_user_id
+                 OR auth_transition_workspace_id IS NOT cache_workspace_id
+               THEN 1 ELSE blocking END,
+             catchup_generation = CASE
+               WHEN @login = 1
+                 OR auth_transition_user_id IS NOT cache_user_id
+                 OR auth_transition_workspace_id IS NOT cache_workspace_id
+               THEN @confirmed_generation ELSE catchup_generation END,
+             auth_pending = CASE WHEN @clears_issue = 1 THEN 0 ELSE auth_pending END,
+             auth_issue_code = CASE WHEN @clears_issue = 1 THEN NULL ELSE auth_issue_code END,
+             auth_issue_message = CASE WHEN @clears_issue = 1 THEN NULL ELSE auth_issue_message END,
+             auth_issue_operation_token = CASE
+               WHEN @clears_issue = 1 THEN NULL ELSE auth_issue_operation_token END,
+             auth_issue_generation = CASE
+               WHEN @clears_issue = 1 THEN NULL ELSE auth_issue_generation END,
+             auth_issue_kind = CASE
+               WHEN @clears_issue = 1 THEN NULL ELSE auth_issue_kind END,
+             updated_ms = @updated_ms
+         WHERE id = 1`,
+      )
+      .run({
+        confirmed_generation: state.auth_transition_generation,
+        confirmed_token: state.auth_transition_token,
+        login: login ? 1 : 0,
+        clears_issue: clearsIssue ? 1 : 0,
+        updated_ms: now,
+      });
+  }
+
+  private persistAuthIssue(code: string, message: string, now: number): void {
+    validateIssue(code, message);
+    this.db
+      .prepare(
+        `UPDATE sync_state
+         SET blocking = 1,
+             auth_pending = 1,
+             auth_issue_code = @issue_code,
+             auth_issue_message = @issue_message,
+             auth_issue_operation_token = NULL,
+             auth_issue_generation = NULL,
+             auth_issue_kind = NULL,
+             updated_ms = @updated_ms
+         WHERE id = 1`,
+      )
+      .run({
+        issue_code: code,
+        issue_message: message,
+        updated_ms: now,
+      });
+  }
+
+  private immediateTransaction<Value>(operation: () => Value): Value {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "SQLite operation and transaction rollback failed",
+        );
+      }
+      throw error;
+    }
+  }
+
+  private authTupleTransaction<Value>(
+    tuple: ConfirmedAuthTuple,
+    operation: () => Value,
+  ): Value | "stale" {
+    validateConfirmedAuthTuple(tuple);
+    return this.immediateTransaction(() => {
+      const state = this.getSyncState();
+      if (
+        state.auth_transition_token !== null ||
+        state.auth_issue_code !== null ||
+        state.auth_generation !== tuple.generation ||
+        state.auth_publication_token !== tuple.publicationToken ||
+        state.auth_user_id !== tuple.userId ||
+        state.auth_workspace_id !== tuple.workspaceId
+      ) {
+        return "stale";
+      }
+      return operation();
+    });
+  }
+
+  private assertCacheOperationRow(tuple: ConfirmedAuthTuple): void {
+    const state = this.getSyncState();
+    if (
+      authStateInvariantIssue(state) !== null ||
+      state.blocking !== 0 ||
+      state.auth_pending !== 0 ||
+      state.auth_transition_token !== null ||
+      state.auth_issue_code !== null ||
+      state.auth_generation !== tuple.generation ||
+      state.auth_publication_token !== tuple.publicationToken ||
+      state.auth_user_id !== tuple.userId ||
+      state.auth_workspace_id !== tuple.workspaceId ||
+      state.cache_user_id !== tuple.userId ||
+      state.cache_workspace_id !== tuple.workspaceId
+    ) {
+      throw new CacheOperationChangedError();
+    }
+  }
+}
+
+function assertPositiveSafeInteger(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive safe integer`);
+  }
+}
+
+function assertNonNegativeSafeInteger(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+}
+
+function isCanonicalId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value !== "" &&
+    value === value.trim()
+  );
+}
+
+function validateSessionVersion(version: SessionVersion): void {
+  assertNonNegativeSafeInteger(version.generation, "session generation");
+  if (
+    version.publicationToken !== null &&
+    !isUuid(version.publicationToken)
+  ) {
+    throw new TypeError("Session publication token must be a UUID or null");
+  }
+  if (
+    (version.generation === 0) !==
+    (version.publicationToken === null)
+  ) {
+    throw new TypeError(
+      "Legacy generation zero requires no publication token, and published generations require one",
+    );
+  }
+  const userId = version.userId ?? null;
+  const workspaceId = version.workspaceId ?? null;
+  if (
+    (version.generation === 0 &&
+      (userId !== null || workspaceId !== null)) ||
+    (userId === null) !== (workspaceId === null) ||
+    (userId !== null && !isCanonicalId(userId)) ||
+    (workspaceId !== null && !isCanonicalId(workspaceId))
+  ) {
+    throw new TypeError(
+      "Session user and workspace identities must be present together, non-empty, and without surrounding whitespace",
+    );
+  }
+}
+
+function validatePublicationIdentity(
+  identity: Readonly<{ userId: string | null; workspaceId: string | null }>,
+  kind: AuthPublicationKind,
+): void {
+  if (
+    (identity.userId === null) !== (identity.workspaceId === null) ||
+    (identity.userId !== null && !isCanonicalId(identity.userId)) ||
+    (identity.workspaceId !== null &&
+      !isCanonicalId(identity.workspaceId))
+  ) {
+    throw new TypeError(
+      "Publication target identity must be present together, non-empty, and without surrounding whitespace",
+    );
+  }
+  if (
+    (kind === "login" || kind === "refresh") &&
+    (identity.userId === null || identity.workspaceId === null)
+  ) {
+    throw new TypeError(
+      `${kind} publication requires an authoritative user and workspace identity`,
+    );
+  }
+}
+
+function validateSyncCycleIdentity(cycle: SyncCycleIdentity): void {
+  assertNonNegativeSafeInteger(cycle.generation, "sync generation");
+  if (
+    cycle.generation === 0 ||
+    !isUuid(cycle.publicationToken) ||
+    !isCanonicalId(cycle.userId) ||
+    !isCanonicalId(cycle.workspaceId)
+  ) {
+    throw new TypeError(
+      "Sync cycle requires a published generation and authoritative identity",
+    );
+  }
+}
+
+function validateConfirmedAuthTuple(tuple: ConfirmedAuthTuple): void {
+  if (
+    !Number.isSafeInteger(tuple.generation) ||
+    tuple.generation <= 0 ||
+    !isUuid(tuple.publicationToken) ||
+    (tuple.userId === null) !== (tuple.workspaceId === null) ||
+    (tuple.userId !== null && !isCanonicalId(tuple.userId)) ||
+    (tuple.workspaceId !== null &&
+      !isCanonicalId(tuple.workspaceId))
+  ) {
+    throw new TypeError("Confirmed authentication tuple is invalid");
+  }
+}
+
+function confirmedTupleMatches(
+  state: SyncState,
+  observed: SessionVersion,
+): boolean {
+  return (
+    observed.generation === state.auth_generation &&
+    observed.publicationToken === state.auth_publication_token &&
+    (observed.userId ?? null) === state.auth_user_id &&
+    (observed.workspaceId ?? null) === state.auth_workspace_id
+  );
+}
+
+function pendingTupleMatches(
+  state: SyncState,
+  observed: SessionVersion,
+): boolean {
+  return (
+    observed.generation === state.auth_transition_generation &&
+    observed.publicationToken === state.auth_transition_token &&
+    (observed.userId ?? null) === state.auth_transition_user_id &&
+    (observed.workspaceId ?? null) === state.auth_transition_workspace_id
+  );
+}
+
+function authStateInvariantIssue(state: SyncState): string | null {
+  if (
+    (state.blocking !== 0 && state.blocking !== 1) ||
+    (state.auth_pending !== 0 && state.auth_pending !== 1)
+  ) {
+    return "Persisted authentication state flags are malformed";
+  }
+  const confirmedTokenValid =
+    state.auth_publication_token === null ||
+    isUuid(state.auth_publication_token);
+  if (
+    !Number.isSafeInteger(state.auth_generation) ||
+    state.auth_generation < 0 ||
+    !confirmedTokenValid ||
+    (state.auth_generation === 0) !==
+      (state.auth_publication_token === null)
+  ) {
+    return "Persisted confirmed authentication generation/token tuple is malformed";
+  }
+  if (
+    (state.auth_generation === 0 &&
+      (state.auth_user_id !== null ||
+        state.auth_workspace_id !== null)) ||
+    (state.auth_user_id === null) !==
+      (state.auth_workspace_id === null) ||
+    (state.auth_user_id !== null &&
+      !isCanonicalId(state.auth_user_id)) ||
+    (state.auth_workspace_id !== null &&
+      !isCanonicalId(state.auth_workspace_id))
+  ) {
+    return "Persisted confirmed authentication identity tuple is malformed";
+  }
+
+  const transitionValues = [
+    state.auth_transition_pid,
+    state.auth_transition_token,
+    state.auth_transition_generation,
+    state.auth_transition_kind,
+    state.auth_transition_user_id,
+    state.auth_transition_workspace_id,
+  ];
+  const transitionPresent = state.auth_transition_token !== null;
+  if (transitionPresent) {
+    if (
+      (state.auth_transition_pid === null
+        ? state.auth_issue_code === null
+        : !Number.isSafeInteger(state.auth_transition_pid) ||
+          state.auth_transition_pid <= 0) ||
+      state.auth_transition_generation !== state.auth_generation + 1 ||
+      state.auth_transition_token === null ||
+      !isUuid(state.auth_transition_token) ||
+      (state.auth_transition_kind !== "request-code" &&
+        state.auth_transition_kind !== "login" &&
+        state.auth_transition_kind !== "refresh") ||
+      (state.auth_transition_user_id === null) !==
+        (state.auth_transition_workspace_id === null) ||
+      (state.auth_transition_user_id !== null &&
+        !isCanonicalId(state.auth_transition_user_id)) ||
+      (state.auth_transition_workspace_id !== null &&
+        !isCanonicalId(state.auth_transition_workspace_id)) ||
+      ((state.auth_transition_kind === "login" ||
+        state.auth_transition_kind === "refresh") &&
+        (state.auth_transition_user_id === null ||
+          state.auth_transition_workspace_id === null))
+    ) {
+      return "Persisted pending authentication publication tuple is malformed";
+    }
+  } else if (transitionValues.some((value) => value !== null)) {
+    return "Persisted authentication transition is only partially populated";
+  }
+
+  const persistedAuthIssue = inspectPersistedAuthIssue(state);
+  if (persistedAuthIssue.kind === "malformed")
+    return persistedAuthIssue.message;
+  const issueProvenance = [
+    state.auth_issue_operation_token,
+    state.auth_issue_generation,
+    state.auth_issue_kind,
+  ];
+  const hasIssueProvenance = issueProvenance.some(
+    (value) => value !== null,
+  );
+  if (
+    state.auth_issue_code === null
+      ? hasIssueProvenance
+      : hasIssueProvenance &&
+        (state.auth_issue_operation_token === null ||
+          !isUuid(state.auth_issue_operation_token) ||
+          state.auth_issue_generation === null ||
+          !Number.isSafeInteger(state.auth_issue_generation) ||
+          state.auth_issue_generation <= 0 ||
+          (state.auth_issue_kind !== "request-code" &&
+            state.auth_issue_kind !== "login" &&
+            state.auth_issue_kind !== "refresh"))
+  ) {
+    return "Persisted authentication issue provenance is malformed";
+  }
+  if (
+    state.auth_issue_code !== null &&
+    (state.blocking !== 1 || state.auth_pending !== 1)
+  ) {
+    return "Persisted authentication issue is not holding the cache block";
+  }
+  if (
+    state.auth_pending === 1 &&
+    state.auth_transition_token === null &&
+    state.auth_issue_code === null
+  ) {
+    return "Persisted authentication pending flag has no transition or issue";
+  }
+  if (
+    state.catchup_generation !== null &&
+    (!Number.isSafeInteger(state.catchup_generation) ||
+      state.catchup_generation <= 0)
+  ) {
+    return "Persisted catch-up generation is malformed";
+  }
+  if (
+    (state.cache_user_id === null) !==
+      (state.cache_workspace_id === null) ||
+    (state.cache_user_id !== null &&
+      !isCanonicalId(state.cache_user_id)) ||
+    (state.cache_workspace_id !== null &&
+      !isCanonicalId(state.cache_workspace_id))
+  ) {
+    return "Persisted cache identity tuple is malformed";
+  }
+  return null;
+}
+
+function validateOperationToken(token: string): void {
+  if (!isUuid(token)) {
+    throw new TypeError("Authentication operation token must be a UUID");
+  }
+}
+
+function validateIssue(code: string, message: string): void {
+  if (!/^[A-Z][A-Z0-9_]{2,63}$/u.test(code)) {
+    throw new TypeError("Authentication issue code is invalid");
+  }
+  if (message.trim() === "" || message.length > 1_000) {
+    throw new TypeError("Authentication issue message is invalid");
+  }
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+    value,
+  );
+}
+
+function authIntentMatches(
+  state: SyncState,
+  intent: AuthPublicationIntent,
+): boolean {
+  return (
+    state.auth_generation === intent.sourceGeneration &&
+    state.auth_publication_token === intent.sourcePublicationToken &&
+    state.auth_user_id === intent.sourceUserId &&
+    state.auth_workspace_id === intent.sourceWorkspaceId &&
+    state.auth_transition_token === intent.operationToken &&
+    state.auth_transition_generation === intent.targetGeneration &&
+    state.auth_transition_pid === intent.ownerPid &&
+    state.auth_transition_kind === intent.kind &&
+    state.auth_transition_user_id === intent.userId &&
+    state.auth_transition_workspace_id === intent.workspaceId
+  );
 }

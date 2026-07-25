@@ -1,0 +1,19 @@
+{
+  "documentEnvelope": {
+    "accepted": [
+      "Markdown or free text without frontmatter",
+      "YAML frontmatter delimited by --- followed by Markdown or free text"
+    ],
+    "currentBaselineUsesFrontmatter": false
+  },
+  "aliases": {
+    "tools": {
+      "list_meetings": "list",
+      "read_transcript": "read"
+    },
+    "arguments": {
+      "login.code": "login.confirmation_code",
+      "id": "meeting_id"
+    }
+  }
+}

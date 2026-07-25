@@ -1,43 +1,39 @@
 {
   "name": "sana-mcp",
   "version": "0.3.2",
+  "private": true,
   "description": "Sync and read your Sana.AI meeting transcripts (CLI + MCP server)",
   "license": "GPL-3.0",
   "type": "module",
-  "bin": {
-    "sana-mcp": "./dist/cli.js"
-  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "check": "bun run typecheck && bun test",
     "cli": "bun src/cli.ts",
     "login": "bun src/cli.ts login",
     "mcp": "bun src/mcp.ts",
     "daemon": "bun src/daemon-main.ts",
+    "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "compile": "bun build src/cli.ts --compile --minify --bytecode --sourcemap --outfile dist/sana-mcp"
+    "compile": "bun src/runtime/build-info.ts compile"
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",
-    "@inquirer/ansi": "^2.0.7",
     "@inquirer/core": "^11.2.1",
     "@inquirer/prompts": "^8.5.2",
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "adm-zip": "^0.5.16",
     "commander": "^12.1.0",
     "jsonc-parser": "^3.3.1",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
   },
   "optionalDependencies": {
     "@huggingface/transformers": "^4.2.0",
     "sqlite-vec": "^0.1.9"
   },
   "devDependencies": {
-    "@types/adm-zip": "^0.5.7",
     "@types/bun": "^1.3.14",
     "@types/iarna__toml": "^2.0.5",
     "@types/node": "^22.9.0",
-    "playwright": "^1.48.0",
-    "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
 }

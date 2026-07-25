@@ -1,3 +1,10 @@
+---
+status: historical
+scope: pre-remediation repository snapshot and known quirks
+last_verified: 2026-07-24
+authority: context only; inspect current code and remediation-plan.md
+---
+
 # sana-mcp - codebase notes & quirks
 
 A reference for anyone working on this code. Captures the architecture, the

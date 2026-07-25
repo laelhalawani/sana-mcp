@@ -1,3 +1,10 @@
+---
+status: research
+scope: non-binding Rust embedding-runtime study
+last_verified: 2026-07-24
+authority: revalidate before use; remediation-plan.md controls implementation
+---
+
 # Rust port - embedding (semantic search) runtime
 
 Status: research, July 2026. All crate versions and APIs below were verified against crates.io, docs.rs, and source on 2026-07-23. Do not trust older memory - the Rust ML ecosystem churns fast and `hf-hub` 1.0 is a breaking redesign.

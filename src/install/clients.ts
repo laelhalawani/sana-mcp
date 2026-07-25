@@ -1,298 +1,373 @@
-// Clean-room registry of supported MCP clients (paths/formats/detection are
-// public facts, re-authored from official docs - not copied from any library).
+// Registry of supported MCP clients. It contains data and deterministic
+// detection/config-shaping only; presentation belongs to the app layer.
 import path from "node:path";
 import type { ServerTarget } from "./server-target.js";
-import type { EntryBuilder } from "./writers.js";
+import type { EntryBuilder, FileConfigKind } from "./writers.js";
 import {
-  home,
   appData,
-  localAppData,
   appSupport,
+  combineDetections,
+  detectCommand,
+  detectPath,
+  detectVscodeExtension,
+  home,
+  localAppData,
+  type DetectionResult,
+  type PathResolution,
   xdgConfig,
-  exists,
-  which,
-  hasVscodeExt,
 } from "./detect.js";
 
-export type InstallKind =
-  | { kind: "file-json"; path: () => string | null; topKey: string }
-  | { kind: "file-jsonc"; path: () => string | null; topKey: string; build: EntryBuilder }
-  | { kind: "file-toml"; path: () => string | null }
-  | { kind: "file-yaml-list"; path: () => string | null }
-  | {
-      kind: "command";
-      bin: string;
-      buildArgs: (name: string, entry: ServerTarget) => string[];
-      removeArgs?: (name: string) => string[];
-    };
-
-// ---- per-client entry shapes (for JSONC clients with non-standard fields) --
-
-/** opencode: top-level `mcp`, type "local", command as a single array.
- * `enabled` is intentionally omitted: opencode treats an absent value as
- * enabled, and omitting it preserves a user's explicit `enabled:false` across
- * re-runs (the writer merges our fields onto the existing entry). */
-const opencodeEntry: EntryBuilder = (e) => {
-  const o: Record<string, unknown> = {
-    type: "local",
-    command: [e.command, ...e.args],
-  };
-  if (e.env && Object.keys(e.env).length) o.environment = e.env;
-  return o;
-};
-
-/** VS Code: top-level `servers`, type "stdio", command + args. */
-const vscodeEntry: EntryBuilder = (e) => {
-  const o: Record<string, unknown> = { type: "stdio", command: e.command, args: e.args };
-  if (e.env && Object.keys(e.env).length) o.env = e.env;
-  return o;
-};
+export interface FileInstall {
+  kind: "file";
+  format: FileConfigKind;
+  path: () => PathResolution;
+  topKey?: string;
+  build?: EntryBuilder;
+}
 
 export interface ClientDef {
   id: string;
   name: string;
-  detect: () => boolean;
-  install: InstallKind;
+  detect: () => DetectionResult;
+  install: FileInstall;
   reloadHint: string;
 }
 
-// ---- per-client config paths --------------------------------------------
-
-function claudeDesktopConfig(): string | null {
-  if (process.platform === "darwin") return appSupport("Claude", "claude_desktop_config.json");
-  if (process.platform === "win32") {
-    const a = appData();
-    return a ? path.join(a, "Claude", "claude_desktop_config.json") : null;
+export function detectClient(client: ClientDef): DetectionResult {
+  try {
+    return client.detect();
+  } catch (error) {
+    return {
+      state: "unavailable",
+      reason: `client detection failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
-  return null; // no official Linux build
 }
 
-function cursorConfig(): string {
-  return home(".cursor", "mcp.json");
+function available(candidate: string): PathResolution {
+  return { state: "available", path: candidate };
 }
 
-function codexConfig(): string {
-  return home(".codex", "config.toml");
+function joinResolution(root: PathResolution, ...parts: string[]): PathResolution {
+  return root.state === "available" ? available(path.join(root.path, ...parts)) : root;
 }
 
-function geminiConfig(): string {
-  return home(".gemini", "settings.json");
+/** Standard command/args/env MCP entry. */
+/** opencode uses a command vector and the `environment` key. */
+export const opencodeEntry: EntryBuilder = (entry) => {
+  const value: Record<string, unknown> = {
+    type: "local",
+    command: [entry.command, ...entry.args],
+  };
+  if (entry.env && Object.keys(entry.env).length > 0) value.environment = { ...entry.env };
+  return value;
+};
+
+/** VS Code uses an explicit stdio discriminator. */
+export const vscodeEntry: EntryBuilder = (entry) => {
+  const value: Record<string, unknown> = {
+    type: "stdio",
+    command: entry.command,
+    args: [...entry.args],
+  };
+  if (entry.env && Object.keys(entry.env).length > 0) value.env = { ...entry.env };
+  return value;
+};
+
+function claudeDesktopConfig(): PathResolution {
+  if (process.platform === "darwin")
+    return appSupport("Claude", "claude_desktop_config.json");
+  if (process.platform === "win32")
+    return joinResolution(appData(), "Claude", "claude_desktop_config.json");
+  return { state: "unavailable", reason: "Claude Desktop has no supported Linux config path" };
 }
 
-function windsurfConfig(): string {
-  return home(".codeium", "windsurf", "mcp_config.json");
+function rooConfig(): PathResolution {
+  if (process.platform === "darwin")
+    return appSupport(
+      "Code",
+      "User",
+      "globalStorage",
+      "rooveterinaryinc.roo-cline",
+      "mcp_settings.json"
+    );
+  if (process.platform === "win32")
+    return joinResolution(
+      appData(),
+      "Code",
+      "User",
+      "globalStorage",
+      "rooveterinaryinc.roo-cline",
+      "mcp_settings.json"
+    );
+  return joinResolution(
+    xdgConfig(),
+    "Code",
+    "User",
+    "globalStorage",
+    "rooveterinaryinc.roo-cline",
+    "mcp_settings.json"
+  );
 }
 
-function clineConfig(): string {
-  return home(".cline", "data", "settings", "cline_mcp_settings.json");
-}
-
-function rooConfig(): string | null {
-  const a = appData();
-  const base =
-    process.platform === "darwin"
-      ? appSupport("Code", "User", "globalStorage")
-      : process.platform === "win32"
-        ? a
-          ? path.join(a, "Code", "User", "globalStorage")
-          : null
-        : path.join(xdgConfig(), "Code", "User", "globalStorage");
-  return base ? path.join(base, "rooveterinaryinc.roo-cline", "mcp_settings.json") : null;
-}
-
-function amazonQConfig(): string {
-  return home(".aws", "amazonq", "mcp.json");
-}
-
-function continueConfig(): string {
-  return home(".continue", "config.yaml");
-}
-
-function zedConfig(): string | null {
+function zedConfig(): PathResolution {
   if (process.platform === "darwin") return appSupport("zed", "settings.json");
-  if (process.platform === "win32") {
-    const a = appData();
-    return a ? path.join(a, "Zed", "settings.json") : null;
-  }
-  return path.join(xdgConfig(), "zed", "settings.json");
+  if (process.platform === "win32")
+    return joinResolution(appData(), "Zed", "settings.json");
+  return joinResolution(xdgConfig(), "zed", "settings.json");
 }
 
-function opencodeDir(): string {
-  // opencode uses XDG on all platforms (incl. Windows via %APPDATA% fallback).
-  if (process.platform === "win32") {
-    const a = appData();
-    return a ? path.join(a, "opencode") : path.join(xdgConfig(), "opencode");
-  }
-  return path.join(xdgConfig(), "opencode");
+function opencodeDir(): PathResolution {
+  if (process.platform === "win32") return joinResolution(appData(), "opencode");
+  return joinResolution(xdgConfig(), "opencode");
 }
 
-function opencodeConfig(): string {
-  // Prefer an existing opencode.jsonc; otherwise write opencode.json.
-  const dir = opencodeDir();
-  const jsonc = path.join(dir, "opencode.jsonc");
-  return exists(jsonc) ? jsonc : path.join(dir, "opencode.json");
+function opencodeConfig(): PathResolution {
+  const directory = opencodeDir();
+  if (directory.state === "unavailable") return directory;
+  const jsonc = path.join(directory.path, "opencode.jsonc");
+  const json = path.join(directory.path, "opencode.json");
+  const jsoncState = detectPath(jsonc);
+  const jsonState = detectPath(json);
+  if (jsoncState.state === "present" && jsonState.state === "present")
+    return {
+      state: "unavailable",
+      reason: "both opencode.jsonc and opencode.json exist; the authoritative config is ambiguous",
+    };
+  if (jsoncState.state === "present") return available(jsonc);
+  if (jsoncState.state === "unavailable")
+    return { state: "unavailable", reason: jsoncState.reason };
+  if (jsonState.state === "unavailable")
+    return { state: "unavailable", reason: jsonState.reason };
+  return available(json);
 }
 
-function vscodeUserConfig(): string | null {
-  // VS Code user profile mcp.json (Copilot agent mode).
-  if (process.platform === "darwin") return appSupport("Code", "User", "mcp.json");
-  if (process.platform === "win32") {
-    const a = appData();
-    return a ? path.join(a, "Code", "User", "mcp.json") : null;
-  }
-  return path.join(xdgConfig(), "Code", "User", "mcp.json");
+function vscodeUserConfig(): PathResolution {
+  if (process.platform === "darwin")
+    return appSupport("Code", "User", "mcp.json");
+  if (process.platform === "win32")
+    return joinResolution(appData(), "Code", "User", "mcp.json");
+  return joinResolution(xdgConfig(), "Code", "User", "mcp.json");
 }
 
-// ---- detection helpers ---------------------------------------------------
-
-function appBundle(name: string): boolean {
-  return process.platform === "darwin" && exists(path.join("/Applications", name));
+function detectAppBundle(name: string): DetectionResult {
+  return process.platform === "darwin"
+    ? detectPath(path.join("/Applications", name))
+    : { state: "absent" };
 }
 
-// ---- the registry --------------------------------------------------------
+function detectResolvedPath(resolution: PathResolution): DetectionResult {
+  return resolution.state === "available"
+    ? detectPath(resolution.path)
+    : { state: "unavailable", reason: resolution.reason };
+}
 
-export const CLIENTS: ClientDef[] = [
+function detectWindowsPath(root: PathResolution, ...parts: string[]): DetectionResult {
+  if (process.platform !== "win32") return { state: "absent" };
+  return detectResolvedPath(joinResolution(root, ...parts));
+}
+
+export const CLIENTS: readonly ClientDef[] = [
   {
     id: "claude-desktop",
     name: "Claude Desktop",
-    detect() {
-      const lad = localAppData();
-      return (
-        exists(claudeDesktopConfig()) ||
-        appBundle("Claude.app") ||
-        (lad ? exists(path.join(lad, "AnthropicClaude")) : false)
-      );
+    detect: () =>
+      combineDetections([
+        detectResolvedPath(claudeDesktopConfig()),
+        detectAppBundle("Claude.app"),
+        detectWindowsPath(localAppData(), "AnthropicClaude"),
+      ]),
+    install: {
+      kind: "file",
+      format: "json",
+      path: claudeDesktopConfig,
+      topKey: "mcpServers",
     },
-    install: { kind: "file-json", path: claudeDesktopConfig, topKey: "mcpServers" },
     reloadHint: "quit and restart Claude Desktop",
   },
   {
     id: "claude-code",
     name: "Claude Code (CLI)",
-    detect() {
-      return which("claude") !== null || exists(home(".claude.json")) || exists(home(".claude"));
-    },
+    detect: () =>
+      combineDetections([
+        detectCommand("claude"),
+        detectResolvedPath(home(".claude.json")),
+        detectResolvedPath(home(".claude")),
+      ]),
+    // User-scoped Claude Code MCP registrations are represented in this file.
+    // File ownership can be proved exactly; opaque CLI text output cannot.
     install: {
-      kind: "command",
-      bin: "claude",
-      buildArgs: (name, e) => ["mcp", "add", name, "-s", "user", "--", e.command, ...e.args],
-      removeArgs: (name) => ["mcp", "remove", name, "-s", "user"],
+      kind: "file",
+      format: "json",
+      path: () => home(".claude.json"),
+      topKey: "mcpServers",
     },
     reloadHint: "restart Claude Code sessions",
   },
   {
     id: "cursor",
     name: "Cursor",
-    detect() {
-      const lad = localAppData();
-      return (
-        exists(home(".cursor")) ||
-        appBundle("Cursor.app") ||
-        (lad ? exists(path.join(lad, "Programs", "cursor")) : false)
-      );
+    detect: () =>
+      combineDetections([
+        detectResolvedPath(home(".cursor")),
+        detectAppBundle("Cursor.app"),
+        detectWindowsPath(localAppData(), "Programs", "cursor"),
+      ]),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () => home(".cursor", "mcp.json"),
+      topKey: "mcpServers",
     },
-    install: { kind: "file-json", path: cursorConfig, topKey: "mcpServers" },
     reloadHint: "restart Cursor",
   },
   {
     id: "codex",
     name: "Codex CLI",
-    detect() {
-      return which("codex") !== null || exists(home(".codex"));
+    detect: () =>
+      combineDetections([
+        detectCommand("codex"),
+        detectResolvedPath(home(".codex")),
+      ]),
+    install: {
+      kind: "file",
+      format: "toml",
+      path: () => home(".codex", "config.toml"),
     },
-    install: { kind: "file-toml", path: codexConfig },
     reloadHint: "restart Codex sessions",
   },
   {
     id: "gemini-cli",
     name: "Gemini CLI",
-    detect() {
-      return which("gemini") !== null || exists(home(".gemini"));
+    detect: () =>
+      combineDetections([
+        detectCommand("gemini"),
+        detectResolvedPath(home(".gemini")),
+      ]),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () => home(".gemini", "settings.json"),
+      topKey: "mcpServers",
     },
-    install: { kind: "file-json", path: geminiConfig, topKey: "mcpServers" },
     reloadHint: "restart Gemini CLI sessions",
   },
   {
     id: "windsurf",
     name: "Windsurf",
-    detect() {
-      const lad = localAppData();
-      return (
-        exists(home(".codeium", "windsurf")) ||
-        appBundle("Windsurf.app") ||
-        (lad ? exists(path.join(lad, "Programs", "Windsurf")) : false)
-      );
+    detect: () =>
+      combineDetections([
+        detectResolvedPath(home(".codeium", "windsurf")),
+        detectAppBundle("Windsurf.app"),
+        detectWindowsPath(localAppData(), "Programs", "Windsurf"),
+      ]),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () => home(".codeium", "windsurf", "mcp_config.json"),
+      topKey: "mcpServers",
     },
-    install: { kind: "file-json", path: windsurfConfig, topKey: "mcpServers" },
     reloadHint: "Windsurf reloads the affected server automatically",
   },
   {
     id: "zed",
     name: "Zed",
-    detect() {
-      return which("zed") !== null || exists(zedConfig()) || appBundle("Zed.app");
-    },
-    install: { kind: "file-json", path: zedConfig, topKey: "context_servers" },
+    detect: () =>
+      combineDetections([detectCommand("zed"), detectResolvedPath(zedConfig()), detectAppBundle("Zed.app")]),
+    install: { kind: "file", format: "json", path: zedConfig, topKey: "context_servers" },
     reloadHint: "Zed reloads settings automatically",
   },
   {
     id: "cline",
     name: "Cline",
-    detect() {
-      return exists(home(".cline")) || hasVscodeExt("saoudrizwan.claude-dev-");
+    detect: () =>
+      combineDetections([
+        detectResolvedPath(home(".cline")),
+        detectVscodeExtension("saoudrizwan.claude-dev-"),
+      ]),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () =>
+        home(".cline", "data", "settings", "cline_mcp_settings.json"),
+      topKey: "mcpServers",
     },
-    install: { kind: "file-json", path: clineConfig, topKey: "mcpServers" },
     reloadHint: "restart the server in Cline's MCP panel",
   },
   {
     id: "roo-code",
     name: "Roo Code",
-    detect() {
-      return exists(rooConfig()) || hasVscodeExt("rooveterinaryinc.roo-cline-");
-    },
-    install: { kind: "file-json", path: rooConfig, topKey: "mcpServers" },
+    detect: () =>
+      combineDetections([
+        detectResolvedPath(rooConfig()),
+        detectVscodeExtension("rooveterinaryinc.roo-cline-"),
+      ]),
+    install: { kind: "file", format: "json", path: rooConfig, topKey: "mcpServers" },
     reloadHint: "restart the server in Roo's MCP panel",
   },
   {
     id: "amazon-q",
     name: "Amazon Q Developer CLI",
-    detect() {
-      return which("q") !== null || which("qchat") !== null || exists(home(".aws", "amazonq"));
+    detect: () =>
+      combineDetections([
+        detectCommand("q"),
+        detectCommand("qchat"),
+        detectResolvedPath(home(".aws", "amazonq")),
+      ]),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () => home(".aws", "amazonq", "mcp.json"),
+      topKey: "mcpServers",
     },
-    install: { kind: "file-json", path: amazonQConfig, topKey: "mcpServers" },
     reloadHint: "restart Amazon Q sessions",
   },
   {
     id: "continue",
     name: "Continue",
-    detect() {
-      return exists(home(".continue")) || hasVscodeExt("continue.continue-");
+    detect: () =>
+      combineDetections([
+        detectResolvedPath(home(".continue")),
+        detectVscodeExtension("continue.continue-"),
+      ]),
+    install: {
+      kind: "file",
+      format: "yaml-list",
+      path: () => home(".continue", "config.yaml"),
     },
-    install: { kind: "file-yaml-list", path: continueConfig },
     reloadHint: "reload Continue config",
   },
   {
     id: "opencode",
     name: "opencode",
-    detect() {
-      return which("opencode") !== null || exists(opencodeDir());
+    detect: () =>
+      combineDetections([detectCommand("opencode"), detectResolvedPath(opencodeDir())]),
+    install: {
+      kind: "file",
+      format: "jsonc",
+      path: opencodeConfig,
+      topKey: "mcp",
+      build: opencodeEntry,
     },
-    install: { kind: "file-jsonc", path: opencodeConfig, topKey: "mcp", build: opencodeEntry },
     reloadHint: "restart opencode",
   },
   {
     id: "vscode",
     name: "VS Code (Copilot)",
-    detect() {
-      const lad = localAppData();
-      return (
-        which("code") !== null ||
-        exists(vscodeUserConfig()) ||
-        appBundle("Visual Studio Code.app") ||
-        (lad ? exists(path.join(lad, "Programs", "Microsoft VS Code")) : false)
-      );
+    detect: () =>
+      combineDetections([
+        detectCommand("code"),
+        detectResolvedPath(vscodeUserConfig()),
+        detectAppBundle("Visual Studio Code.app"),
+        detectWindowsPath(localAppData(), "Programs", "Microsoft VS Code"),
+      ]),
+    install: {
+      kind: "file",
+      format: "jsonc",
+      path: vscodeUserConfig,
+      topKey: "servers",
+      build: vscodeEntry,
     },
-    install: { kind: "file-jsonc", path: vscodeUserConfig, topKey: "servers", build: vscodeEntry },
     reloadHint: "reload VS Code (or restart Copilot chat)",
   },
 ];

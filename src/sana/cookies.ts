@@ -36,6 +36,11 @@ export class CookieJar {
     return this.jar.has(name);
   }
 
+  /** Remove one named cookie from this in-memory jar. */
+  delete(name: string): boolean {
+    return this.jar.delete(name);
+  }
+
   get size(): number {
     return this.jar.size;
   }

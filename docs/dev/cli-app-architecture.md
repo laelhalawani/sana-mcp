@@ -1,3 +1,10 @@
+---
+status: superseded
+scope: former interactive CLI architecture proposal
+last_verified: 2026-07-24
+superseded_by: remediation-plan.md
+---
+
 # CLI App Architecture
 
 How `sana-mcp` is split into three faces of one binary: an interactive CLI

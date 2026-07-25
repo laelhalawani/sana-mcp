@@ -1,3 +1,10 @@
+---
+status: research
+scope: non-binding Go port feasibility study
+last_verified: 2026-07-24
+authority: revalidate before use; remediation-plan.md controls implementation
+---
+
 # sana-mcp Go Port - Technical Feasibility Study
 
 Status: July 2026. All module versions and claims were web-verified against

@@ -1,0 +1,58 @@
+{
+  "manifestVersion": 1,
+  "packageVersion": "0.3.2",
+  "releaseTag": "v0.3.2",
+  "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+  "installerProtocol": 1,
+  "lifecycleProtocol": 1,
+  "inspectProtocol": 1,
+  "semanticCapability": "keyword",
+  "assets": [
+    {
+      "target": "bun-linux-x64",
+      "libc": "glibc",
+      "assetName": "sana-mcp-linux-x64",
+      "checksumFileName": "sana-mcp-linux-x64.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+    },
+    {
+      "target": "bun-linux-x64-musl",
+      "libc": "musl",
+      "assetName": "sana-mcp-linux-x64-musl",
+      "checksumFileName": "sana-mcp-linux-x64-musl.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+    },
+    {
+      "target": "bun-linux-arm64",
+      "libc": "glibc",
+      "assetName": "sana-mcp-linux-arm64",
+      "checksumFileName": "sana-mcp-linux-arm64.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000003"
+    },
+    {
+      "target": "bun-linux-arm64-musl",
+      "libc": "musl",
+      "assetName": "sana-mcp-linux-arm64-musl",
+      "checksumFileName": "sana-mcp-linux-arm64-musl.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000004"
+    },
+    {
+      "target": "bun-darwin-x64",
+      "assetName": "sana-mcp-darwin-x64",
+      "checksumFileName": "sana-mcp-darwin-x64.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000005"
+    },
+    {
+      "target": "bun-darwin-arm64",
+      "assetName": "sana-mcp-darwin-arm64",
+      "checksumFileName": "sana-mcp-darwin-arm64.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000006"
+    },
+    {
+      "target": "bun-windows-x64",
+      "assetName": "sana-mcp-windows-x64.exe",
+      "checksumFileName": "sana-mcp-windows-x64.exe.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000007"
+    }
+  ]
+}

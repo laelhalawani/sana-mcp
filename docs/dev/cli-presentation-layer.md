@@ -1,3 +1,10 @@
+---
+status: accepted
+scope: structured-core and human-versus-agent presentation boundary
+last_verified: 2026-07-24
+authority: subordinate to remediation-plan.md contracts and typed ports
+---
+
 # CLI presentation layer: separating human UI from agent-facing text
 
 ## The bug
