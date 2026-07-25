@@ -2,7 +2,7 @@
 # Install the latest sana-mcp release:
 #   sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.sh
 # Pin a release:
-#   SANA_MCP_VERSION=v0.4.0 sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Etals-AiApp/sana-ai-mcp/releases/download/v0.4.0/install.sh
+#   SANA_MCP_VERSION=v0.4.1 sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Etals-AiApp/sana-ai-mcp/releases/download/v0.4.1/install.sh
 set -eu
 set -f
 umask 077

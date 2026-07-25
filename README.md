@@ -18,7 +18,7 @@ sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] 
 Windows (PowerShell):
 
 ```powershell
-irm -ErrorAction Stop https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
+irm https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
 ```
 
 The installer selects the release for your OS, CPU, and (on Linux) libc, verifies
@@ -43,17 +43,20 @@ configuration or health failure keeps the new runtime and recovery inventory in
 place instead of restoring an older executable against possibly newer local
 state; the error prints the retained locations and the next manual action.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.0` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.1` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
 `apk add --no-cache libstdc++ libgcc`; the installer detects and reports this
 before downloading release metadata or binary assets. Windows ARM64 is not yet
 in the verified release matrix.
 
-The first upgrade from an older, pre-receipt installer will refuse to overwrite
-an unproven binary. If that happens, confirm and rename the exact binary path
-reported by the installer as a backup, then rerun the one-line command. The
-refusal does not touch your Sana session or meeting cache.
+On Windows, the installer recognizes the official pre-receipt releases by their
+published binary digests, stops an exact-path legacy daemon when needed, and
+replaces the old runtime transactionally. It revalidates the old Sana cookie
+against Sana before publishing it in the current session format; expired
+sessions request a fresh sign-in, and a temporary validation failure leaves the
+old session unchanged. An unrecognized receiptless executable is never run or
+overwritten.
 
 ## What it does
 

@@ -1,5 +1,5 @@
 # Install the latest sana-mcp release:
-#   irm -ErrorAction Stop https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
+#   irm https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
 # Pin a release:
 #   Set $env:SANA_MCP_VERSION to an exact tag, then run the command above.
 & {
@@ -38,6 +38,7 @@ $ReceiptPath = $null
 $TransactionActive = $false
 $Committed = $false
 $OldPresent = $false
+$LegacyInstall = $false
 $OldWasRunning = $false
 $PathChanged = $false
 $OldUserPath = $null
@@ -57,6 +58,7 @@ $ConfigJournalPreexisting = $false
 $LiveStateTouched = $false
 $InstallFailure = $null
 $CleanupErrors = @()
+$AuthMigrationState = "not-run"
 
 function Assert-ReleaseTag([string] $Tag) {
   if ($Tag -cnotmatch '\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?\z') {
@@ -120,6 +122,7 @@ function Download-Https(
   $Response = Open-HttpsResponse $Source
   $InputStream = $null
   $OutputStream = $null
+  $ProgressCompleted = $false
   try {
     $InputStream = $Response.GetResponseStream()
     $OutputStream = [System.IO.File]::Create($Destination)
@@ -133,25 +136,76 @@ function Download-Https(
       }
       $OutputStream.Write($Buffer, 0, $Count)
       $ReadTotal += $Count
-      if ($ShowProgress -and ($Stopwatch.ElapsedMilliseconds - $LastDraw -ge 150)) {
+      if ($ShowProgress -and ($Stopwatch.ElapsedMilliseconds - $LastDraw -ge 100)) {
         $LastDraw = $Stopwatch.ElapsedMilliseconds
-        $Megabytes = [Math]::Round($ReadTotal / 1MB, 1)
-        if ($Response.ContentLength -gt 0) {
-          $Percent = [int](100 * $ReadTotal / $Response.ContentLength)
-          Write-Host -NoNewline ("`rDownloading [{0,3}%] {1} MB" -f $Percent, $Megabytes)
-        } else {
-          Write-Host -NoNewline ("`rDownloading {0} MB" -f $Megabytes)
-        }
+        Write-Host -NoNewline (
+          Format-DownloadProgress `
+            $ReadTotal `
+            $Response.ContentLength `
+            $Stopwatch.Elapsed.TotalSeconds
+        )
       }
     }
     if ($ShowProgress) {
-      Write-Host ("`rDownloaded {0} MB                " -f [Math]::Round($ReadTotal / 1MB, 1))
+      Write-Host (
+        Format-DownloadProgress `
+          $ReadTotal `
+          $Response.ContentLength `
+          $Stopwatch.Elapsed.TotalSeconds
+      )
+      $ProgressCompleted = $true
     }
   } finally {
+    if ($ShowProgress -and -not $ProgressCompleted) {
+      Write-Host ""
+    }
     if ($null -ne $OutputStream) { $OutputStream.Dispose() }
     if ($null -ne $InputStream) { $InputStream.Dispose() }
     $Response.Dispose()
   }
+}
+
+function Format-DownloadProgress(
+  [long] $BytesRead,
+  [long] $TotalBytes,
+  [double] $ElapsedSeconds
+) {
+  $Seconds = [Math]::Max($ElapsedSeconds, 0.001)
+  $SpeedBytes = $BytesRead / $Seconds
+  $ReadMegabytes = [Math]::Round($BytesRead / 1MB, 1)
+  $SpeedMegabytes = [Math]::Round($SpeedBytes / 1MB, 1)
+  if ($TotalBytes -le 0) {
+    return (
+      "`r  {0} MB  {1} MB/s " -f
+        $ReadMegabytes,
+        $SpeedMegabytes
+    )
+  }
+
+  $Ratio = [Math]::Min(
+    1.0,
+    [Math]::Max(0.0, $BytesRead / [double] $TotalBytes)
+  )
+  $Percent = [int] [Math]::Floor($Ratio * 100)
+  $TotalMegabytes = [Math]::Round($TotalBytes / 1MB, 1)
+  $RemainingSeconds = if ($SpeedBytes -gt 0) {
+    [Math]::Max(0.0, ($TotalBytes - $BytesRead) / $SpeedBytes)
+  } else {
+    0.0
+  }
+  $Eta = [TimeSpan]::FromSeconds($RemainingSeconds).ToString("mm\:ss")
+  $BarWidth = 24
+  $Fill = [int] [Math]::Floor($Ratio * $BarWidth)
+  $Bar = ("#" * $Fill) + ("-" * ($BarWidth - $Fill))
+  return (
+    "`r  [{0}] {1,3}%  {2}/{3} MB  {4} MB/s  ETA {5} " -f
+      $Bar,
+      $Percent,
+      $ReadMegabytes,
+      $TotalMegabytes,
+      $SpeedMegabytes,
+      $Eta
+  )
 }
 
 function Read-Properties(
@@ -239,6 +293,94 @@ function Read-Checksum([string] $File, [string] $ExpectedName) {
 
 function Get-Sha256([string] $File) {
   return (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-VerifiedLegacyReleaseDigest([string] $Digest) {
+  # Authoritative digests of this repository's Windows x64 assets from the
+  # releases published before installer receipts were introduced.
+  $Published = @{
+    # v0.1.0-rc1 and v0.1.0 published the same Windows x64 bytes.
+    "da20ac9ec3accb3aed715a064dcd6c250721b1afa2882465d5edef680a813b3d" = "v0.1.0-rc1 or v0.1.0"
+    "cb818ee5a6b4037e5d077466bd56ea5cf7c50f5c0816cec7f86d7cd101a0303d" = "v0.1.1"
+    "dc36798271253440cb2ab190272c08ce10c4cbebfc59d88a66dd5744c0c2d2d5" = "v0.1.2"
+    "88d08b25aac178734f1d030de34e907db04aec41f5834c0a12c0095b51423c6e" = "v0.2.0"
+    "52cdb1cc78d4c6315017424a72200e50959d978a8f563f65e25ba32c5d31099a" = "v0.3.0"
+    "4e905d9dd43d801ed3662ad4c1a7d774175207d92a1fd761d3b283af291c29de" = "v0.3.2"
+  }
+  if (-not $Published.ContainsKey($Digest)) {
+    return $null
+  }
+  return $Published[$Digest]
+}
+
+function Get-VerifiedLegacyRelease([string] $Executable) {
+  $Release = Get-VerifiedLegacyReleaseDigest (Get-Sha256 $Executable)
+  if ([string]::IsNullOrEmpty($Release)) {
+    throw "Existing $Executable has no receipt and does not match an official pre-receipt sana-mcp release."
+  }
+  return $Release
+}
+
+function Get-LegacyDaemonProcesses([string] $Executable) {
+  $Resolved = [System.IO.Path]::GetFullPath($Executable)
+  $Escaped = [Regex]::Escape($Resolved)
+  $QuotedDaemon = '^\s*"' + $Escaped + '"\s+daemon(?:\s|$)'
+  $BareDaemon = '^\s*' + $Escaped + '\s+daemon(?:\s|$)'
+  $DaemonProcesses = @()
+  foreach ($Process in @(
+    Get-CimInstance Win32_Process -Filter "Name = 'sana-mcp.exe'"
+  )) {
+    if ([string]::IsNullOrWhiteSpace([string] $Process.ExecutablePath)) {
+      continue
+    }
+    $ProcessPath = [System.IO.Path]::GetFullPath(
+      [string] $Process.ExecutablePath
+    )
+    if (-not [string]::Equals(
+      $ProcessPath,
+      $Resolved,
+      [StringComparison]::OrdinalIgnoreCase
+    )) {
+      continue
+    }
+    $CommandLine = [string] $Process.CommandLine
+    if ($CommandLine -notmatch $QuotedDaemon -and
+        $CommandLine -notmatch $BareDaemon) {
+      throw "The official legacy sana-mcp executable is active outside daemon mode; close it and rerun the installer."
+    }
+    $DaemonProcesses += $Process
+  }
+  return @($DaemonProcesses)
+}
+
+function Stop-LegacyDaemon([string] $Executable) {
+  foreach ($Process in @(Get-LegacyDaemonProcesses $Executable)) {
+    $Result = Invoke-CimMethod -InputObject $Process -MethodName Terminate
+    if ([int] $Result.ReturnValue -ne 0) {
+      throw "The previous sana-mcp daemon could not be stopped (code $($Result.ReturnValue))."
+    }
+  }
+  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+  while (@(Get-LegacyDaemonProcesses $Executable).Count -gt 0) {
+    if ([DateTime]::UtcNow -ge $Deadline) {
+      throw "The previous sana-mcp daemon did not stop within ten seconds."
+    }
+    Start-Sleep -Milliseconds 50
+  }
+}
+
+function Start-LegacyDaemon([string] $Executable) {
+  Start-Process `
+    -FilePath $Executable `
+    -ArgumentList @("daemon") `
+    -WindowStyle Hidden | Out-Null
+  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+  while (@(Get-LegacyDaemonProcesses $Executable).Count -eq 0) {
+    if ([DateTime]::UtcNow -ge $Deadline) {
+      throw "The restored sana-mcp daemon did not start within ten seconds."
+    }
+    Start-Sleep -Milliseconds 50
+  }
 }
 
 function Assert-NotReparse([string] $Path, [string] $Label) {
@@ -627,7 +769,7 @@ function Invoke-InstallerCleanup(
 ) {
   $Failures = @()
   try {
-    if ($null -ne $PendingBinary -and
+    if (-not [string]::IsNullOrEmpty($PendingBinary) -and
         (Test-Path -LiteralPath $PendingBinary)) {
       Remove-Item -LiteralPath $PendingBinary -Force
     }
@@ -635,7 +777,7 @@ function Invoke-InstallerCleanup(
     $Failures += "could not remove staged binary: $($_.Exception.Message)"
   }
   try {
-    if ($null -ne $PendingReceipt -and
+    if (-not [string]::IsNullOrEmpty($PendingReceipt) -and
         (Test-Path -LiteralPath $PendingReceipt)) {
       Remove-Item -LiteralPath $PendingReceipt -Force
     }
@@ -643,7 +785,8 @@ function Invoke-InstallerCleanup(
     $Failures += "could not remove staged receipt: $($_.Exception.Message)"
   }
   try {
-    if ($OwnsInstallLock -and $null -ne $OwnedInstallLock -and
+    if ($OwnsInstallLock -and
+        -not [string]::IsNullOrEmpty($OwnedInstallLock) -and
         (Test-Path -LiteralPath $OwnedInstallLock)) {
       Remove-Item -LiteralPath $OwnedInstallLock -Recurse -Force
     }
@@ -651,7 +794,8 @@ function Invoke-InstallerCleanup(
     $Failures += "could not release install lock: $($_.Exception.Message)"
   }
   try {
-    if ($OwnsPathLock -and $null -ne $OwnedPathLock -and
+    if ($OwnsPathLock -and
+        -not [string]::IsNullOrEmpty($OwnedPathLock) -and
         (Test-Path -LiteralPath $OwnedPathLock)) {
       Remove-Item -LiteralPath $OwnedPathLock -Recurse -Force
     }
@@ -659,7 +803,8 @@ function Invoke-InstallerCleanup(
     $Failures += "could not release user-state lock: $($_.Exception.Message)"
   }
   try {
-    if (-not $KeepTemporary -and $null -ne $TemporaryDirectory -and
+    if (-not $KeepTemporary -and
+        -not [string]::IsNullOrEmpty($TemporaryDirectory) -and
         (Test-Path -LiteralPath $TemporaryDirectory)) {
       Remove-Item -LiteralPath $TemporaryDirectory -Recurse -Force
     }
@@ -788,13 +933,20 @@ try {
   $DestinationExists = Test-Path -LiteralPath $Destination -PathType Leaf
   $ReceiptExists = Test-Path -LiteralPath $ReceiptPath -PathType Leaf
   if ($DestinationExists -and -not $ReceiptExists) {
-    throw "Existing $Destination has no supported installer receipt. If it is a pre-receipt sana-mcp install, rename it as a backup and rerun; this refusal leaves authentication and meeting data untouched."
+    $LegacyRelease = Get-VerifiedLegacyRelease $Destination
+    $OldPresent = $true
+    $LegacyInstall = $true
+    $OldWasRunning =
+      @(Get-LegacyDaemonProcesses $Destination).Count -gt 0
+    $OldBinaryBackup = Join-Path $TempDir "previous-sana-mcp.exe"
+    Copy-Item -LiteralPath $Destination -Destination $OldBinaryBackup
+    Write-Host "Verified official pre-receipt sana-mcp $LegacyRelease."
   }
-  if ($DestinationExists -ne $ReceiptExists) {
+  if (-not $LegacyInstall -and $DestinationExists -ne $ReceiptExists) {
     throw "The install destination is not a complete installer-owned sana-mcp installation."
   }
 
-  if ($DestinationExists) {
+  if ($DestinationExists -and -not $LegacyInstall) {
     $OldPresent = $true
     $OldReceipt = Read-InstallReceipt $ReceiptPath
     if ($OldReceipt["target"] -cne $Target) {
@@ -861,9 +1013,13 @@ try {
 
   $TransactionActive = $true
   if ($OldWasRunning) {
-    $Stopped = Invoke-Lifecycle $Destination "stop"
-    if ($Stopped["state"] -cne "stopped") {
-      throw "The previous sana-mcp daemon did not stop."
+    if ($LegacyInstall) {
+      Stop-LegacyDaemon $Destination
+    } else {
+      $Stopped = Invoke-Lifecycle $Destination "stop"
+      if ($Stopped["state"] -cne "stopped") {
+        throw "The previous sana-mcp daemon did not stop."
+      }
     }
   }
 
@@ -883,7 +1039,7 @@ try {
   if ($MatchingEntries.Count -gt 1) {
     throw "The user PATH contains duplicate entries for $InstallDir; remove the duplicates before installing."
   }
-  if ($OldPresent) {
+  if ($OldPresent -and -not $LegacyInstall) {
     if ($NewPathManaged -and $MatchingEntries.Count -ne 1) {
       throw "The installer-owned PATH entry recorded by the receipt is missing."
     }
@@ -939,6 +1095,75 @@ try {
   [IO.File]::WriteAllText($StagedReceipt, "$ReceiptBody`n", [Text.Encoding]::ASCII)
   Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force
   $StagedReceipt = $null
+
+  $AuthMigrationOutput = @(
+    & $Destination __migrate-legacy-auth --format properties
+  )
+  $AuthMigrationExit = $LASTEXITCODE
+  if ($AuthMigrationExit -ne 0) {
+    # The command may have opened or migrated the local store before failing.
+    $LiveStateTouched = $true
+    throw "Legacy Sana authentication migration failed (exit $AuthMigrationExit). The replacement runtime was retained."
+  }
+  $AuthMigrationFile = Join-Path $TempDir "auth-migration.properties"
+  [IO.File]::WriteAllText(
+    $AuthMigrationFile,
+    (($AuthMigrationOutput -join "`n") + "`n"),
+    [Text.Encoding]::ASCII
+  )
+  $AuthMigration = Read-Properties $AuthMigrationFile @(
+    "migrationProtocol", "state", "persistentStateTouched"
+  )
+  foreach ($Key in @(
+    "migrationProtocol", "state", "persistentStateTouched"
+  )) {
+    if (-not $AuthMigration.ContainsKey($Key)) {
+      $LiveStateTouched = $true
+      throw "Legacy Sana authentication migration response is missing $Key."
+    }
+  }
+  if ($AuthMigration["migrationProtocol"] -cne "1" -or
+      @(
+        "not-needed", "preserved", "fresh-login-required",
+        "validation-unavailable", "local-session-unavailable"
+      ) -cnotcontains $AuthMigration["state"] -or
+      @("true", "false") -cnotcontains
+        $AuthMigration["persistentStateTouched"]) {
+    $LiveStateTouched = $true
+    throw "Legacy Sana authentication migration returned an invalid response."
+  }
+  $AuthMigrationState = $AuthMigration["state"]
+  $AuthStateTouched =
+    $AuthMigration["persistentStateTouched"] -ceq "true"
+  if (
+    ($AuthStateTouched -and @(
+      "preserved", "fresh-login-required"
+    ) -cnotcontains $AuthMigrationState) -or
+    (-not $AuthStateTouched -and @(
+      "not-needed", "validation-unavailable",
+      "local-session-unavailable"
+    ) -cnotcontains $AuthMigrationState)
+  ) {
+    $LiveStateTouched = $true
+    throw "Legacy Sana authentication migration response is contradictory."
+  }
+  if ($AuthStateTouched) {
+    $LiveStateTouched = $true
+  }
+  switch -CaseSensitive ($AuthMigrationState) {
+    "preserved" {
+      Write-Host "Existing Sana authentication was revalidated and preserved."
+    }
+    "fresh-login-required" {
+      Write-Host "The previous Sana session could not be preserved; sign in again during setup."
+    }
+    "validation-unavailable" {
+      throw "Existing Sana authentication could not be validated because Sana is unavailable. The previous runtime and unchanged session were restored; rerun the installer when Sana is reachable."
+    }
+    "local-session-unavailable" {
+      throw "Existing Sana authentication could not be read safely. The previous runtime and unchanged session were restored; repair the reported session path and rerun the installer."
+    }
+  }
 
   $ConfigJournalDir = Join-Path $InstallDir ".sana-mcp-config-transaction"
   $ConfigJournalFile = Join-Path $ConfigJournalDir "client-config-transaction.json"
@@ -1143,13 +1368,19 @@ try {
           Copy-Item -LiteralPath $OldBinaryBackup -Destination $StagedBinary
           Move-Item -LiteralPath $StagedBinary -Destination $Destination -Force
           $StagedBinary = $null
-          if ($null -eq $OldReceiptBackup -or -not (Test-Path -LiteralPath $OldReceiptBackup -PathType Leaf)) {
-            throw "previous receipt backup is unavailable"
+          if ($LegacyInstall) {
+            if (Test-Path -LiteralPath $ReceiptPath) {
+              Remove-Item -LiteralPath $ReceiptPath -Force
+            }
+          } else {
+            if ($null -eq $OldReceiptBackup -or -not (Test-Path -LiteralPath $OldReceiptBackup -PathType Leaf)) {
+              throw "previous receipt backup is unavailable"
+            }
+            $StagedReceipt = Join-Path $InstallDir (".sana-mcp-receipt-rollback-" + [Guid]::NewGuid().ToString("N"))
+            Copy-Item -LiteralPath $OldReceiptBackup -Destination $StagedReceipt
+            Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force
+            $StagedReceipt = $null
           }
-          $StagedReceipt = Join-Path $InstallDir (".sana-mcp-receipt-rollback-" + [Guid]::NewGuid().ToString("N"))
-          Copy-Item -LiteralPath $OldReceiptBackup -Destination $StagedReceipt
-          Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force
-          $StagedReceipt = $null
         } else {
           if ($null -ne $Destination -and (Test-Path -LiteralPath $Destination)) {
             Remove-Item -LiteralPath $Destination -Force
@@ -1180,9 +1411,13 @@ try {
             -not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
           throw "restored runtime is unavailable"
         }
-        $Restarted = Invoke-Lifecycle $Destination "start"
-        if ($Restarted["state"] -cne "running") {
-          throw "previous runtime did not restart"
+        if ($LegacyInstall) {
+          Start-LegacyDaemon $Destination
+        } else {
+          $Restarted = Invoke-Lifecycle $Destination "start"
+          if ($Restarted["state"] -cne "running") {
+            throw "previous runtime did not restart"
+          }
         }
       } catch {
         $RollbackErrors += "could not restart the previous runtime: $($_.Exception.Message)"
