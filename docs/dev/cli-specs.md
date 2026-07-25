@@ -38,8 +38,10 @@ Style: hyphens only, never em/en dashes. All timestamps are UTC unless stated.
 
 The binary is produced with `bun build --compile` for seven verified targets:
 Linux x64/ARM64 with glibc or musl, macOS x64/Apple Silicon, and Windows x64.
-Windows ARM64 is not currently published. It embeds the Bun runtime, so end
-users need nothing else installed.
+Windows ARM64 is not currently published. It embeds the Bun runtime. Alpine
+also requires its `libstdc++` and `libgcc` runtime packages; the POSIX installer
+checks them before downloading release metadata or binary assets and prints the
+exact `apk add` command when absent.
 
 Data is local-only. A background daemon downloads meetings, transcripts, and
 metadata into a local SQLite database; all read commands serve from that DB and

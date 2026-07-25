@@ -1430,3 +1430,36 @@ Final candidate validation on 2026-07-25:
   authoritative `0.4.0`/protocol-v1/keyword identity;
 - `git diff --check`: clean;
 - no live `data/` tree was used.
+
+### Native musl evidence correction
+
+GitHub Actions run `30165390438` passed authorization, Windows x64, both macOS
+targets, and both glibc targets. Both musl jobs failed before attestation because
+bare Alpine does not include Bun's required `libstdc++` and `libgcc` runtime
+packages; publication was correctly skipped and no partial release was created.
+
+Correction owner: `/root`.
+
+Exact correction files:
+
+- `.github/workflows/release.yml`, `install.sh`, `README.md`;
+- `docs/dev/cli-specs.md`;
+- `tests/install/installers.test.ts`, `tests/release/release.test.ts`.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/musl_ci_failure_analysis` | A CI-only package install would conceal the same bare-Alpine end-user prerequisite | Added a non-mutating installer preflight with the exact `apk add` remediation and documented it alongside the CI runtime setup | correction required review |
+| `/root/musl_correction_review` | Installer coverage matched source text but did not execute missing/present package states | Added isolated behavioral cases for each missing package, no release download on failure, and continuation when both are present | correction required fresh review |
+| `/root/musl_correction_zero_review` | Documentation overstated the preflight as occurring before the installer itself is downloaded | Narrowed the claim to release metadata and binary assets | `/root/musl_terminal_review`: CLEAN - zero findings |
+| `/root/release_musl_cross_review` | none | n/a | CLEAN - zero findings |
+
+Post-correction validation:
+
+- isolated `bun run check`: 553 passed, 1 platform skip, 0 failed;
+- focused installer suite: 39 passed, 0 failed;
+- focused release/projection suite: 6 passed, 0 failed;
+- bare pinned Alpine emitted the exact prerequisite command before release
+  resolution;
+- a locally built Linux x64 musl artifact executed `__inspect` and `--help` in
+  the pinned Alpine image after installing the declared runtime packages;
+- `sh -n install.sh` and `git diff --check`: clean.

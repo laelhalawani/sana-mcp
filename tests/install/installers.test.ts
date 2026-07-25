@@ -2758,6 +2758,10 @@ test("installers preserve interactive configuration and strict transaction parsi
   const windows = await readFile(path.join(root, "install.ps1"), "utf8");
   assert.match(
     posix,
+    /command -v apk[\s\S]*apk info --exists libstdc\+\+[\s\S]*apk info --exists libgcc[\s\S]*apk add --no-cache libstdc\+\+ libgcc/,
+  );
+  assert.match(
+    posix,
     /__configure-transaction apply[\s\S]*--server-command "\$dest" \\\n    < \/dev\/tty > "\$tmp_dir\/config-apply\.json"/,
   );
   assert.doesNotMatch(
@@ -2781,6 +2785,83 @@ test("installers preserve interactive configuration and strict transaction parsi
     windows.indexOf("__configure-transaction rollback", rollback + 1),
     -1,
   );
+});
+
+test("POSIX installer checks Alpine runtime packages before release downloads", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(
+    path.join(os.tmpdir(), "sana-musl-prerequisite-"),
+  );
+  try {
+    const commands = path.join(temporary, "commands");
+    const home = path.join(temporary, "home");
+    const log = path.join(temporary, "calls.log");
+    await mkdir(commands);
+    await mkdir(home);
+    await writeFile(
+      path.join(commands, "uname"),
+      "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; *) exit 64 ;; esac\n",
+    );
+    await writeFile(path.join(commands, "getconf"), "#!/bin/sh\nexit 1\n");
+    await writeFile(
+      path.join(commands, "ldd"),
+      "#!/bin/sh\necho 'musl libc (test fixture)'\n",
+    );
+    await writeFile(
+      path.join(commands, "apk"),
+      [
+        "#!/bin/sh",
+        'printf "apk:%s\\n" "$3" >> "$FAKE_CALL_LOG"',
+        '[ "$1" = info ] && [ "$2" = --exists ] || exit 64',
+        '[ "${FAKE_MISSING_PACKAGE:-}" != "$3" ]',
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      path.join(commands, "curl"),
+      '#!/bin/sh\nprintf "curl\\n" >> "$FAKE_CALL_LOG"\nexit 22\n',
+    );
+    for (const command of ["uname", "getconf", "ldd", "apk", "curl"]) {
+      await chmod(path.join(commands, command), 0o755);
+    }
+
+    const run = (missingPackage?: string) =>
+      spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${commands}:/usr/bin:/bin`,
+          HOME: home,
+          FAKE_CALL_LOG: log,
+          SANA_MCP_VERSION: "v0.4.0",
+          ...(missingPackage === undefined
+            ? {}
+            : { FAKE_MISSING_PACKAGE: missingPackage }),
+        },
+      });
+
+    for (const missingPackage of ["libstdc++", "libgcc"]) {
+      await writeFile(log, "");
+      const missing = run(missingPackage);
+      assert.notEqual(missing.status, 0);
+      assert.match(
+        missing.stderr,
+        /apk add --no-cache libstdc\+\+ libgcc/,
+      );
+      assert.doesNotMatch(await readFile(log, "utf8"), /curl/);
+    }
+
+    await writeFile(log, "");
+    const present = run();
+    assert.notEqual(present.status, 0);
+    assert.match(present.stderr, /could not download release metadata/);
+    assert.deepEqual(
+      (await readFile(log, "utf8")).trim().split("\n"),
+      ["apk:libstdc++", "apk:libgcc", "curl"],
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 });
 
 test("POSIX defers only the canonical interaction-unavailable response from an interactive attempt", async () => {

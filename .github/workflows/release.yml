@@ -194,10 +194,11 @@ jobs:
           if [ "$LIBC" = musl ]; then
             docker run --rm -v "$PWD:/work:ro" -w /work \
               alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
-              "/work/$ASSET" __inspect --format json > "inspect-$TARGET.json"
-            docker run --rm -v "$PWD:/work:ro" -w /work \
-              alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
-              "/work/$ASSET" --help >/dev/null
+              sh -eu -c \
+              'apk add --no-cache libstdc++ libgcc >/dev/null
+              "$1" __inspect --format json
+              "$1" --help >/dev/null' \
+              sh "/work/$ASSET" > "inspect-$TARGET.json"
           else
             "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
             "./$ASSET" --help >/dev/null
