@@ -259,6 +259,10 @@ test("release workflow binds every build and publish step to the authorized comm
     workflow,
     /alpine:3\.22@sha256:[a-f0-9]{64}/,
   );
+  assert.match(
+    workflow,
+    /apk add --no-cache libstdc\+\+ libgcc[\s\S]*"\$1" __inspect --format json[\s\S]*"\$1" --help/,
+  );
   assert.match(workflow, /-v "\$PWD:\/work:ro"/);
   assert.match(workflow, /--target "\$SOURCE_SHA"/);
   assert.match(
