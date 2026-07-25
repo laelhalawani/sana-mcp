@@ -1643,3 +1643,48 @@ Validation evidence:
 - compiled standalone `sana-mcp update --help`: passed;
 - `git diff --check`: clean;
 - all tests used isolated state and did not open the live Sana data tree.
+
+## Windows replacement setup and fixed-width progress (`v0.4.3`)
+
+Planning was split between `/root/progress_width_plan` for progress rendering
+and `/root/wizard_launch_plan` for the post-replacement setup path. The
+consolidated plan was independently reviewed by
+`/root/legacy_upgrade_plan_review_b` and
+`/root/wizard_launch_plan/wizard_plan_independent_review`. Their requirements
+were incorporated before development: commit and close the replacement
+transaction before setup, let updater handoffs outrank unattended mode, launch
+the configurer outside the `irm | iex` output pipeline, keep launch failures
+local to post-install guidance, and test stable invariant-culture columns.
+
+Development scopes and exact ownership:
+
+- `/root`: `install.ps1`, `tests/install/installers.test.ts`;
+- `/root/v043_projection_dev`: `package.json`, `README.md`, `install.sh`,
+  `.github/workflows/release.yml`, `docs/dev/cli-specs.md`,
+  `tests/fixtures/manifest/invalid-unknown-field.json`,
+  `tests/fixtures/manifest/valid-all-targets.json`,
+  `tests/install/manifest.test.ts`.
+
+The installer now left-pads the rendered current download size to the rendered
+known-total width. After a committed incompatible replacement, a direct
+interactive one-line install starts the public configurer in the inherited
+console. Updater handoffs and sessions without an interactive terminal defer
+setup with an exact command, while `SANA_MCP_YES=1` performs prompt-free client
+registration and prints separate sign-in guidance. Configurer failure cannot
+roll back the already completed runtime replacement.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/v043_projection_dev` | none in the installer and installer-test scope | n/a | CLEAN - zero findings |
+| `/root/wizard_launch_plan` | README initially overstated which replacement paths launch interactive setup | documented direct interactive, updater, and unattended behavior separately | correction required fresh review |
+| `/root/projection_fresh_review` | none | n/a | CLEAN - zero findings |
+| `/root/v043_crosscut_review` | none | n/a | CLEAN - zero findings |
+
+Validation evidence:
+
+- complete `bun test`: 574 passed, 1 Windows-only platform skip, 0 failed;
+- `bun run typecheck`: passed;
+- Windows PowerShell AST parsing: passed;
+- POSIX `sh -n`: passed;
+- `git diff --check`: clean;
+- tests used isolated state and did not open the live Sana data tree.
