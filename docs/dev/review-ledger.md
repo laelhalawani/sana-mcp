@@ -1395,3 +1395,38 @@ The bounded final execution gate completed on 2026-07-25:
 The platform-specific Windows ACL integration test remains the one intentional
 host skip on WSL/Linux. No release was published and no live `data/` tree was
 read, migrated, or mutated by these checks.
+
+## Automatic release restoration and 0.4.0 projection
+
+Development and correction owner: `/root`.
+
+Exact scope:
+
+- `.github/workflows/release.yml`;
+- `package.json`, `README.md`, `install.sh`;
+- `docs/dev/cli-specs.md`, `docs/dev/remediation-plan.md`;
+- `tests/release/release.test.ts`,
+  `tests/release/version-projection.test.ts`;
+- `tests/install/manifest.test.ts`;
+- `tests/fixtures/manifest/valid-all-targets.json`,
+  `tests/fixtures/manifest/invalid-unknown-field.json`.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/release_trigger_final_review` | Tag probes were not confined to the exact tag namespace, and publication did not recheck the tag at both final state boundaries | Switched to exact `git/ref/tags` resolution with annotated-tag peeling and added pre/post-publication checks plus race tests | correction required fresh review |
+| `/root/release_projection_final_review` | Projection status was stale and the current CLI-spec release label was outside the drift test | Marked the projection implemented and made the package-derived test cover the current CLI-spec label | `/root/release_projection_clean_review`: CLEAN - zero findings |
+| `/root/release_trigger_clean_review` | An annotated-tag object 404 could be confused with an absent tag ref | Gave exact-ref absence a distinct status; all dereference failures remain fatal, with resolver and publisher coverage | correction required fresh review |
+| `/root/release_trigger_edge_zero_review` | An already-published rerun could finish if the tag moved during remote asset verification | Rechecked the exact tag after byte verification and tested movement during download | correction required fresh review |
+| `/root/release_trigger_terminal_review` | GitHub does not make `target_commitish` authoritative for an existing tag; publisher annotated-tag success lacked coverage | Removed that false identity assertion, kept exact tag-ref authority, corrected the fake API model, and added annotated publication success | `/root/release_api_terminal_zero_review`: CLEAN - zero findings |
+| `/root/release_cross_cutting_zero_review` | none | n/a | CLEAN - zero findings |
+
+Final candidate validation on 2026-07-25:
+
+- isolated `bun run check`: 552 passed, 1 platform skip, 0 failed;
+- focused release and projection suite: 6 passed, 0 failed;
+- focused manifest suite: 17 passed, 0 failed;
+- frozen Bun install: no worktree change;
+- host standalone Linux x64 build, inspect, and help smoke: successful with
+  authoritative `0.4.0`/protocol-v1/keyword identity;
+- `git diff --check`: clean;
+- no live `data/` tree was used.

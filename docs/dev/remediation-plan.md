@@ -40,9 +40,11 @@ governed by `AGENTS.md`.
   GUI clients are configured by running the PowerShell installer on Windows; no
   path or client state is guessed across the WSL boundary.
 - The authoritative dependency lock is Bun's text lockfile, `bun.lock`.
-- Release publication is not automatic from `main`. An exact existing tag/commit
-  is released only by an explicitly invoked workflow protected by the `release`
-  environment. Package version and tag must match.
+- Release publication is automatic from `main` when the exact
+  `v<package.json version>` tag does not yet exist. Matching `v*` tag pushes and
+  manual dispatches are also supported. Every path binds the package version,
+  release tag, source commit, binaries, attestations, manifest, installers, and
+  checksums to one exact release tuple.
 
 ### Installer/version coupling
 
@@ -1824,23 +1826,23 @@ Acceptance:
 - define and locally validate the native/faithful execution jobs for every
   canonical target, without claiming that a native run occurred during this
   implementation scope;
-- encode publication behind the configured protected `release` environment and
-  exact remote-asset revalidation, with local workflow/contract tests proving
-  the gates are wired correctly.
-- require workflow-dispatch inputs for the exact tag and expected full candidate
-  SHA; an unprotected preflight resolves the immutable tag, requires the
-  workflow ref/definition SHA and tag commit to match the expected candidate,
-  and passes that authority to the protected approval job;
-- every native/build/publish job checks out the expected full SHA and rechecks
-  that the tag still points to it before acting;
+- encode automatic publication for a package-version bump on `main`, matching
+  `v*` tag pushes, and explicit manual retries, with exact remote-asset
+  revalidation and local workflow/contract tests proving each path;
+- resolve the package-matching tag and exact triggering SHA before any build;
+  an existing package tag makes an unchanged `main` push a no-op, while a
+  missing tag is created at the reviewed SHA only after every build succeeds;
+- every native/build/publish job checks out the expected full SHA; publication
+  creates or verifies the exact tag at that SHA before any release mutation and
+  rechecks it before the final state transition;
 - after changing the release from draft to published, the same workflow run
   re-fetches it, requires `draft=false`, and byte-verifies the complete remote
   asset tuple again before reporting success.
 
-Actual protected-environment authorization, seven-target native execution,
-publication, and remote revalidation are final-candidate evidence. They occur
-only in the evidence seal after D-DOCS-FINAL and D-VERSION-PROJECTION have
-finished and the immutable candidate tag exists.
+Actual automatic authorization, seven-target native execution, publication,
+and remote revalidation are final-candidate evidence. They occur from the
+version-bumped candidate on `main` or its exact matching tag after
+D-DOCS-FINAL and D-VERSION-PROJECTION have finished.
 
 ### D-DOCS-FINAL
 
@@ -1889,8 +1891,9 @@ Acceptance:
 
 ### D-VERSION-PROJECTION
 
-Status: MISSING. Runs atomically after D-CI-RELEASE and D-DOCS-FINAL
-implementations and before hygiene or any Stage D/final review.
+Status: IMPLEMENTED. The projection is enforced by
+`tests/release/version-projection.test.ts` and is included in the release
+validation gate.
 
 Exclusive files:
 
@@ -1947,7 +1950,7 @@ Acceptance:
   `bun run check`, seeded-clean deterministic build, package refusal/allowlist,
   and host standalone compile/inspect/help smoke leave no unowned artifact;
 - live `data/` remains untouched;
-- PAT, native-run, and release-environment evidence is reported truthfully.
+- PAT and native release-run evidence is reported truthfully.
 
 This local gate establishes candidate readiness, not clean-clone or native
 evidence. A `git archive HEAD` or modified worktree never substitutes for the
@@ -1958,8 +1961,6 @@ post-review evidence seal below.
 These block final release/completion claims, not autonomous local development:
 
 - GitHub PAT revocation/rotation remains externally unconfirmed;
-- GitHub `release` environment reviewers/protection and explicit approval require
-  external confirmation;
 - native macOS x64/arm64 and the complete approved seven-target workflow require
   GitHub-hosted/native execution.
 
@@ -1967,9 +1968,9 @@ These block final release/completion claims, not autonomous local development:
 
 After every scope is individually clean, a fresh adversarial reviewer traces
 candidate-ready inventory -> frozen install/check commands -> clean build ->
-release matrix/manifest/checksum/attestation logic -> approval gate -> installer
+release matrix/manifest/checksum/attestation logic -> exact-SHA authorization -> installer
 selection -> docs/hygiene. Corrections and fresh reviews repeat until zero
-findings. Actual clean-clone/native/approval evidence follows the final local
+findings. Actual clean-clone/native publication evidence follows the final local
 reviews under the evidence seal.
 
 ## Final repository-wide review
@@ -2024,12 +2025,11 @@ all substantive local reviews clean
   -> fresh non-mutating candidate-content audit of that exact SHA
   -> fresh clone of that exact SHA
   -> frozen install/check/clean-build/package/standalone evidence
-  -> release tag points to that exact candidate SHA
-  -> dispatch the release workflow for that exact tag
-  -> protected release-environment approval and authorization
+  -> merge the version-bumped candidate to main or push its exact matching tag
+  -> workflow resolves or creates the release tag at that exact candidate SHA
   -> CI plus native seven-target build/smoke/attestation on that exact tag/SHA
   -> publish and remotely revalidate the immutable asset tuple
-  -> retain immutable external run/approval/attestation evidence
+  -> retain immutable external run/publication/attestation evidence
 ```
 
 The candidate-content audit is the bounded terminal review of the registrar
@@ -2044,12 +2044,12 @@ The clean-clone gate must run `bun install --frozen-lockfile`, `bun run check`,
 a seeded-stale and deterministic-repeat build, package refusal/allowlist checks,
 and host standalone compile/inspect/help smoke, ending with a clean checkout.
 Native evidence records the exact workflow run, tag, full candidate SHA,
-approval, and attestations for all seven targets.
+publication result, and attestations for all seven targets.
 
 Any source, build, installer, workflow, manifest, test, or authoritative
 documentation change after the candidate is cut invalidates that candidate.
 Cut a new candidate and, under the version/tag policy, a new exact tag/version,
-then repeat the clone, dispatch, approval, CI/native, publication, and remote
+then repeat the clone, automatic authorization, CI/native, publication, and remote
 checks. External run URLs and attestations cannot be embedded in the commit
 they attest and are therefore retained as immutable external completion
 evidence. An optional later ledger-only evidence reference commit must identify
@@ -2068,8 +2068,8 @@ Completion requires:
 - typecheck/tests/parsers/linters/builds/supported smokes passing;
 - intentional worktree inventory;
 - no secret/runtime/generated artifact included;
-- PAT revocation, release-environment protection/approval, and exact native
-  evidence confirmed for final release, or each unconfirmed item explicitly
+- PAT revocation and exact native evidence confirmed for final release, or each
+  unconfirmed item explicitly
   reported as an external blocker to local-only completion;
 - zero unauthorized LLM contract diff;
 - zero known audit, plan-review, code-review, or no-fallback finding.

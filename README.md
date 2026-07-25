@@ -43,7 +43,7 @@ configuration or health failure keeps the new runtime and recovery inventory in
 place instead of restoring an older executable against possibly newer local
 state; the error prints the retained locations and the next manual action.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.3.2` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.0` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. Windows ARM64 is not yet in the verified release matrix.
 
@@ -285,8 +285,9 @@ installed `sana-mcp`. The
 compile target is always explicit; valid published targets are
 `bun-linux-x64`, `bun-linux-x64-musl`, `bun-linux-arm64`,
 `bun-linux-arm64-musl`, `bun-darwin-x64`, `bun-darwin-arm64`, and
-`bun-windows-x64`. Releases are built only from a manually selected existing tag
-after approval of the protected GitHub `release` environment.
+`bun-windows-x64`. A package-version bump merged to `main` publishes the matching
+release automatically when its tag does not exist. A pushed matching `v*` tag or
+manual dispatch can also build or resume that exact release.
 
 ## License
 

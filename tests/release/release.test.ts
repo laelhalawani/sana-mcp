@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import {
   chmod,
   mkdtemp,
@@ -208,8 +209,29 @@ test("release workflow binds every build and publish step to the authorized comm
   for (const action of actionUses) {
     assert.match(action[1] ?? "", /^[a-f0-9]{40}$/);
   }
-  assert.match(workflow, /ref: \$\{\{ inputs\.tag \}\}/);
+  assert.match(workflow, /push:\s*\n\s+tags: \["v\*"\]\s*\n\s+branches: \[main\]/);
+  assert.match(
+    workflow,
+    /ref: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.tag \|\| github\.sha \}\}/,
+  );
   assert.match(workflow, /sha: \$\{\{ steps\.verify\.outputs\.sha \}\}/);
+  assert.match(workflow, /skip: \$\{\{ steps\.verify\.outputs\.skip \}\}/);
+  assert.match(
+    workflow,
+    /create_tag: \$\{\{ steps\.verify\.outputs\.create_tag \}\}/,
+  );
+  assert.match(
+    workflow,
+    /release_tag=\$package_tag[\s\S]*"repos\/\$GITHUB_REPOSITORY\/git\/ref\/tags\/\$tag_name"[\s\S]*"repos\/\$GITHUB_REPOSITORY\/git\/tags\/\$object_sha"/,
+  );
+  assert.match(workflow, /Tag \$release_tag does not match package version \$package_tag/);
+  assert.ok(
+    (
+      workflow.match(
+        /if: needs\.authorize\.outputs\.skip != 'true'/g,
+      ) ?? []
+    ).length >= 4,
+  );
   assert.ok(
     (
       workflow.match(
@@ -226,11 +248,12 @@ test("release workflow binds every build and publish step to the authorized comm
   );
   assert.match(
     workflow,
-    /git fetch --no-tags origin "refs\/tags\/\$RELEASE_TAG"/,
+    /verify_release_tag\(\)[\s\S]*resolve_tag_commit "\$RELEASE_TAG" "\$tag_probe_error"/,
   );
+  assert.doesNotMatch(workflow, /repos\/\$GITHUB_REPOSITORY\/commits\/\$(?:release_tag|RELEASE_TAG)/);
   assert.match(
     workflow,
-    /test "\$\(git rev-parse FETCH_HEAD\^\{commit\}\)" = "\$SOURCE_SHA"/,
+    /test "\$observed_tag_sha" = "\$SOURCE_SHA"/,
   );
   assert.match(
     workflow,
@@ -238,7 +261,16 @@ test("release workflow binds every build and publish step to the authorized comm
   );
   assert.match(workflow, /-v "\$PWD:\/work:ro"/);
   assert.match(workflow, /--target "\$SOURCE_SHA"/);
-  assert.match(workflow, /Existing release targets a different source commit/);
+  assert.match(
+    workflow,
+    /"repos\/\$GITHUB_REPOSITORY\/git\/refs"[\s\S]*"ref=refs\/tags\/\$RELEASE_TAG"[\s\S]*"sha=\$SOURCE_SHA"/,
+  );
+  assert.match(workflow, /gh release create "\$RELEASE_TAG" \\\n\s+--verify-tag/);
+  assert.match(
+    workflow,
+    /group: release-\$\{\{ needs\.authorize\.outputs\.tag \}\}/,
+  );
+  assert.doesNotMatch(workflow, /release\.target_commitish/);
   assert.match(workflow, /tag_without_build="\$\{RELEASE_TAG%%\+\*\}"/);
   assert.match(workflow, /Existing release title does not match/);
   assert.match(workflow, /prerelease classification is incorrect/);
@@ -251,9 +283,280 @@ test("release workflow binds every build and publish step to the authorized comm
   assert.match(workflow, /verify_remote_assets true/);
   assert.match(workflow, /cmp -s "release-assets\/\$asset"/);
   assert.match(workflow, /already published with the authorized tuple/);
+  assert.match(
+    workflow,
+    /verify_remote_assets true\s+verify_release_tag\s+gh release edit "\$RELEASE_TAG" --draft=false/,
+  );
+  assert.match(
+    workflow,
+    /gh release edit "\$RELEASE_TAG" --draft=false[\s\S]*verify_remote_assets true\s+verify_release_tag/,
+  );
 });
 
-linuxOnlyTest("release publication resumes only a matching draft and re-verifies every asset", async () => {
+linuxOnlyTest("release resolver distinguishes version reuse, new versions, and lookup failure", async () => {
+  const workflow = YAML.parse(
+    await readFile(
+      path.join(process.cwd(), ".github/workflows/release.yml"),
+      "utf8",
+    ),
+  ) as {
+    jobs: {
+      authorize: {
+        steps: Array<{ id?: string; run?: string }>;
+      };
+    };
+  };
+  const resolver = workflow.jobs.authorize.steps.find(
+    (step) => step.id === "verify",
+  )?.run;
+  assert.ok(resolver);
+
+  const temporary = await mkdtemp(
+    path.join(os.tmpdir(), "sana-release-resolver-"),
+  );
+  try {
+    const commands = path.join(temporary, "commands");
+    await mkdir(commands);
+    await writeFile(
+      path.join(commands, "bun"),
+      `#!/bin/sh\nprintf '%s' '${packageMetadata.version}'\n`,
+    );
+    await writeFile(
+      path.join(commands, "git"),
+      [
+        "#!/bin/sh",
+        'case "$1" in',
+        `  rev-parse) printf '%s\\n' '${sourceCommit}'; exit 0 ;;`,
+        "  show-ref)",
+        '    [ "${FAKE_TAG_PROBE:-missing}" = "exists" ] && exit 0',
+        "    exit 1",
+        "    ;;",
+        "  ls-remote)",
+        '    case "${FAKE_TAG_PROBE:-missing}" in',
+        `      exists) printf '%s\\t%s\\n' '${sourceCommit}' 'refs/tags/v${packageMetadata.version}'; exit 0 ;;`,
+        "      missing) exit 2 ;;",
+        "      error) echo 'synthetic remote failure' >&2; exit 128 ;;",
+        "      *) exit 64 ;;",
+        "    esac",
+        "    ;;",
+        "  *) exit 64 ;;",
+        "esac",
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      path.join(commands, "gh"),
+      [
+        "#!/bin/sh",
+        '[ "$1" = "api" ] || exit 64',
+        `exact_ref="repos/example/sana-mcp/git/ref/tags/v${packageMetadata.version}"`,
+        'if [ "$2" = "$exact_ref" ]; then',
+        'case "${FAKE_TAG_PROBE:-missing}" in',
+        `  exists) if [ "\${FAKE_TAG_KIND:-commit}" = "tag" ]; then printf 'tag %s\\n' '${"a".repeat(40)}'; else printf 'commit %s\\n' "\${FAKE_TAG_SHA:-${sourceCommit}}"; fi; exit 0 ;;`,
+        "  missing) echo 'HTTP 404: Not Found' >&2; exit 1 ;;",
+        "  error) echo 'synthetic remote failure' >&2; exit 1 ;;",
+        "  *) exit 64 ;;",
+        "esac",
+        "fi",
+        `if [ "$2" = "repos/example/sana-mcp/git/tags/${"a".repeat(40)}" ]; then`,
+        "  if [ \"${FAKE_TAG_OBJECT_PROBE:-exists}\" = \"missing\" ]; then echo 'HTTP 404: Not Found' >&2; exit 1; fi",
+        `  printf 'commit %s\\n' "\${FAKE_TAG_SHA:-${sourceCommit}}"`,
+        "  exit 0",
+        "fi",
+        "echo 'unexpected API path' >&2",
+        "exit 65",
+        "",
+      ].join("\n"),
+    );
+    await chmod(path.join(commands, "bun"), 0o755);
+    await chmod(path.join(commands, "git"), 0o755);
+    await chmod(path.join(commands, "gh"), 0o755);
+
+    const execute = (options: {
+      eventName: "push" | "workflow_dispatch";
+      refName: string;
+      refType: "branch" | "tag";
+      requestedTag?: string;
+      tagProbe: "exists" | "missing" | "error";
+      tagSha?: string;
+      tagKind?: "commit" | "tag";
+      tagObjectProbe?: "exists" | "missing";
+    }) => {
+      const output = path.join(
+        temporary,
+        `output-${Math.random().toString(16).slice(2)}`,
+      );
+      const result = spawnSync("/bin/bash", ["-c", resolver], {
+        cwd: temporary,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${commands}:${process.env.PATH ?? ""}`,
+          EVENT_NAME: options.eventName,
+          REF_NAME: options.refName,
+          REF_TYPE: options.refType,
+          REQUESTED_TAG: options.requestedTag ?? "",
+          FAKE_TAG_PROBE: options.tagProbe,
+          ...(options.tagSha === undefined
+            ? {}
+            : { FAKE_TAG_SHA: options.tagSha }),
+          ...(options.tagKind === undefined
+            ? {}
+            : { FAKE_TAG_KIND: options.tagKind }),
+          ...(options.tagObjectProbe === undefined
+            ? {}
+            : { FAKE_TAG_OBJECT_PROBE: options.tagObjectProbe }),
+          GITHUB_REPOSITORY: "example/sana-mcp",
+          GITHUB_OUTPUT: output,
+        },
+      });
+      const outputs =
+        result.status === 0
+          ? Object.fromEntries(
+              readFileSync(output, "utf8")
+                .trim()
+                .split("\n")
+                .filter(Boolean)
+                .map((line) => {
+                  const separator = line.indexOf("=");
+                  return [
+                    line.slice(0, separator),
+                    line.slice(separator + 1),
+                  ];
+                }),
+            )
+          : {};
+      return { result, outputs };
+    };
+
+    const unchanged = execute({
+      eventName: "push",
+      refName: "main",
+      refType: "branch",
+      tagProbe: "exists",
+    });
+    assert.equal(unchanged.result.status, 0, unchanged.result.stderr);
+    assert.equal(unchanged.outputs.skip, "true");
+    assert.equal(unchanged.outputs.create_tag, "false");
+
+    const changed = execute({
+      eventName: "push",
+      refName: "main",
+      refType: "branch",
+      tagProbe: "missing",
+    });
+    assert.equal(changed.result.status, 0, changed.result.stderr);
+    assert.equal(changed.outputs.tag, `v${packageMetadata.version}`);
+    assert.equal(changed.outputs.sha, sourceCommit);
+    assert.equal(changed.outputs.skip, "false");
+    assert.equal(changed.outputs.create_tag, "true");
+
+    const unavailable = execute({
+      eventName: "push",
+      refName: "main",
+      refType: "branch",
+      tagProbe: "error",
+    });
+    assert.notEqual(unavailable.result.status, 0);
+    assert.match(
+      unavailable.result.stderr,
+      /Could not determine whether v0\.4\.0 already exists/,
+    );
+
+    const tagPush = execute({
+      eventName: "push",
+      refName: `v${packageMetadata.version}`,
+      refType: "tag",
+      tagProbe: "exists",
+    });
+    assert.equal(tagPush.result.status, 0, tagPush.result.stderr);
+    assert.equal(tagPush.outputs.skip, "false");
+    assert.equal(tagPush.outputs.create_tag, "false");
+
+    const annotatedTagPush = execute({
+      eventName: "push",
+      refName: `v${packageMetadata.version}`,
+      refType: "tag",
+      tagProbe: "exists",
+      tagKind: "tag",
+    });
+    assert.equal(
+      annotatedTagPush.result.status,
+      0,
+      annotatedTagPush.result.stderr,
+    );
+
+    const annotatedObjectMissing = execute({
+      eventName: "push",
+      refName: "main",
+      refType: "branch",
+      tagProbe: "exists",
+      tagKind: "tag",
+      tagObjectProbe: "missing",
+    });
+    assert.notEqual(annotatedObjectMissing.result.status, 0);
+    assert.match(
+      annotatedObjectMissing.result.stderr,
+      /Could not determine whether v0\.4\.0 already exists/,
+    );
+
+    const matchingManual = execute({
+      eventName: "workflow_dispatch",
+      refName: "main",
+      refType: "branch",
+      requestedTag: `v${packageMetadata.version}`,
+      tagProbe: "exists",
+    });
+    assert.equal(
+      matchingManual.result.status,
+      0,
+      matchingManual.result.stderr,
+    );
+    assert.equal(matchingManual.outputs.create_tag, "false");
+
+    const missingManual = execute({
+      eventName: "workflow_dispatch",
+      refName: "main",
+      refType: "branch",
+      requestedTag: `v${packageMetadata.version}`,
+      tagProbe: "missing",
+    });
+    assert.notEqual(missingManual.result.status, 0);
+    assert.match(missingManual.result.stderr, /is not an existing tag/);
+
+    const mismatchedTagCommit = execute({
+      eventName: "push",
+      refName: `v${packageMetadata.version}`,
+      refType: "tag",
+      tagProbe: "exists",
+      tagSha: "fedcba9876543210fedcba9876543210fedcba98",
+    });
+    assert.notEqual(mismatchedTagCommit.result.status, 0);
+    assert.match(
+      mismatchedTagCommit.result.stderr,
+      /Checkout is not the exact requested tag commit/,
+    );
+
+    const mismatchedManual = execute({
+      eventName: "workflow_dispatch",
+      refName: "main",
+      refType: "branch",
+      requestedTag: "v9.9.9",
+      tagProbe: "exists",
+    });
+    assert.notEqual(mismatchedManual.result.status, 0);
+    assert.match(
+      mismatchedManual.result.stderr,
+      new RegExp(
+        `does not match package version v${packageMetadata.version.replaceAll(".", "\\.")}`,
+      ),
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+linuxOnlyTest("release publication resumes only a matching draft and re-verifies every asset", { timeout: 20_000 }, async () => {
   const workflow = YAML.parse(
     await readFile(
       path.join(process.cwd(), ".github/workflows/release.yml"),
@@ -270,6 +573,15 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
     (step) => step.name === "Publish the immutable tuple",
   )?.run;
   assert.ok(publishScript);
+  const afterPublish = publishScript.slice(
+    publishScript.indexOf(
+      'gh release edit "$RELEASE_TAG" --draft=false',
+    ),
+  );
+  assert.match(
+    afterPublish,
+    /gh release edit "\$RELEASE_TAG" --draft=false[\s\S]*fetch_release[\s\S]*validate_release_identity[\s\S]*test "\$release_is_draft" = "false"[\s\S]*verify_remote_assets true/,
+  );
 
   for (const remoteMatches of [true, false]) {
     const temporary = await mkdtemp(
@@ -295,21 +607,11 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
           exists: true,
           draft: true,
           tag: `v${packageMetadata.version}`,
-          target: sourceCommit,
           title: `v${packageMetadata.version}`,
           prerelease: false,
         }),
       );
 
-      const fakeGit = [
-        "#!/bin/sh",
-        'case "$1" in',
-        "  fetch) exit 0 ;;",
-        '  rev-parse) printf "%s\\n" "$SOURCE_SHA"; exit 0 ;;',
-        "  *) exit 64 ;;",
-        "esac",
-        "",
-      ].join("\n");
       const fakeGh = [
         "#!/usr/bin/env bun",
         'import { copyFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";',
@@ -320,12 +622,39 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "if (!stateFile || !assetsDir) process.exit(70);",
         "const load = () => JSON.parse(readFileSync(stateFile, 'utf8'));",
         "const save = (state) => writeFileSync(stateFile, JSON.stringify(state));",
+        "if (args[0] === 'api' && args.includes('--method')) {",
+        "  const state = load();",
+        "  const requestedSha = args[args.indexOf('-f', args.indexOf('-f') + 1) + 1].slice('sha='.length);",
+        "  if (process.env.FAKE_TAG_CREATE_FAIL === '1') { console.error('synthetic tag creation failure'); process.exit(1); }",
+        "  const raceSha = process.env.FAKE_TAG_RACE_SHA;",
+        "  state.tagExists = true; state.tagSha = raceSha || requestedSha;",
+        "  save(state);",
+        "  if (raceSha) { console.error('synthetic concurrent tag creation'); process.exit(1); }",
+        "  process.stdout.write('{}'); process.exit(0);",
+        "}",
+        "if (args[0] === 'api' && args[1]?.includes('/git/ref/tags/')) {",
+        "  if (process.env.FAKE_TAG_LOOKUP_ERROR === '1') { console.error('synthetic tag lookup failure'); process.exit(1); }",
+        "  const state = load();",
+        "  if (state.tagExists === false) { console.error('HTTP 404: Not Found'); process.exit(1); }",
+        "  if (state.tagKind === 'tag') process.stdout.write(`tag ${state.tagObjectSha}\\n`);",
+        "  else process.stdout.write(`commit ${state.tagSha ?? process.env.SOURCE_SHA}\\n`);",
+        "  process.exit(0);",
+        "}",
+        "if (args[0] === 'api' && args[1]?.includes('/git/tags/')) {",
+        "  const state = load();",
+        "  if (process.env.FAKE_TAG_OBJECT_LOOKUP_ERROR === '1') { console.error('HTTP 404: Not Found'); process.exit(1); }",
+        "  if (state.tagKind !== 'tag' || !args[1].endsWith(`/${state.tagObjectSha}`)) process.exit(66);",
+        "  process.stdout.write(`commit ${state.tagSha ?? process.env.SOURCE_SHA}\\n`); process.exit(0);",
+        "}",
+        "if (args[0] === 'api' && args[1]?.includes('/commits/')) {",
+        "  console.error('commit lookup must not be used as a tag lookup'); process.exit(67);",
+        "}",
         "if (args[0] === 'api') {",
         "  const state = load();",
         "  if (!state.exists) { console.error('HTTP 404: Not Found'); process.exit(1); }",
         "  process.stdout.write(JSON.stringify({",
         "    tag_name: state.tag,",
-        "    target_commitish: state.target,",
+        "    target_commitish: 'main',",
         "    draft: state.draft,",
         "    name: state.title,",
         "    prerelease: state.prerelease,",
@@ -338,32 +667,42 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "  const pattern = args[args.indexOf('--pattern') + 1];",
         "  const directory = args[args.indexOf('--dir') + 1];",
         "  copyFileSync(path.join(assetsDir, pattern), path.join(directory, pattern));",
+        "  if (process.env.FAKE_MOVE_TAG_ON_DOWNLOAD_SHA) { const state = load(); state.tagSha = process.env.FAKE_MOVE_TAG_ON_DOWNLOAD_SHA; save(state); }",
         "  process.exit(0);",
         "}",
         "if (args[1] === 'upload') {",
         "  for (const file of args.slice(3)) copyFileSync(file, path.join(assetsDir, path.basename(file)));",
+        "  if (process.env.FAKE_MOVE_TAG_ON_UPLOAD_SHA) { const state = load(); state.tagSha = process.env.FAKE_MOVE_TAG_ON_UPLOAD_SHA; save(state); }",
         "  process.exit(0);",
         "}",
         "if (args[1] === 'edit') {",
-        "  const state = load(); state.draft = false; save(state); process.exit(0);",
+        "  const state = load(); state.draft = false;",
+        "  if (process.env.FAKE_MOVE_TAG_ON_EDIT_SHA) state.tagSha = process.env.FAKE_MOVE_TAG_ON_EDIT_SHA;",
+        "  save(state); process.exit(0);",
         "}",
         "if (args[1] === 'create') {",
         "  const state = load();",
+        "  if (!args.includes('--verify-tag') || state.tagExists === false) process.exit(65);",
         "  state.exists = true; state.draft = true; state.tag = args[2];",
-        "  state.target = args[args.indexOf('--target') + 1];",
         "  state.title = args[args.indexOf('--title') + 1];",
         "  state.prerelease = args.includes('--prerelease'); save(state); process.exit(0);",
         "}",
         "process.exit(64);",
         "",
       ].join("\n");
-      await writeFile(path.join(commands, "git"), fakeGit);
       await writeFile(path.join(commands, "gh"), fakeGh);
-      await chmod(path.join(commands, "git"), 0o755);
       await chmod(path.join(commands, "gh"), 0o755);
 
       const execute = (
         releaseTag = `v${packageMetadata.version}`,
+        createTag = false,
+        tagRaceSha?: string,
+        tagCreateFails = false,
+        tagLookupFails = false,
+        tagMoveOnUploadSha?: string,
+        tagMoveOnEditSha?: string,
+        tagObjectLookupFails = false,
+        tagMoveOnDownloadSha?: string,
       ) =>
         spawnSync("/bin/bash", ["-c", publishScript], {
           cwd: temporary,
@@ -373,6 +712,24 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
             PATH: `${commands}:${process.env.PATH ?? ""}`,
             RELEASE_TAG: releaseTag,
             SOURCE_SHA: sourceCommit,
+            CREATE_TAG: String(createTag),
+            ...(tagRaceSha === undefined
+              ? {}
+              : { FAKE_TAG_RACE_SHA: tagRaceSha }),
+            ...(tagCreateFails ? { FAKE_TAG_CREATE_FAIL: "1" } : {}),
+            ...(tagLookupFails ? { FAKE_TAG_LOOKUP_ERROR: "1" } : {}),
+            ...(tagObjectLookupFails
+              ? { FAKE_TAG_OBJECT_LOOKUP_ERROR: "1" }
+              : {}),
+            ...(tagMoveOnDownloadSha === undefined
+              ? {}
+              : { FAKE_MOVE_TAG_ON_DOWNLOAD_SHA: tagMoveOnDownloadSha }),
+            ...(tagMoveOnUploadSha === undefined
+              ? {}
+              : { FAKE_MOVE_TAG_ON_UPLOAD_SHA: tagMoveOnUploadSha }),
+            ...(tagMoveOnEditSha === undefined
+              ? {}
+              : { FAKE_MOVE_TAG_ON_EDIT_SHA: tagMoveOnEditSha }),
             GITHUB_REPOSITORY: "example/sana-mcp",
             FAKE_RELEASE_STATE: stateFile,
             FAKE_RELEASE_ASSETS: remoteAssets,
@@ -393,6 +750,29 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         assert.equal(rerun.status, 0, rerun.stderr);
         assert.match(rerun.stdout, /already published with the authorized tuple/);
 
+        const movedPublishedTagSha =
+          "2222222222222222222222222222222222222222";
+        const publishedTagMovedDuringVerification = execute(
+          `v${packageMetadata.version}`,
+          false,
+          undefined,
+          false,
+          false,
+          undefined,
+          undefined,
+          false,
+          movedPublishedTagSha,
+        );
+        assert.notEqual(publishedTagMovedDuringVerification.status, 0);
+        assert.match(
+          publishedTagMovedDuringVerification.stderr,
+          /Release tag moved after authorization/,
+        );
+        const publishedState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as { tagSha?: string };
+        assert.equal(publishedState.tagSha, movedPublishedTagSha);
+
         const buildMetadataTag = `v${packageMetadata.version}+build-x`;
         await writeFile(
           stateFile,
@@ -400,7 +780,6 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
             exists: true,
             draft: false,
             tag: buildMetadataTag,
-            target: sourceCommit,
             title: buildMetadataTag,
             prerelease: false,
           }),
@@ -412,13 +791,34 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
           buildMetadataRerun.stderr,
         );
 
+        const annotatedTag = `v${packageMetadata.version}`;
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: true,
+            draft: false,
+            tag: annotatedTag,
+            title: annotatedTag,
+            prerelease: false,
+            tagExists: true,
+            tagKind: "tag",
+            tagObjectSha: "a".repeat(40),
+            tagSha: sourceCommit,
+          }),
+        );
+        const annotatedPublishedRerun = execute(annotatedTag);
+        assert.equal(
+          annotatedPublishedRerun.status,
+          0,
+          annotatedPublishedRerun.stderr,
+        );
+
         await writeFile(
           stateFile,
           JSON.stringify({
             exists: true,
             draft: true,
             tag: `v${packageMetadata.version}`,
-            target: sourceCommit,
             title: "wrong title",
             prerelease: false,
           }),
@@ -433,7 +833,6 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
             exists: true,
             draft: true,
             tag: `v${packageMetadata.version}`,
-            target: sourceCommit,
             title: `v${packageMetadata.version}`,
             prerelease: true,
           }),
@@ -443,6 +842,229 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         assert.match(
           wrongClassification.stderr,
           /prerelease classification is incorrect/,
+        );
+
+        for (const asset of await readdir(remoteAssets)) {
+          await rm(path.join(remoteAssets, asset));
+        }
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: false,
+            draft: false,
+            tag: "",
+            title: "",
+            prerelease: false,
+            tagExists: false,
+            tagSha: null,
+          }),
+        );
+        const automaticMainRelease = execute(
+          `v${packageMetadata.version}`,
+          true,
+        );
+        assert.equal(
+          automaticMainRelease.status,
+          0,
+          automaticMainRelease.stderr,
+        );
+        const automaticState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as {
+          draft: boolean;
+          tag: string;
+        };
+        assert.equal(automaticState.draft, false);
+        assert.equal(
+          automaticState.tag,
+          `v${packageMetadata.version}`,
+        );
+
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: false,
+            draft: false,
+            tag: `v${packageMetadata.version}`,
+            title: "",
+            prerelease: false,
+            tagExists: false,
+            tagSha: null,
+          }),
+        );
+        const racedTagSha =
+          "fedcba9876543210fedcba9876543210fedcba98";
+        const racedTag = execute(
+          `v${packageMetadata.version}`,
+          true,
+          racedTagSha,
+        );
+        assert.notEqual(racedTag.status, 0);
+        assert.match(racedTag.stderr, /Release tag moved after authorization/);
+        const racedState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as {
+          exists: boolean;
+          tagSha: string;
+        };
+        assert.equal(racedState.exists, false);
+        assert.equal(racedState.tagSha, racedTagSha);
+
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: false,
+            draft: false,
+            tag: `v${packageMetadata.version}`,
+            title: "",
+            prerelease: false,
+            tagExists: false,
+            tagSha: null,
+          }),
+        );
+        const disappearedManualTag = execute(
+          `v${packageMetadata.version}`,
+          false,
+        );
+        assert.notEqual(disappearedManualTag.status, 0);
+        assert.match(
+          disappearedManualTag.stderr,
+          /disappeared after authorization/,
+        );
+
+        const failedTagCreation = execute(
+          `v${packageMetadata.version}`,
+          true,
+          undefined,
+          true,
+        );
+        assert.notEqual(failedTagCreation.status, 0);
+        assert.match(
+          failedTagCreation.stderr,
+          /Could not create release tag/,
+        );
+
+        const exactConcurrentTag = execute(
+          `v${packageMetadata.version}`,
+          true,
+          sourceCommit,
+        );
+        assert.equal(
+          exactConcurrentTag.status,
+          0,
+          exactConcurrentTag.stderr,
+        );
+
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: false,
+            draft: false,
+            tag: `v${packageMetadata.version}`,
+            title: "",
+            prerelease: false,
+            tagExists: true,
+            tagSha: sourceCommit,
+          }),
+        );
+        const lookupFailure = execute(
+          `v${packageMetadata.version}`,
+          false,
+          undefined,
+          false,
+          true,
+        );
+        assert.notEqual(lookupFailure.status, 0);
+        assert.match(lookupFailure.stderr, /Could not resolve release tag/);
+
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: true,
+            draft: true,
+            tag: `v${packageMetadata.version}`,
+            title: `v${packageMetadata.version}`,
+            prerelease: false,
+            tagExists: true,
+            tagKind: "tag",
+            tagObjectSha: "a".repeat(40),
+            tagSha: sourceCommit,
+          }),
+        );
+        const annotatedDereferenceFailure = execute(
+          `v${packageMetadata.version}`,
+          false,
+          undefined,
+          false,
+          false,
+          undefined,
+          undefined,
+          true,
+        );
+        assert.notEqual(annotatedDereferenceFailure.status, 0);
+        assert.match(
+          annotatedDereferenceFailure.stderr,
+          /Could not resolve release tag/,
+        );
+
+        const movedTagSha =
+          "1111111111111111111111111111111111111111";
+        await rm(path.join(remoteAssets, "b.sha256"));
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: true,
+            draft: true,
+            tag: `v${packageMetadata.version}`,
+            title: `v${packageMetadata.version}`,
+            prerelease: false,
+            tagExists: true,
+            tagSha: sourceCommit,
+          }),
+        );
+        const movedDuringUpload = execute(
+          `v${packageMetadata.version}`,
+          false,
+          undefined,
+          false,
+          false,
+          movedTagSha,
+        );
+        assert.notEqual(movedDuringUpload.status, 0);
+        assert.match(
+          movedDuringUpload.stderr,
+          /Release tag moved after authorization/,
+        );
+        const uploadRaceState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as { draft: boolean };
+        assert.equal(uploadRaceState.draft, true);
+
+        await writeFile(
+          stateFile,
+          JSON.stringify({
+            exists: true,
+            draft: true,
+            tag: `v${packageMetadata.version}`,
+            title: `v${packageMetadata.version}`,
+            prerelease: false,
+            tagExists: true,
+            tagSha: sourceCommit,
+          }),
+        );
+        const movedDuringEdit = execute(
+          `v${packageMetadata.version}`,
+          false,
+          undefined,
+          false,
+          false,
+          undefined,
+          movedTagSha,
+        );
+        assert.notEqual(movedDuringEdit.status, 0);
+        assert.match(
+          movedDuringEdit.stderr,
+          /Release tag moved after authorization/,
         );
       } else {
         assert.notEqual(result.status, 0);
