@@ -666,8 +666,10 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "  console.error('commit lookup must not be used as a tag lookup'); process.exit(67);",
         "}",
         "if (args[0] === 'api' && args.includes('--paginate')) {",
-        "  if (process.env.FAKE_RELEASE_LOOKUP_ERROR === '1') { console.error('synthetic release lookup failure'); process.exit(1); }",
         "  const state = load();",
+        "  state.releaseLookups = (state.releaseLookups ?? 0) + 1; save(state);",
+        "  if (Number(process.env.FAKE_RELEASE_LOOKUP_FAILURE_AT) === state.releaseLookups) { console.error('synthetic release lookup failure'); process.exit(1); }",
+        "  if (Number(process.env.FAKE_RELEASE_MALFORMED_AT) === state.releaseLookups) { process.stdout.write('['); process.exit(0); }",
         "  const releases = state.exists ? [{",
         "    tag_name: state.tag,",
         "    target_commitish: 'main',",
@@ -676,6 +678,8 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "    prerelease: state.prerelease,",
         "    assets: readdirSync(assetsDir).map((name) => ({ name })),",
         "  }] : [];",
+        "  if (Number(process.env.FAKE_RELEASE_DUPLICATE_AT) === state.releaseLookups && releases.length === 1) releases.push({ ...releases[0] });",
+        "  if ((state.releaseVisibilityMisses ?? 0) > 0) { state.releaseVisibilityMisses -= 1; save(state); process.stdout.write(JSON.stringify([[], []])); process.exit(0); }",
         "  process.stdout.write(JSON.stringify([[], releases]));",
         "  process.exit(0);",
         "}",
@@ -703,13 +707,29 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "  if (!args.includes('--verify-tag') || state.tagExists === false) process.exit(65);",
         "  state.exists = true; state.draft = true; state.tag = args[2];",
         "  state.title = args[args.indexOf('--title') + 1];",
-        "  state.prerelease = args.includes('--prerelease'); save(state); process.exit(0);",
+        "  state.prerelease = args.includes('--prerelease');",
+        "  state.releaseVisibilityMisses = Number(process.env.FAKE_RELEASE_VISIBILITY_MISSES ?? '0');",
+        "  save(state); process.exit(0);",
         "}",
         "process.exit(64);",
         "",
       ].join("\n");
       await writeFile(path.join(commands, "gh"), fakeGh);
       await chmod(path.join(commands, "gh"), 0o755);
+      await writeFile(
+        path.join(commands, "sleep"),
+        [
+          "#!/usr/bin/env bun",
+          'import { readFileSync, writeFileSync } from "node:fs";',
+          "const stateFile = process.env.FAKE_RELEASE_STATE;",
+          "if (!stateFile) process.exit(70);",
+          "const state = JSON.parse(readFileSync(stateFile, 'utf8'));",
+          "state.sleepCalls = [...(state.sleepCalls ?? []), ...process.argv.slice(2)];",
+          "writeFileSync(stateFile, JSON.stringify(state));",
+          "",
+        ].join("\n"),
+      );
+      await chmod(path.join(commands, "sleep"), 0o755);
 
       const execute = (
         releaseTag = `v${packageMetadata.version}`,
@@ -721,7 +741,10 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         tagMoveOnEditSha?: string,
         tagObjectLookupFails = false,
         tagMoveOnDownloadSha?: string,
-        releaseLookupFails = false,
+        releaseVisibilityMisses = 0,
+        releaseLookupFailureAt?: number,
+        releaseMalformedAt?: number,
+        releaseDuplicateAt?: number,
       ) =>
         spawnSync("/bin/bash", ["-c", publishScript], {
           cwd: temporary,
@@ -743,9 +766,20 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
             ...(tagMoveOnDownloadSha === undefined
               ? {}
               : { FAKE_MOVE_TAG_ON_DOWNLOAD_SHA: tagMoveOnDownloadSha }),
-            ...(releaseLookupFails
-              ? { FAKE_RELEASE_LOOKUP_ERROR: "1" }
-              : {}),
+            FAKE_RELEASE_VISIBILITY_MISSES: String(releaseVisibilityMisses),
+            ...(releaseLookupFailureAt === undefined
+              ? {}
+              : {
+                  FAKE_RELEASE_LOOKUP_FAILURE_AT: String(
+                    releaseLookupFailureAt,
+                  ),
+                }),
+            ...(releaseMalformedAt === undefined
+              ? {}
+              : { FAKE_RELEASE_MALFORMED_AT: String(releaseMalformedAt) }),
+            ...(releaseDuplicateAt === undefined
+              ? {}
+              : { FAKE_RELEASE_DUPLICATE_AT: String(releaseDuplicateAt) }),
             ...(tagMoveOnUploadSha === undefined
               ? {}
               : { FAKE_MOVE_TAG_ON_UPLOAD_SHA: tagMoveOnUploadSha }),
@@ -902,6 +936,126 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
           `v${packageMetadata.version}`,
         );
 
+        const resetAbsentRelease = async () => {
+          for (const asset of await readdir(remoteAssets)) {
+            await rm(path.join(remoteAssets, asset));
+          }
+          await writeFile(
+            stateFile,
+            JSON.stringify({
+              exists: false,
+              draft: false,
+              tag: `v${packageMetadata.version}`,
+              title: "",
+              prerelease: false,
+              tagExists: false,
+              tagSha: null,
+            }),
+          );
+        };
+
+        await resetAbsentRelease();
+        const transientlyHiddenRelease = execute(
+          `v${packageMetadata.version}`,
+          true,
+          undefined,
+          false,
+          false,
+          undefined,
+          undefined,
+          false,
+          undefined,
+          2,
+        );
+        assert.equal(
+          transientlyHiddenRelease.status,
+          0,
+          transientlyHiddenRelease.stderr,
+        );
+        const transientState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as {
+          draft: boolean;
+          releaseLookups: number;
+          sleepCalls: string[];
+        };
+        assert.equal(transientState.draft, false);
+        assert.equal(transientState.releaseLookups, 6);
+        assert.deepEqual(transientState.sleepCalls, ["1", "1"]);
+
+        await resetAbsentRelease();
+        const persistentlyHiddenRelease = execute(
+          `v${packageMetadata.version}`,
+          true,
+          undefined,
+          false,
+          false,
+          undefined,
+          undefined,
+          false,
+          undefined,
+          5,
+        );
+        assert.notEqual(persistentlyHiddenRelease.status, 0);
+        assert.match(
+          persistentlyHiddenRelease.stderr,
+          /disappeared during publication/,
+        );
+        const persistentState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as {
+          draft: boolean;
+          releaseLookups: number;
+          sleepCalls: string[];
+        };
+        assert.equal(persistentState.draft, true);
+        assert.equal(persistentState.releaseLookups, 6);
+        assert.deepEqual(persistentState.sleepCalls, ["1", "1", "1", "1"]);
+        assert.deepEqual(await readdir(remoteAssets), []);
+
+        for (const failureMode of [
+          { name: "API", args: [2, undefined, undefined] },
+          { name: "malformed", args: [undefined, 2, undefined] },
+          { name: "duplicate", args: [undefined, undefined, 2] },
+        ] as const) {
+          await resetAbsentRelease();
+          const failedReleaseLookup = execute(
+            `v${packageMetadata.version}`,
+            true,
+            undefined,
+            false,
+            false,
+            undefined,
+            undefined,
+            false,
+            undefined,
+            0,
+            ...failureMode.args,
+          );
+          assert.notEqual(
+            failedReleaseLookup.status,
+            0,
+            `${failureMode.name} failure unexpectedly succeeded`,
+          );
+          assert.match(
+            failedReleaseLookup.stderr,
+            new RegExp(
+              `Could not resolve release v${packageMetadata.version.replaceAll(".", "\\.")}`,
+            ),
+          );
+          const failedState = JSON.parse(
+            await readFile(stateFile, "utf8"),
+          ) as {
+            draft: boolean;
+            releaseLookups: number;
+            sleepCalls?: string[];
+          };
+          assert.equal(failedState.draft, true);
+          assert.equal(failedState.releaseLookups, 2);
+          assert.deepEqual(failedState.sleepCalls ?? [], []);
+          assert.deepEqual(await readdir(remoteAssets), []);
+        }
+
         await writeFile(
           stateFile,
           JSON.stringify({
@@ -1051,7 +1205,8 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
           undefined,
           false,
           undefined,
-          true,
+          0,
+          1,
         );
         assert.notEqual(releaseLookupFailure.status, 0);
         assert.match(

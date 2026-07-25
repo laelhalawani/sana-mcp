@@ -524,10 +524,19 @@ jobs:
           }
 
           require_release() {
-            if fetch_release; then
-              return 0
-            fi
-            release_status=$?
+            release_probe=1
+            while :; do
+              if fetch_release; then
+                return 0
+              else
+                release_status=$?
+              fi
+              if [ "$release_status" -ne 4 ] || [ "$release_probe" -ge 5 ]; then
+                break
+              fi
+              release_probe=$((release_probe + 1))
+              sleep 1
+            done
             cat "$release_error" >&2
             if [ "$release_status" -eq 4 ]; then
               echo "Release $RELEASE_TAG disappeared during publication." >&2
