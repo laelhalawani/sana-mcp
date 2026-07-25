@@ -48,6 +48,14 @@ export function wizardEmptyMessage(
   return undefined;
 }
 
+export function initialWizardDesiredState(
+  rows: readonly WizardRow[]
+): Record<string, boolean> {
+  const desired: Record<string, boolean> = {};
+  for (const row of rows) desired[row.id] = row.current;
+  return desired;
+}
+
 export const wizardPrompt = createPrompt<WizardResult, WizardConfig>((config, done) => {
   const ui = config.ui;
   const detected = useMemo(() => config.rows.filter((r) => r.detected), [config.rows]);
@@ -56,12 +64,10 @@ export const wizardPrompt = createPrompt<WizardResult, WizardConfig>((config, do
   const [status, setStatus] = useState<Status>("idle");
   const [showAll, setShowAll] = useState(false);
   const [cursor, setCursor] = useState(0);
-  // desired on/off state, seeded from current registration
-  const [desired, setDesired] = useState<Record<string, boolean>>(() => {
-    const d: Record<string, boolean> = {};
-    for (const r of config.rows) d[r.id] = r.detected ? r.current : false;
-    return d;
-  });
+  // Desired state is seeded only from authoritative registration ownership.
+  const [desired, setDesired] = useState<Record<string, boolean>>(() =>
+    initialWizardDesiredState(config.rows)
+  );
 
   const selectable = showAll ? [...detected, ...others] : detected;
 

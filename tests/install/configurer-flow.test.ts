@@ -31,6 +31,7 @@ import {
   type InstallInteraction,
 } from "../../src/install/install.js";
 import { serverTarget } from "../../src/install/server-target.js";
+import { initialWizardDesiredState } from "../../src/install/wizard-prompt.js";
 import type { SessionVersion, SyncState } from "../../src/store/db.js";
 
 function terminal(
@@ -1523,6 +1524,153 @@ test("detected, safely configurable absent, and unavailable clients remain disti
     );
     assert.equal(fs.existsSync(path.join(root, "present.json")), false);
     assert.equal(fs.existsSync(path.join(root, "absent.json")), false);
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("public configurer starts from compatible saved registrations without rewriting them", async () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-saved-defaults-")
+  );
+  const detectedOwnedPath = path.join(root, "detected-owned.json");
+  const absentOwnedPath = path.join(root, "absent-owned.json");
+  const unavailableOwnedPath = path.join(root, "unavailable-owned.json");
+  const detectedAbsentPath = path.join(root, "detected-absent.json");
+  const undetectedAbsentPath = path.join(root, "undetected-absent.json");
+  const foreignPath = path.join(root, "foreign.json");
+  const target = serverTarget();
+  const existing = new Map<string, string>([
+    [
+      detectedOwnedPath,
+      `${JSON.stringify({
+        unrelated: { preserved: true },
+        mcpServers: { "sana-mcp": target },
+      }, null, 2)}\n`,
+    ],
+    [
+      absentOwnedPath,
+      `${JSON.stringify({
+        mcpServers: { "sana-mcp": target },
+        unrelated: "absent detector",
+      })}\n`,
+    ],
+    [
+      unavailableOwnedPath,
+      `${JSON.stringify({
+        mcpServers: { "sana-mcp": target },
+        unrelated: "unavailable detector",
+      }, null, 4)}\n`,
+    ],
+    [
+      foreignPath,
+      '{"mcpServers":{"sana-mcp":{"command":"foreign","args":[]}},"unrelated":true}\n',
+    ],
+  ]);
+  const unchangedTime = new Date("2001-02-03T04:05:06.000Z");
+  const before = new Map<
+    string,
+    Readonly<{ contents: string; mtimeNs: bigint }>
+  >();
+  for (const [file, contents] of existing) {
+    fs.writeFileSync(file, contents);
+    fs.utimesSync(file, unchangedTime, unchangedTime);
+    before.set(file, {
+      contents: fs.readFileSync(file, "utf8"),
+      mtimeNs: fs.statSync(file, { bigint: true }).mtimeNs,
+    });
+  }
+
+  const clients = [
+    fixture("detected-owned", detectedOwnedPath, {
+      state: "present",
+      evidence: [detectedOwnedPath],
+    }),
+    fixture("absent-owned", absentOwnedPath, { state: "absent" }),
+    fixture("unavailable-owned", unavailableOwnedPath, {
+      state: "unavailable",
+      reason: "executable probe denied",
+    }),
+    fixture("detected-absent", detectedAbsentPath, {
+      state: "present",
+      evidence: [detectedAbsentPath],
+    }),
+    fixture("undetected-absent", undetectedAbsentPath, { state: "absent" }),
+    fixture("foreign", foreignPath, { state: "absent" }),
+  ];
+  const output: string[] = [];
+  const auth = fakeAuth({ loggedIn: true });
+  let capturedRows:
+    | Array<{ id: string; detected: boolean; current: boolean }>
+    | undefined;
+  let confirmCalls = 0;
+  let inputCalls = 0;
+  try {
+    const result = await runInstall(
+      {},
+      interaction(clients, output, {
+        prompt: async ({ rows }) => {
+          capturedRows = rows.map(({ id, detected, current }) => ({
+            id,
+            detected,
+            current,
+          }));
+          return {
+            submitted: true,
+            desired: initialWizardDesiredState(rows),
+          };
+        },
+        openAuthSession: () => auth.session,
+        confirm: async () => {
+          confirmCalls += 1;
+          return true;
+        },
+        input: async () => {
+          inputCalls += 1;
+          return "must not be requested";
+        },
+      })
+    );
+
+    assert.deepEqual(capturedRows, [
+      { id: "detected-owned", detected: true, current: true },
+      { id: "absent-owned", detected: true, current: true },
+      { id: "unavailable-owned", detected: true, current: true },
+      { id: "detected-absent", detected: true, current: false },
+      { id: "undetected-absent", detected: false, current: false },
+    ]);
+    assert.deepEqual(result, {
+      disposition: "no-changes",
+      authentication: "ready",
+    });
+    assert.equal(auth.calls.session, 1);
+    assert.equal(auth.calls.close, 1);
+    assert.deepEqual(auth.calls.request, []);
+    assert.deepEqual(auth.calls.verify, []);
+    assert.equal(confirmCalls, 0);
+    assert.equal(inputCalls, 0);
+    const plainOutput = stripTerminalSequences(output.join("\n"));
+    assert.match(plainOutput, /Already signed in to Sana/u);
+    assert.match(
+      plainOutput,
+      /Client foreign: configuration unavailable:/u
+    );
+    assert.ok(plainOutput.includes(JSON.stringify(foreignPath)));
+
+    for (const [file, snapshot] of before) {
+      assert.equal(fs.readFileSync(file, "utf8"), snapshot.contents, file);
+      assert.equal(
+        fs.statSync(file, { bigint: true }).mtimeNs,
+        snapshot.mtimeNs,
+        file
+      );
+    }
+    assert.equal(fs.existsSync(detectedAbsentPath), false);
+    assert.equal(fs.existsSync(undetectedAbsentPath), false);
+    assert.deepEqual(
+      fs.readdirSync(root).sort(),
+      [...existing.keys()].map((file) => path.basename(file)).sort()
+    );
   } finally {
     fs.rmSync(root, { recursive: true });
   }

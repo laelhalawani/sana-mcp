@@ -150,11 +150,21 @@ test("cancel, no clients, and exact no-change are successful explicit no-mutatio
   for (const scenario of ["cancelled", "no-clients", "no-changes"] as const) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-tx-flow-"));
     const file = path.join(root, "client.json");
-    if (scenario === "no-changes")
+    let unchanged:
+      | Readonly<{ contents: string; mtimeNs: bigint }>
+      | undefined;
+    if (scenario === "no-changes") {
       fs.writeFileSync(
         file,
         `${JSON.stringify({ mcpServers: { "sana-mcp": target } }, null, 2)}\n`,
       );
+      const unchangedTime = new Date("2001-02-03T04:05:06.000Z");
+      fs.utimesSync(file, unchangedTime, unchangedTime);
+      unchanged = {
+        contents: fs.readFileSync(file, "utf8"),
+        mtimeNs: fs.statSync(file, { bigint: true }).mtimeNs,
+      };
+    }
     const client = fixture("client", file);
     try {
       const result = await runInstallerConfigTransaction(
@@ -166,10 +176,24 @@ test("cancel, no clients, and exact no-change are successful explicit no-mutatio
           clients: scenario === "no-clients" ? [] : [client],
           terminal: terminal(),
           writeLine: () => undefined,
-          prompt: async () =>
-            scenario === "cancelled"
-              ? { submitted: false, desired: {} }
-              : { submitted: true, desired: { client: true } },
+          prompt: async ({ rows }) => {
+            if (scenario === "cancelled")
+              return { submitted: false, desired: {} };
+            assert.deepEqual(
+              rows.map(({ id, detected, current }) => ({
+                id,
+                detected,
+                current,
+              })),
+              [{ id: "client", detected: true, current: true }]
+            );
+            return {
+              submitted: true,
+              desired: Object.fromEntries(
+                rows.map(({ id, current }) => [id, current])
+              ),
+            };
+          },
           openAuthSession: () => authSession({ alreadyReady: true }),
         },
       );
@@ -177,6 +201,13 @@ test("cancel, no clients, and exact no-change are successful explicit no-mutatio
       assert.equal(result.disposition, scenario);
       assert.equal(result.exitCode, 0);
       assert.equal(fs.existsSync(path.join(root, "journal")), false);
+      if (unchanged !== undefined) {
+        assert.equal(fs.readFileSync(file, "utf8"), unchanged.contents);
+        assert.equal(
+          fs.statSync(file, { bigint: true }).mtimeNs,
+          unchanged.mtimeNs
+        );
+      }
     } finally {
       fs.rmSync(root, { recursive: true });
     }

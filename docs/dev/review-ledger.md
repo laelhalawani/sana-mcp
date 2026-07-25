@@ -1688,3 +1688,65 @@ Validation evidence:
 - POSIX `sh -n`: passed;
 - `git diff --check`: clean;
 - tests used isolated state and did not open the live Sana data tree.
+
+## Direct Windows setup handoff and saved defaults (`v0.4.4`)
+
+Planning was split between `/root/v043_projection_dev` for the Windows
+installer paths and `/root/projection_fresh_review` for the public configurer's
+saved-state model. The consolidated plan was independently reviewed by
+`/root/v043_crosscut_review` and `/root/v044_plan_review_2`.
+
+Plan-review findings were incorporated before development: all direct Windows
+installs must attempt the public configurer only after commit, cleanup, and lock
+release; updater handoffs must never launch it; compatible updater handoffs
+remain setup-silent while incompatible handoffs print the exact deferred
+command; obsolete Windows-only configuration-transaction plumbing must be
+removed; and saved defaults must derive only from authoritative registration
+ownership. The lifecycle state-touch guard was retained as
+`RuntimeStateTouched` because lifecycle inspection opens `SanaStore` and can
+run database migrations.
+
+Development scopes and exact ownership:
+
+- `/root/v043_projection_dev`: `install.ps1`,
+  `tests/install/installers.test.ts`;
+- `/root/projection_fresh_review`: `src/install/wizard-prompt.ts`,
+  `tests/install/wizard-prompt.test.ts`,
+  `tests/install/configurer-flow.test.ts`,
+  `tests/install/config-transaction-flow.test.ts`;
+- `/root/v043_projection_dev`: `package.json`, `README.md`,
+  `docs/dev/cli-specs.md`, `.github/workflows/release.yml`, the `install.sh`
+  version example, both manifest fixtures, and
+  `tests/install/manifest.test.ts`.
+
+The Windows installer no longer runs the private configuration transaction.
+After a successful direct fresh, compatible, or incompatible installation, it
+releases installer resources and invokes the public configurer exactly once.
+`SANA_MCP_YES=1` invokes `install --yes`; updater handoffs invoke no
+configurer. The production wizard initializes every row from its exact current
+registration state, preserves unchanged config bytes, and recognizes a valid
+saved login after actionable client selection.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/v044_plan_review_2` | Scope B saved-default implementation review: none | n/a | CLEAN - zero findings |
+| `/root/projection_fresh_review` | installer scope lacked a spawn-exception regression | added exact Boolean-false containment coverage | correction required fresh review |
+| `/root/v044_plan_review_2` | none in corrected installer scope | n/a | CLEAN - zero findings |
+| `/root/projection_fresh_review` | projection docs overstated selection, non-TTY, and foreign-entry behavior | aligned the human documentation with the public configurer | correction required fresh review |
+| `/root/v044_plan_review_2` | POSIX fresh/compatible and Windows PATH claims were too broad | documented the real platform and install-state branches | correction required fresh review |
+| `/root/v043_crosscut_review` | stale command targets were incorrectly described as refreshed | documented exact owned no-ops and blocked foreign targets | correction required fresh review |
+| `/root/v044_projection_zero_review` | selection defaults and release resolution/assets/progress/checksum mechanics were stale | aligned them with the authoritative installers | correction required fresh review |
+| `/root/v044_projection_final_review` | no-client authentication boundary and shipped update/alias reference were incomplete | documented both real command paths | correction required fresh review |
+| `/root/v044_projection_absolute_final` | four pre-existing human CLI routing/flag/app claims were inaccurate | corrected aliases, `--page`, shipped app configuration, and human rendering | correction required fresh review |
+| `/root/v044_docs_bounded_zero` | none | n/a | CLEAN - zero findings |
+| `/root/v044_crosscut_1` | post-configurer failures hid whether process launch failed or the child exited nonzero; the saved-default review entry was ambiguous | preserved exact structured launch/exit diagnostics and labeled the implementation review explicitly | correction required fresh review |
+| `/root/v044_crosscut_2` | none | n/a | CLEAN - zero findings |
+
+Validation evidence:
+
+- complete `bun test`: 574 passed, 1 Windows-only platform skip, 0 failed;
+- `bun run typecheck`: passed;
+- Windows PowerShell AST parsing: passed;
+- POSIX `sh -n`: passed;
+- `git diff --check`: clean;
+- tests used isolated state and did not open the live Sana data tree.

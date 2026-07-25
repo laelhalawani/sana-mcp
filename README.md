@@ -22,28 +22,39 @@ irm https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.
 ```
 
 The installer selects the release for your OS, CPU, and (on Linux) libc, verifies
-the release manifest, checksums, and embedded binary identity, puts `sana-mcp` on
-your `PATH`, then opens an interactive
-configurer: it detects your AI clients, lets you toggle which ones to connect
-(space to toggle, `v` to reveal undetected clients, enter to confirm), and offers
-to sign you in. Run `sana-mcp` anytime to reopen it and change what's connected or
-sign in later.
+the release manifest, checksums, and embedded binary identity, and puts
+`sana-mcp` on your `PATH`. Every successful direct Windows script run - fresh,
+compatible, or incompatible, from the one-line command or a local script -
+attempts the public configurer after the runtime transaction has committed and
+installer cleanup has finished. It detects your AI clients, shows registrations
+that exactly match the installed command checked initially, and lets you change
+registrations. When at least one safely configurable client row is available and
+client selection/configuration completes, interactive setup reaches sign-in and
+recognizes valid saved Sana authentication. With no safely configurable rows it
+reports that no clients are available and returns before authentication.
 
-When the installer has no interactive terminal, it installs the verified binary
-and prints the exact `sana-mcp install` command to run later; it does not guess
-which clients to change. For an intentional unattended install, set
-`SANA_MCP_YES=1` to configure every detected client without showing the picker.
-If a terminal is present but interactive controls are disabled by redirection,
-CI, or terminal policy, the installer makes the same explicit deferral and keeps
-the verified runtime installed.
+For a fresh direct POSIX install, the installer configures inside its transaction
+when an interactive terminal is available; without one it keeps the verified
+runtime and prints the exact `sana-mcp install` command for later.
+`SANA_MCP_YES=1` performs unattended transactional configuration for that fresh
+install. A receipt-backed compatible existing POSIX installation preserves its
+client configuration and does not reopen it. A direct Windows run still attempts
+the public configurer without a terminal; if interaction is unavailable, the
+installed runtime remains successful and an exact retry command is printed. For
+an intentional unattended direct Windows install, `SANA_MCP_YES=1` configures
+detected clients without the picker or authentication, then prints the exact
+command to sign in.
 
 Run `sana-mcp update` to check for and install the latest release. A compatible
 receipt-backed update verifies the installed runtime and release metadata, then
 replaces the runtime without requiring Sana to be reachable; your login and local
 meeting state remain in place. The command reports a no-op when you already have
-the latest version and never downgrades a newer installation.
+the latest version and never downgrades a newer installation. Updater handoffs do
+not launch the configurer. A compatible Windows updater is silent about setup and
+preserves registrations and local state; only an incompatible Windows updater
+prints the deferred command to configure clients and sign in.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.3` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.4` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
 `apk add --no-cache libstdc++ libgcc`; the installer detects and reports this
@@ -55,13 +66,12 @@ handled as an incompatible replacement. Before changing anything, the installer 
 local meetings must be resynced and you must sign in again, then asks whether to
 continue. Declining leaves the installation unchanged. Confirming replaces the
 verified old runtime and resets its default local state; it does not migrate or
-revalidate the old authentication. A direct interactive one-line replacement
-opens the configurer so you can sign in again immediately. A replacement handed
-off by `sana-mcp update` defers setup and prints the exact command to run later.
-For a direct unattended run, `SANA_MCP_YES=1` registers detected clients without
-prompts and then prints sign-in guidance. An unrecognized receiptless executable
-is never run or overwritten, and an overridden data or transcript directory is
-never reset automatically.
+revalidate the old authentication. After commit and cleanup, a direct script run
+uses the same public configurer behavior described above. An incompatible
+updater handoff launches no configurer and prints its exact deferred
+configure-and-sign-in command. An unrecognized receiptless executable is never
+run or overwritten, and an overridden data or transcript directory is never
+reset automatically.
 
 Linux and macOS support compatible receipt-backed updates. An epoch-changing
 update is refused before confirmation until their destructive replacement
@@ -181,7 +191,9 @@ your existing servers are preserved - and the operation is idempotent.
 
 - **Detects:** Claude Desktop, Claude Code, Cursor, VS Code (Copilot), Codex,
   Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q, Continue, and opencode.
-  Detected clients are pre-selected; you can add any other supported client too.
+  Exact compatible saved registrations for the installed command start checked.
+  Detected clients without that registration are shown unchecked, not
+  pre-selected. Press `v` to reveal other safely configurable supported clients.
 - **Flags:** `--dry-run` (show what would change), `--yes` (register with all
   detected clients, no prompt), `--name <name>` (server name; default `sana-mcp`).
 - After registering, most clients need a restart or a session reload to pick up
