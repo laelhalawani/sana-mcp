@@ -1,151 +1,626 @@
-// Shared rendering primitives for every human-facing surface (configurer, the
-// interactive app, installer). Dependency-light: color/glyphs gated on TTY +
-// NO_COLOR, layout helpers with a consistent gutter, and a Frame that redraws a
-// tracked region in place (degrading to plain writes when not a TTY).
-import { cursorHide, cursorShow, eraseLines } from "@inquirer/ansi";
+import {
+  displayWidth,
+  renderDisplayRow,
+  renderPanel,
+  renderRule,
+  renderTable,
+  sanitizeTerminalText,
+  stripTerminalSequences,
+  truncateText,
+  wrapText,
+  type DisplayRow,
+  type TableColumn,
+} from "./render.js";
 
-// ---- capability detection (computed once) --------------------------------
-
-const noColor = "NO_COLOR" in process.env || process.env.TERM === "dumb";
-export const isTTY = !!process.stdout.isTTY;
-export const isColor = isTTY && !noColor;
-// Interactive = we may run prompts and redraw. CI is treated as non-interactive.
-export const isInteractive = !!process.stdin.isTTY && !!process.stdout.isTTY && !process.env.CI;
-// Unicode glyphs only where we are confident they render; else ASCII.
-const unicodeOK =
-  isTTY && (process.platform !== "win32" || !!process.env.WT_SESSION);
-
-// ---- color ---------------------------------------------------------------
-
-const wrap =
-  (open: number, close: number) =>
-  (s: string): string =>
-    isColor ? `\x1b[${open}m${s}\x1b[${close}m` : s;
-
-export const color = {
-  dim: wrap(2, 22),
-  bold: wrap(1, 22),
-  green: wrap(32, 39),
-  yellow: wrap(33, 39),
-  red: wrap(31, 39),
-  cyan: wrap(36, 39),
+export {
+  displayWidth,
+  sanitizeTerminalText,
+  type DisplayRow,
+  type TableColumn,
 };
 
-// ---- glyphs --------------------------------------------------------------
+const CURSOR_HIDE = "\x1b[?25l";
+const CURSOR_SHOW = "\x1b[?25h";
+const CURSOR_LEFT = "\x1b[G";
+const ERASE_TO_END = "\x1b[J";
+interface TrustedTextMetadata {
+  owner: object;
+  color: boolean;
+  unicode: boolean;
+}
+const trustedText = new WeakMap<object, TrustedTextMetadata>();
 
-export const glyphs = unicodeOK
-  ? { ok: "✔", disable: "−", noop: "=", skip: "·", fail: "✖", pending: "·", pointer: "❯", check: "◉", uncheck: "◯" }
-  : { ok: "+", disable: "-", noop: "=", skip: "~", fail: "x", pending: ".", pointer: ">", check: "[x]", uncheck: "[ ]" };
+export interface RenderedText {
+  readonly text: string;
+}
 
-export const spinnerFrames = unicodeOK
-  ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-  : ["-", "\\", "|", "/"];
+function rendered(
+  text: string,
+  owner: object,
+  policy: Pick<TerminalPolicy, "color" | "unicode">
+): RenderedText {
+  const value = Object.freeze({ text });
+  trustedText.set(value, { owner, color: policy.color, unicode: policy.unicode });
+  return value;
+}
+
+function serialize(
+  value: unknown,
+  owner: object,
+  policy: Pick<TerminalPolicy, "color" | "unicode">
+): string {
+  if (typeof value !== "object" || value === null) return sanitizeTerminalText(value);
+  const metadata = trustedText.get(value);
+  if (
+    metadata?.owner === owner &&
+    metadata.color === policy.color &&
+    metadata.unicode === policy.unicode
+  ) {
+    return (value as RenderedText).text;
+  }
+  return sanitizeTerminalText(
+    typeof (value as Partial<RenderedText>).text === "string"
+      ? (value as Partial<RenderedText>).text
+      : value
+  );
+}
+
+export interface TerminalEnvironment {
+  readonly [name: string]: string | undefined;
+}
+
+export interface TerminalInput {
+  readonly isTTY?: boolean;
+  readonly isRaw?: boolean;
+  setRawMode?(mode: boolean): void;
+}
+
+export interface TerminalOutput {
+  readonly isTTY?: boolean;
+  readonly columns?: number;
+  readonly rows?: number;
+  write(value: string): unknown;
+  on?(event: "resize", listener: () => void): unknown;
+  off?(event: "resize", listener: () => void): unknown;
+}
+
+export interface TerminalPolicy {
+  inputTTY: boolean;
+  outputTTY: boolean;
+  interactive: boolean;
+  control: boolean;
+  color: boolean;
+  unicode: boolean;
+  columns: number | null;
+  rows: number | null;
+  platform: NodeJS.Platform;
+  wsl: boolean;
+}
+
+export interface TerminalPolicyInput {
+  input: TerminalInput;
+  output: TerminalOutput;
+  env: TerminalEnvironment;
+  platform: NodeJS.Platform;
+}
+
+function enabledEnvironmentFlag(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized !== "" && normalized !== "0" && normalized !== "false" && normalized !== "no";
+}
+
+function positiveDimension(value: number | undefined): number | null {
+  return Number.isSafeInteger(value) && value! > 0 ? value! : null;
+}
+
+export function createTerminalPolicy(source: TerminalPolicyInput): TerminalPolicy {
+  const inputTTY = source.input.isTTY === true;
+  const outputTTY = source.output.isTTY === true;
+  const ci = enabledEnvironmentFlag(source.env.CI);
+  const dumb = source.env.TERM?.trim().toLowerCase() === "dumb";
+  const noColor = Object.prototype.hasOwnProperty.call(source.env, "NO_COLOR");
+  const control = outputTTY && !ci && !dumb;
+  const locale = source.env.LC_ALL ?? source.env.LC_CTYPE ?? source.env.LANG;
+  const utfLocale = locale !== undefined && /utf-?8/i.test(locale);
+  const wsl = source.env.WSL_DISTRO_NAME !== undefined || source.env.WSL_INTEROP !== undefined;
+  const windowsUnicode =
+    source.env.WT_SESSION !== undefined ||
+    source.env.TERM_PROGRAM === "vscode" ||
+    enabledEnvironmentFlag(source.env.ConEmuANSI);
+
+  return {
+    inputTTY,
+    outputTTY,
+    interactive: inputTTY && outputTTY && !ci && !dumb,
+    control,
+    color: control && !noColor,
+    unicode: control && (source.platform === "win32" ? windowsUnicode : utfLocale),
+    columns: positiveDimension(source.output.columns),
+    rows: positiveDimension(source.output.rows),
+    platform: source.platform,
+    wsl,
+  };
+}
+
+export interface GlyphSet {
+  ok: string;
+  disable: string;
+  noop: string;
+  skip: string;
+  fail: string;
+  pending: string;
+  pointer: string;
+  check: string;
+  uncheck: string;
+}
 
 export interface ApplyLike {
   status: "ok" | "noop" | "skipped" | "failed";
 }
 
-/** Status glyph for an apply result. `enabling=false` renders the ok case as a
- *  yellow "disabled/removed" mark. */
-export function statusGlyph(r: ApplyLike, enabling = true): string {
-  if (r.status === "ok") return enabling ? color.green(glyphs.ok) : color.yellow(glyphs.disable);
-  if (r.status === "noop") return color.dim(glyphs.noop);
-  if (r.status === "failed") return color.red(glyphs.fail);
-  return color.dim(glyphs.skip);
-}
-
-// ---- layout helpers ------------------------------------------------------
-
 export const GUTTER = "  ";
 
-export function header(title: string, subtitle?: string): string[] {
-  const out = [color.bold(title)];
-  if (subtitle) out.push(color.dim(subtitle));
-  return out;
+/**
+ * All styling, glyph, and layout decisions derive from this one injected
+ * policy. Trusted terminal sequences can only be created by this class.
+ */
+export class TerminalUi {
+  readonly glyphs: GlyphSet;
+  readonly spinnerFrames: readonly string[];
+  readonly truncationMarker: string;
+  readonly overflowMarker: string;
+
+  constructor(readonly policy: TerminalPolicy, private readonly owner: object = {}) {
+    this.glyphs = policy.unicode
+      ? {
+          ok: "✔", disable: "−", noop: "=", skip: "·", fail: "✖",
+          pending: "·", pointer: "❯", check: "◉", uncheck: "◯",
+        }
+      : {
+          ok: "+", disable: "-", noop: "=", skip: "~", fail: "x",
+          pending: ".", pointer: ">", check: "[x]", uncheck: "[ ]",
+        };
+    this.spinnerFrames = policy.unicode
+      ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+      : ["-", "\\", "|", "/"];
+    this.truncationMarker = policy.unicode ? "…" : "...";
+    this.overflowMarker = policy.unicode ? "…" : ".";
+  }
+
+  text(value: unknown): RenderedText {
+    return rendered(sanitizeTerminalText(value), this.owner, this.policy);
+  }
+
+  private style(open: number, value: unknown): RenderedText {
+    const text = sanitizeTerminalText(value);
+    return rendered(
+      this.policy.color ? `\x1b[${open}m${text}\x1b[0m` : text,
+      this.owner,
+      this.policy
+    );
+  }
+
+  readonly color = {
+    dim: (value: unknown) => this.style(2, value),
+    bold: (value: unknown) => this.style(1, value),
+    green: (value: unknown) => this.style(32, value),
+    yellow: (value: unknown) => this.style(33, value),
+    red: (value: unknown) => this.style(31, value),
+    cyan: (value: unknown) => this.style(36, value),
+  };
+
+  line(...parts: readonly unknown[]): RenderedText {
+    return rendered(
+      parts.map((part) => serialize(part, this.owner, this.policy)).join(""),
+      this.owner,
+      this.policy
+    );
+  }
+
+  statusGlyph(result: ApplyLike, enabling = true): RenderedText {
+    if (result.status === "ok") {
+      return enabling ? this.color.green(this.glyphs.ok) : this.color.yellow(this.glyphs.disable);
+    }
+    if (result.status === "noop") return this.color.dim(this.glyphs.noop);
+    if (result.status === "failed") return this.color.red(this.glyphs.fail);
+    return this.color.dim(this.glyphs.skip);
+  }
+
+  header(title: unknown, subtitle?: unknown): RenderedText[] {
+    const output = [this.color.bold(title)];
+    if (subtitle !== undefined) output.push(this.color.dim(subtitle));
+    return output;
+  }
+
+  row(glyph: unknown, label: unknown, detail?: unknown, hint?: unknown): RenderedText {
+    const parts: unknown[] = [GUTTER, glyph, " ", label];
+    if (detail !== undefined) parts.push(": ", this.color.dim(detail));
+    if (hint !== undefined) parts.push("  ", this.color.dim(`(${sanitizeTerminalText(hint)})`));
+    return this.line(...parts);
+  }
+
+  keyHint(key: unknown, action: unknown): RenderedText {
+    return this.line(this.color.bold(key), " ", action);
+  }
+
+  footer(hints: readonly unknown[]): RenderedText[] {
+    return [
+      this.text(""),
+      this.color.dim(hints.map((hint) => sanitizeTerminalText(hint)).join("  |  ")),
+    ];
+  }
+
+  frame(parts: {
+    header: readonly RenderedText[];
+    body: readonly RenderedText[];
+    footer?: readonly RenderedText[];
+  }): RenderedText[] {
+    const output = [...parts.header, this.text(""), ...parts.body];
+    if (parts.footer?.length) output.push(...parts.footer);
+    return output;
+  }
+
+  truncate(value: unknown, width: number): string {
+    return truncateText(value, width, { marker: this.truncationMarker });
+  }
+
+  wrap(value: unknown, width: number): string[] {
+    return wrapText(value, width, { overflowMarker: this.overflowMarker });
+  }
+
+  table<Row>(
+    columns: readonly TableColumn<Row>[],
+    rows: readonly Row[],
+    width: number
+  ): string[] {
+    return renderTable(columns, rows, width, {
+      unicode: this.policy.unicode,
+      truncationMarker: this.truncationMarker,
+      overflowMarker: this.overflowMarker,
+    });
+  }
+
+  rule(width: number): string {
+    return renderRule(width, { unicode: this.policy.unicode });
+  }
+
+  panel(body: readonly unknown[], width: number, title?: string): string[] {
+    return renderPanel(body, width, {
+      title,
+      unicode: this.policy.unicode,
+      truncationMarker: this.truncationMarker,
+      overflowMarker: this.overflowMarker,
+    });
+  }
+
+  settledRow(value: DisplayRow, width: number, status: ApplyLike["status"] = "ok"): string {
+    return renderDisplayRow(
+      {
+        ...value,
+        marker: serialize(this.statusGlyph({ status }), this.owner, this.policy),
+      },
+      width,
+      { truncationMarker: this.truncationMarker }
+    );
+  }
+
+  liveRow(value: DisplayRow, width: number, frameIndex: number): string {
+    if (!Number.isSafeInteger(frameIndex)) throw new RangeError("frame index must be a safe integer");
+    const index =
+      ((frameIndex % this.spinnerFrames.length) + this.spinnerFrames.length) %
+      this.spinnerFrames.length;
+    return renderDisplayRow(
+      { ...value, marker: this.spinnerFrames[index]! },
+      width,
+      { truncationMarker: this.truncationMarker }
+    );
+  }
 }
 
-export function row(glyph: string, label: string, detail?: string, hint?: string): string {
-  let s = `${GUTTER}${glyph} ${label}`;
-  if (detail) s += `: ${color.dim(detail)}`;
-  if (hint) s += `  ${color.dim(`(${hint})`)}`;
-  return s;
+export function stripAnsi(value: string): string {
+  return stripTerminalSequences(value);
 }
 
-export function keyHint(key: string, action: string): string {
-  return `${color.bold(key)} ${action}`;
+function visualRows(line: string, columns: number | null): number {
+  if (columns === null) return 1;
+  return Math.max(1, Math.ceil(displayWidth(stripTerminalSequences(line)) / columns));
 }
 
-export function footer(hints: string[]): string[] {
-  return ["", color.dim(hints.join("  |  "))];
+interface RestorableTerminal {
+  restore(): void;
 }
 
-/** Assemble a whole screen with consistent spacing: one blank after the header,
- *  one blank before the footer. */
-export function frame(parts: { header: string[]; body: string[]; footer?: string[] }): string[] {
-  const out = [...parts.header, "", ...parts.body];
-  if (parts.footer && parts.footer.length) out.push(...parts.footer);
-  return out;
+const activeTerminals = new Set<RestorableTerminal>();
+let processHooksInstalled = false;
+
+function restoreAllTerminals(): void {
+  for (const terminal of [...activeTerminals]) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        terminal.restore();
+        break;
+      } catch {
+        // Retry once because restoration keeps failed resources owned.
+      }
+    }
+  }
 }
 
-// ---- misc helpers --------------------------------------------------------
-
-const ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]/g;
-export function stripAnsi(s: string): string {
-  return s.replace(ANSI_RE, "");
+function handleTermination(signal: NodeJS.Signals): void {
+  restoreAllTerminals();
+  process.removeListener("SIGINT", handleSigint);
+  process.removeListener("SIGTERM", handleSigterm);
+  process.kill(process.pid, signal);
 }
 
-export function clearAndHome(): void {
-  if (isTTY) process.stdout.write("\x1b[2J\x1b[H");
+function handleSigint(): void {
+  handleTermination("SIGINT");
 }
 
-/** Visual row count of a rendered line, accounting for wrap at terminal width. */
-function visualRows(line: string, cols: number): number {
-  const len = stripAnsi(line).length;
-  if (cols <= 0) return 1;
-  return Math.max(1, Math.ceil(len / cols));
+function handleSigterm(): void {
+  handleTermination("SIGTERM");
 }
 
-// ---- Frame: in-place redraw of a tracked region --------------------------
+function installProcessHooks(): void {
+  if (processHooksInstalled) return;
+  processHooksInstalled = true;
+  process.once("exit", restoreAllTerminals);
+  process.on("SIGINT", handleSigint);
+  process.on("SIGTERM", handleSigterm);
+}
 
-let cursorRestoreHooked = false;
-function hookCursorRestore(): void {
-  if (cursorRestoreHooked) return;
-  cursorRestoreHooked = true;
-  const restore = () => {
+function uninstallProcessHooks(): void {
+  if (!processHooksInstalled) return;
+  process.removeListener("exit", restoreAllTerminals);
+  process.removeListener("SIGINT", handleSigint);
+  process.removeListener("SIGTERM", handleSigterm);
+  processHooksInstalled = false;
+}
+
+function registerTerminal(terminal: RestorableTerminal): void {
+  const wasEmpty = activeTerminals.size === 0;
+  activeTerminals.add(terminal);
+  if (wasEmpty) installProcessHooks();
+}
+
+function unregisterTerminal(terminal: RestorableTerminal): void {
+  activeTerminals.delete(terminal);
+  if (activeTerminals.size === 0) uninstallProcessHooks();
+}
+
+export interface FrameOptions {
+  policy: TerminalPolicyInput;
+  manageProcessSignals?: boolean;
+}
+
+export type FrameRedraw = (
+  ui: TerminalUi,
+  policy: TerminalPolicy
+) => readonly unknown[];
+
+/**
+ * In-place renderer for one tracked terminal region. Resize starts a fresh
+ * owned region below the prior settled render, avoiding unsafe cursor movement
+ * after terminal reflow.
+ */
+export class Frame implements RestorableTerminal {
+  private readonly policyInput: TerminalPolicyInput;
+  private readonly manageProcessSignals: boolean;
+  private readonly styleOwner = {};
+  private lastLines: readonly string[] = [];
+  private redraw: FrameRedraw | null = null;
+  private cursorHidden = false;
+  private rawModeBefore: boolean | undefined;
+  private rawModeOwned = false;
+  private resizeListenerOwned = false;
+
+  constructor(options: FrameOptions) {
+    this.policyInput = options.policy;
+    this.manageProcessSignals =
+      options.manageProcessSignals ?? options.policy.output === process.stdout;
+  }
+
+  get policy(): TerminalPolicy {
+    return createTerminalPolicy(this.policyInput);
+  }
+
+  get ui(): TerminalUi {
+    return this.uiFor(this.policy);
+  }
+
+  private uiFor(policy: TerminalPolicy): TerminalUi {
+    return new TerminalUi(policy, this.styleOwner);
+  }
+
+  private startLifecycle(): void {
+    if (this.manageProcessSignals) registerTerminal(this);
+    const output = this.policyInput.output;
+    if (!this.resizeListenerOwned && output.on && output.off) {
+      this.resizeListenerOwned = true;
+      output.on("resize", this.onResize);
+    }
+  }
+
+  private showCursor(): void {
+    if (!this.cursorHidden) return;
+    this.policyInput.output.write(CURSOR_SHOW);
+    this.cursorHidden = false;
+  }
+
+  private readonly onResize = (): void => {
+    if (this.lastLines.length === 0 && !this.redraw) return;
     try {
-      if (isTTY) process.stdout.write(cursorShow);
-    } catch {
-      /* ignore */
+      // Never move upward through reflowed content. Settle it as scrollback and
+      // ask the model to lay out a new owned region using the new policy.
+      this.showCursor();
+      this.lastLines = [];
+      if (this.redraw) {
+        const policy = this.policy;
+        this.renderResolved(this.redraw(this.uiFor(policy), policy), policy);
+      }
+    } catch (error) {
+      try {
+        this.restore();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "terminal resize redraw and cleanup failed");
+      }
+      throw error;
     }
   };
-  process.on("exit", restore);
-  process.on("SIGINT", () => {
-    restore();
-    process.exit(130);
-  });
-}
 
-export class Frame {
-  private lastRows = 0;
-  constructor(private stream: NodeJS.WriteStream = process.stdout) {}
-
-  render(lines: string[]): void {
-    if (!isTTY) {
-      // Non-interactive: write once as plain lines, no erase/cursor codes.
-      this.stream.write(lines.join("\n") + "\n");
+  enterRawMode(): void {
+    const input = this.policyInput.input;
+    if (
+      !this.policy.interactive ||
+      !input.setRawMode ||
+      typeof input.isRaw !== "boolean" ||
+      this.rawModeOwned
+    ) {
       return;
     }
-    hookCursorRestore();
-    const cols = this.stream.columns || 80;
-    if (this.lastRows > 0) this.stream.write(eraseLines(this.lastRows + 1));
-    this.stream.write(cursorHide);
-    this.stream.write(lines.join("\n") + "\n");
-    this.lastRows = lines.reduce((n, l) => n + visualRows(l, cols), 0);
+    try {
+      this.startLifecycle();
+      this.rawModeBefore = input.isRaw;
+      this.rawModeOwned = true;
+      input.setRawMode(true);
+    } catch (error) {
+      this.cleanupAfterFailure(error, "raw-mode setup and cleanup failed");
+    }
   }
 
-  done(finalLines?: string[]): void {
-    if (finalLines) this.render(finalLines);
-    if (isTTY) this.stream.write(cursorShow);
-    this.lastRows = 0;
+  private clearOwnedRegion(): void {
+    if (this.lastLines.length === 0) return;
+    const rows = this.lastLines.reduce(
+      (count, line) => count + visualRows(line, this.policy.columns),
+      0
+    );
+    this.policyInput.output.write(`\x1b[${rows}A${CURSOR_LEFT}${ERASE_TO_END}`);
   }
+
+  private renderFresh(lines: readonly string[]): void {
+    const output = this.policyInput.output;
+    if (!this.cursorHidden) {
+      this.cursorHidden = true;
+      output.write(CURSOR_HIDE);
+    }
+    output.write(lines.join("\r\n") + "\r\n");
+    this.lastLines = lines;
+  }
+
+  private renderResolved(lines: readonly unknown[], policy = this.policy): void {
+    const safeLines = lines.map((line) => serialize(line, this.styleOwner, policy));
+    if (!policy.control) {
+      this.policyInput.output.write(safeLines.join("\n") + "\n");
+      return;
+    }
+    try {
+      this.startLifecycle();
+      this.clearOwnedRegion();
+      this.renderFresh(safeLines);
+    } catch (error) {
+      this.cleanupAfterFailure(error, "terminal render and cleanup failed");
+    }
+  }
+
+  /** Render a settled value. It is not replayed after resize. */
+  render(lines: readonly unknown[]): void {
+    this.redraw = null;
+    this.renderResolved(lines);
+  }
+
+  /** Render live state and recompute it from the model after every resize. */
+  renderModel(redraw: FrameRedraw): void {
+    this.redraw = redraw;
+    const policy = this.policy;
+    let lines: readonly unknown[];
+    try {
+      lines = redraw(this.uiFor(policy), policy);
+    } catch (error) {
+      this.cleanupAfterFailure(error, "terminal model render and cleanup failed");
+    }
+    this.renderResolved(lines, policy);
+  }
+
+  private cleanupAfterFailure(error: unknown, message: string): never {
+    try {
+      this.restore();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], message);
+    }
+    throw error;
+  }
+
+  clearToEnd(): void {
+    if (this.policy.control) this.policyInput.output.write(CURSOR_LEFT + ERASE_TO_END);
+  }
+
+  done(finalLines?: readonly unknown[]): void {
+    if (finalLines) this.render(finalLines);
+    this.redraw = null;
+    this.restore();
+  }
+
+  cancel(finalLines?: readonly unknown[]): void {
+    this.done(finalLines);
+  }
+
+  fail(finalLines?: readonly unknown[]): void {
+    this.done(finalLines);
+  }
+
+  restore(): void {
+    const errors: unknown[] = [];
+    const input = this.policyInput.input;
+    const output = this.policyInput.output;
+    if (this.rawModeOwned && input.setRawMode) {
+      try {
+        input.setRawMode(this.rawModeBefore!);
+        this.rawModeOwned = false;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (this.cursorHidden) {
+      try {
+        output.write(CURSOR_SHOW);
+        this.cursorHidden = false;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (this.resizeListenerOwned && output.off) {
+      try {
+        output.off("resize", this.onResize);
+        this.resizeListenerOwned = false;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    this.lastLines = [];
+    this.redraw = null;
+    if (!this.rawModeOwned && !this.cursorHidden && !this.resizeListenerOwned) {
+      unregisterTerminal(this);
+    }
+    if (errors.length > 0) throw new AggregateError(errors, "terminal restoration failed");
+  }
+}
+
+export async function withTerminalFrame<Value>(
+  frame: Frame,
+  operation: (frame: Frame) => Promise<Value> | Value
+): Promise<Value> {
+  let result: Value;
+  try {
+    result = await operation(frame);
+  } catch (error) {
+    try {
+      frame.restore();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "terminal operation and cleanup failed");
+    }
+    throw error;
+  }
+  frame.restore();
+  return result;
 }

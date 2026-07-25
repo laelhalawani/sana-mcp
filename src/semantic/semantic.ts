@@ -2,90 +2,371 @@
 // dependencies and are only loaded when semantic search is enabled AND used,
 // so a base install pays no RAM/CPU cost. Enable with SANA_SEMANTIC=1.
 import path from "node:path";
-import type { Database } from "bun:sqlite";
-import { DATA_DIR } from "../config.js";
+import { SQLiteError, type Database } from "bun:sqlite";
+import { dataDirectory } from "../config.js";
+import { RUNTIME_ENV } from "../runtime/env.js";
+import { BUILD_INFO, type SemanticCapability } from "../runtime/build-info.js";
 import type { Bindings } from "../store/db.js";
 
-export const EMBED_MODEL = process.env.SANA_EMBED_MODEL ?? "Xenova/all-MiniLM-L6-v2";
-export const EMBED_DIM = Number(process.env.SANA_EMBED_DIM ?? 384);
+export const EMBED_MODEL = RUNTIME_ENV.embedModel;
+export const EMBED_DIM = RUNTIME_ENV.embedDimension;
 // Lines shorter than this many words are too noisy to embed and are skipped.
-const MIN_WORDS = Number(process.env.SANA_EMBED_MIN_WORDS ?? 5);
-const MODELS_DIR = path.join(DATA_DIR, "models");
+const MIN_WORDS = RUNTIME_ENV.embedMinWords;
 // Warm load is ~150ms, so we keep the model in RAM only briefly after use.
-const IDLE_UNLOAD_MS = Number(process.env.SANA_EMBED_IDLE_MS ?? 60_000);
+const IDLE_UNLOAD_MS = RUNTIME_ENV.embedIdleMs;
 
-export function semanticEnabled(): boolean {
-  return /^(1|true|yes|on)$/i.test(process.env.SANA_SEMANTIC ?? "");
+export interface SemanticUnavailableContext {
+  readonly operation:
+    | "transformers-import"
+    | "model-initialization"
+    | "embedding-output"
+    | "sqlite-vec-import"
+    | "sqlite-vec-load"
+    | "sqlite-vec-schema";
+  readonly model?: string;
+  readonly expectedDimension?: number;
+  readonly actualDimension?: number | null;
+  readonly expectedBatchSize?: number;
+  readonly actualBatchSize?: number | null;
+  readonly expectedValueCount?: number;
+  readonly actualValueCount?: number | null;
 }
 
 export class SemanticUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly context?: SemanticUnavailableContext;
+
+  constructor(
+    message: string,
+    options: { readonly cause?: unknown; readonly context?: SemanticUnavailableContext } = {},
+  ) {
+    super(message, "cause" in options ? { cause: options.cause } : undefined);
     this.name = "SemanticUnavailableError";
+    this.context = options.context;
   }
+}
+
+export type SemanticCapabilityState =
+  | Readonly<{ kind: "disabled" }>
+  | Readonly<{ kind: "available" }>
+  | Readonly<{ kind: "unsupported"; message: string }>;
+
+export function resolveSemanticCapability(
+  requested: boolean,
+  capability: SemanticCapability,
+): SemanticCapabilityState {
+  if (!requested) return { kind: "disabled" };
+  if (capability === "source-semantic") return { kind: "available" };
+  return {
+    kind: "unsupported",
+    message:
+      "This standalone build supports keyword search only; semantic search is available from source builds.",
+  };
+}
+
+export function semanticCapabilityState(): SemanticCapabilityState {
+  return resolveSemanticCapability(
+    RUNTIME_ENV.semanticEnabled,
+    BUILD_INFO.semanticCapability,
+  );
+}
+
+export function semanticEnabled(): boolean {
+  const state = semanticCapabilityState();
+  return state.kind === "available";
 }
 
 // ---- embedding model (lazy, idle-unloaded) --------------------------------
 
-interface Pipe {
-  (texts: string[], opts: Record<string, unknown>): Promise<{ data: Float32Array; dims: number[] }>;
+export interface EmbeddingOutput {
+  readonly data: Float32Array;
+  readonly dims: readonly number[];
+}
+
+export interface EmbeddingPipe {
+  (texts: string[], opts: Record<string, unknown>): Promise<EmbeddingOutput>;
   dispose?: () => Promise<void> | void;
 }
-let pipePromise: Promise<Pipe> | null = null;
-let pipeRef: Pipe | null = null;
-let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
-async function loadPipe(): Promise<Pipe> {
-  let mod: typeof import("@huggingface/transformers");
+export interface TransformersModule {
+  readonly env: {
+    cacheDir: string;
+    allowRemoteModels: boolean;
+  };
+  readonly pipeline: (
+    task: "feature-extraction",
+    model: string,
+    options: { readonly dtype: "q8" },
+  ) => Promise<unknown>;
+}
+
+function unavailable(
+  message: string,
+  context: SemanticUnavailableContext,
+  cause: unknown,
+): SemanticUnavailableError {
+  return new SemanticUnavailableError(message, { cause, context });
+}
+
+export async function loadEmbeddingPipe(
+  importTransformers: () => Promise<TransformersModule>,
+): Promise<EmbeddingPipe> {
+  let mod: TransformersModule;
   try {
-    mod = await import("@huggingface/transformers");
-  } catch {
-    throw new SemanticUnavailableError(
-      'Semantic search dependencies are not installed. Run: npm install @huggingface/transformers sqlite-vec'
+    mod = await importTransformers();
+  } catch (cause) {
+    throw unavailable(
+      "Semantic search dependencies are not installed. Run: bun install",
+      { operation: "transformers-import", model: EMBED_MODEL },
+      cause,
     );
   }
-  const { pipeline, env } = mod;
-  env.cacheDir = MODELS_DIR;
-  env.allowRemoteModels = true;
-  const pipe = (await pipeline("feature-extraction", EMBED_MODEL, {
-    dtype: "q8",
-  })) as unknown as Pipe;
-  pipeRef = pipe;
-  return pipe;
+
+  try {
+    const { pipeline, env } = mod;
+    env.cacheDir = path.join(dataDirectory(), "models");
+    env.allowRemoteModels = true;
+    const pipe = await pipeline("feature-extraction", EMBED_MODEL, {
+      dtype: "q8",
+    });
+    if (typeof pipe !== "function") {
+      throw new TypeError("the feature-extraction pipeline is not callable");
+    }
+    return pipe as EmbeddingPipe;
+  } catch (cause) {
+    throw unavailable(
+      `Could not initialize semantic embedding model "${EMBED_MODEL}". Check model access and the local model cache, then retry.`,
+      {
+        operation: "model-initialization",
+        model: EMBED_MODEL,
+        expectedDimension: EMBED_DIM,
+      },
+      cause,
+    );
+  }
 }
+
+async function loadPipe(): Promise<EmbeddingPipe> {
+  return loadEmbeddingPipe(
+    async () => (await import("@huggingface/transformers")) as TransformersModule,
+  );
+}
+
+function outputError(
+  problem: string,
+  context: Omit<SemanticUnavailableContext, "operation" | "model">,
+): SemanticUnavailableError {
+  return unavailable(
+    `Semantic embedding output from model "${EMBED_MODEL}" is incompatible: ${problem}.`,
+    {
+      operation: "embedding-output",
+      model: EMBED_MODEL,
+      expectedDimension: EMBED_DIM,
+      ...context,
+    },
+    new Error(problem),
+  );
+}
+
+/** Validate and split the pooled transformer output into one vector per input. */
+export function validateEmbeddingOutput(
+  output: unknown,
+  batchSize: number,
+): Float32Array[] {
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+    throw outputError(`the requested batch size ${String(batchSize)} is invalid`, {
+      expectedBatchSize: batchSize,
+      actualBatchSize: null,
+      actualDimension: null,
+      actualValueCount: null,
+    });
+  }
+  const expectedValueCount = batchSize * EMBED_DIM;
+  if (
+    typeof output !== "object" ||
+    output === null ||
+    !("dims" in output) ||
+    !Array.isArray(output.dims)
+  ) {
+    throw outputError("the output shape is missing", {
+      expectedBatchSize: batchSize,
+      actualBatchSize: null,
+      actualDimension: null,
+      expectedValueCount,
+      actualValueCount: null,
+    });
+  }
+
+  const dims = output.dims;
+  const actualBatchSize =
+    dims.length >= 1 && Number.isInteger(dims[0]) && dims[0] > 0 ? dims[0] : null;
+  const actualDimension =
+    dims.length >= 2 && Number.isInteger(dims[1]) && dims[1] > 0 ? dims[1] : null;
+  if (
+    dims.length !== 2 ||
+    actualBatchSize !== batchSize ||
+    actualDimension !== EMBED_DIM
+  ) {
+    const renderedShape = `[${dims
+      .map((value) => (typeof value === "number" ? String(value) : typeof value))
+      .join(", ")}]`;
+    throw outputError(
+      `expected shape [${batchSize}, ${EMBED_DIM}], received ${renderedShape}`,
+      {
+        expectedBatchSize: batchSize,
+        actualBatchSize,
+        actualDimension,
+        expectedValueCount,
+        actualValueCount:
+          "data" in output && output.data instanceof Float32Array
+            ? output.data.length
+            : null,
+      },
+    );
+  }
+
+  if (!("data" in output) || !(output.data instanceof Float32Array)) {
+    throw outputError("the vector data is not a Float32Array", {
+      expectedBatchSize: batchSize,
+      actualBatchSize,
+      actualDimension,
+      expectedValueCount,
+      actualValueCount: null,
+    });
+  }
+  const flat = output.data;
+  if (flat.length !== expectedValueCount) {
+    throw outputError(
+      `expected ${expectedValueCount} vector values, received ${flat.length}`,
+      {
+        expectedBatchSize: batchSize,
+        actualBatchSize,
+        actualDimension,
+        expectedValueCount,
+        actualValueCount: flat.length,
+      },
+    );
+  }
+  for (let index = 0; index < flat.length; index++) {
+    if (!Number.isFinite(flat[index])) {
+      throw outputError(`vector value ${index} is not finite`, {
+        expectedBatchSize: batchSize,
+        actualBatchSize,
+        actualDimension,
+        expectedValueCount,
+        actualValueCount: flat.length,
+      });
+    }
+  }
+
+  const rows: Float32Array[] = [];
+  for (let index = 0; index < batchSize; index++) {
+    rows.push(flat.slice(index * EMBED_DIM, (index + 1) * EMBED_DIM));
+  }
+  return rows;
+}
+
+export interface EmbeddingRuntime {
+  embed(texts: string[]): Promise<Float32Array[]>;
+  unload(): Promise<void>;
+}
+
+export interface EmbeddingRuntimeOptions {
+  readonly load: () => Promise<EmbeddingPipe>;
+  readonly idleMs: number;
+  readonly setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  readonly clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
+/** Create the small lazy-load lifecycle used by production and deterministic tests. */
+export function createEmbeddingRuntime(options: EmbeddingRuntimeOptions): EmbeddingRuntime {
+  const setTimer = options.setTimer ?? setTimeout;
+  const clearTimer = options.clearTimer ?? clearTimeout;
+  let pipePromise: Promise<EmbeddingPipe> | null = null;
+  let pipeRef: EmbeddingPipe | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let activeEmbeds = 0;
+  let unloadPending = false;
+
+  const clearIdleTimer = (): void => {
+    if (idleTimer !== null) clearTimer(idleTimer);
+    idleTimer = null;
+  };
+
+  const getPipe = (): Promise<EmbeddingPipe> => {
+    if (pipePromise) return pipePromise;
+    const attempt = options.load();
+    pipePromise = attempt;
+    void attempt.then(
+      (pipe) => {
+        if (pipePromise === attempt) pipeRef = pipe;
+      },
+      () => {
+        if (pipePromise === attempt) {
+          pipePromise = null;
+          pipeRef = null;
+        }
+      },
+    );
+    return attempt;
+  };
+
+  const unload = async (): Promise<void> => {
+    clearIdleTimer();
+    if (activeEmbeds > 0) {
+      unloadPending = true;
+      return;
+    }
+    unloadPending = false;
+    const pipe = pipeRef;
+    pipePromise = null;
+    pipeRef = null;
+    if (pipe?.dispose) {
+      try {
+        await pipe.dispose();
+      } catch {
+        // Disposal is best-effort; the model has already been detached.
+      }
+    }
+  };
+
+  const scheduleUnload = (): void => {
+    clearIdleTimer();
+    idleTimer = setTimer(() => void unload(), options.idleMs);
+    idleTimer.unref?.();
+  };
+
+  return {
+    async embed(texts: string[]): Promise<Float32Array[]> {
+      clearIdleTimer();
+      activeEmbeds++;
+      try {
+        const pipe = await getPipe();
+        const output = await pipe(texts, { pooling: "mean", normalize: true });
+        return validateEmbeddingOutput(output, texts.length);
+      } finally {
+        activeEmbeds--;
+        if (activeEmbeds === 0) {
+          if (unloadPending) void unload();
+          else scheduleUnload();
+        }
+      }
+    },
+    unload,
+  };
+}
+
+const embeddingRuntime = createEmbeddingRuntime({
+  load: loadPipe,
+  idleMs: IDLE_UNLOAD_MS,
+});
 
 /** Free the model from RAM. Called automatically after an idle period. */
 export async function unloadModel(): Promise<void> {
-  if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = null;
-  const p = pipeRef;
-  pipePromise = null;
-  pipeRef = null;
-  if (p?.dispose) {
-    try {
-      await p.dispose();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function scheduleUnload(): void {
-  if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => void unloadModel(), IDLE_UNLOAD_MS);
-  idleTimer.unref?.();
+  await embeddingRuntime.unload();
 }
 
 async function embed(texts: string[]): Promise<Float32Array[]> {
-  if (!pipePromise) pipePromise = loadPipe();
-  const pipe = await pipePromise;
-  const out = await pipe(texts, { pooling: "mean", normalize: true });
-  scheduleUnload(); // reset the idle timer on every use
-  const dim = out.dims[out.dims.length - 1];
-  const flat = out.data;
-  const rows: Float32Array[] = [];
-  for (let i = 0; i < texts.length; i++) rows.push(flat.slice(i * dim, (i + 1) * dim));
-  return rows;
+  return embeddingRuntime.embed(texts);
 }
 
 const toBuf = (v: Float32Array): Buffer => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
@@ -98,26 +379,106 @@ export async function embedQuery(text: string): Promise<Buffer> {
 
 // ---- sqlite-vec storage (lazy) -------------------------------------------
 
-const vecLoaded = new WeakSet<Database>();
+interface SqliteVecModule {
+  load(db: Database): void;
+}
+
+function isMissingVecModule(cause: unknown): boolean {
+  if (
+    !(cause instanceof SQLiteError) ||
+    cause.message !== "no such module: vec0"
+  ) {
+    return false;
+  }
+  return cause.errno === 1;
+}
+
+export function createVectorExtensionRuntime(
+  importSqliteVec: () => Promise<SqliteVecModule>,
+): (
+  db: Database,
+  fence?: <Value>(operation: () => Value) => Value,
+) => Promise<void> {
+  const extensionLoaded = new WeakSet<Database>();
+  const ready = new WeakSet<Database>();
+  const pending = new WeakMap<Database, Promise<void>>();
+  return async (
+    db: Database,
+    fence?: <Value>(operation: () => Value) => Value,
+  ): Promise<void> => {
+    if (ready.has(db)) return;
+    const existing = pending.get(db);
+    if (existing) return existing;
+
+    const initialization = (async (): Promise<void> => {
+      if (!extensionLoaded.has(db)) {
+        let sqliteVec: SqliteVecModule;
+        try {
+          sqliteVec = await importSqliteVec();
+        } catch (cause) {
+          throw unavailable(
+            "Semantic search dependencies are not installed. Run: bun install",
+            { operation: "sqlite-vec-import" },
+            cause,
+          );
+        }
+        try {
+          const load = () => sqliteVec.load(db);
+          if (fence) fence(load);
+          else load();
+        } catch (cause) {
+          throw unavailable(
+            "Could not load the sqlite-vec extension for semantic search. Check that sqlite-vec supports this platform and runtime.",
+            { operation: "sqlite-vec-load" },
+            cause,
+          );
+        }
+        extensionLoaded.add(db);
+      }
+      try {
+        const createSchema = () =>
+          db.exec(
+            `CREATE VIRTUAL TABLE IF NOT EXISTS vec_lines USING vec0(
+               embedding float[${EMBED_DIM}], meeting_id TEXT, line_no INTEGER, created_at INTEGER
+             )`,
+          );
+        if (fence) fence(createSchema);
+        else createSchema();
+      } catch (cause) {
+        if (isMissingVecModule(cause)) {
+          throw unavailable(
+            `Could not initialize semantic vector storage because sqlite-vec did not register the vec0 module.`,
+            {
+              operation: "sqlite-vec-schema",
+              model: EMBED_MODEL,
+              expectedDimension: EMBED_DIM,
+            },
+            cause,
+          );
+        }
+        throw cause;
+      }
+      ready.add(db);
+    })();
+    pending.set(db, initialization);
+    try {
+      await initialization;
+    } finally {
+      if (pending.get(db) === initialization) pending.delete(db);
+    }
+  };
+}
+
+const ensureVectorExtension = createVectorExtensionRuntime(
+  async () => import("sqlite-vec"),
+);
 
 /** Load the sqlite-vec extension into a connection and ensure the table. */
-export async function ensureVec(db: Database): Promise<void> {
-  if (vecLoaded.has(db)) return;
-  let sqliteVec: typeof import("sqlite-vec");
-  try {
-    sqliteVec = await import("sqlite-vec");
-  } catch {
-    throw new SemanticUnavailableError(
-      'Semantic search dependencies are not installed. Run: npm install @huggingface/transformers sqlite-vec'
-    );
-  }
-  sqliteVec.load(db);
-  db.exec(
-    `CREATE VIRTUAL TABLE IF NOT EXISTS vec_lines USING vec0(
-       embedding float[${EMBED_DIM}], meeting_id TEXT, line_no INTEGER, created_at INTEGER
-     )`
-  );
-  vecLoaded.add(db);
+export async function ensureVec(
+  db: Database,
+  fence?: <Value>(operation: () => Value) => Value,
+): Promise<void> {
+  await ensureVectorExtension(db, fence);
 }
 
 /** Embed a meeting's lines (skipping trivially short ones) and store vectors. */
@@ -125,12 +486,17 @@ export async function embedMeeting(
   db: Database,
   meetingId: string,
   createdAtMs: number,
-  lines: { n: number; text: string }[]
+  lines: { n: number; text: string }[],
+  commit: <Value>(write: () => Value) => Value,
 ): Promise<void> {
-  await ensureVec(db);
+  await ensureVec(db, commit);
   const usable = lines.filter((l) => l.text.split(/\s+/).length >= MIN_WORDS);
-  db.prepare(`DELETE FROM vec_lines WHERE meeting_id = ?`).run(meetingId);
-  if (usable.length === 0) return;
+  if (usable.length === 0) {
+    commit(() => {
+      db.prepare(`DELETE FROM vec_lines WHERE meeting_id = ?`).run(meetingId);
+    });
+    return;
+  }
 
   const ins = db.prepare(
     `INSERT INTO vec_lines(embedding, meeting_id, line_no, created_at) VALUES (?, ?, ?, ?)`
@@ -139,12 +505,17 @@ export async function embedMeeting(
   for (let i = 0; i < usable.length; i += BATCH) {
     const slice = usable.slice(i, i + BATCH);
     const vecs = await embed(slice.map((l) => l.text));
-    const tx = db.transaction(() => {
-      for (let j = 0; j < slice.length; j++) {
-        ins.run(toBuf(vecs[j]), meetingId, BigInt(slice[j].n), BigInt(createdAtMs));
+    commit(() => {
+      if (i === 0) {
+        db.prepare(`DELETE FROM vec_lines WHERE meeting_id = ?`).run(meetingId);
       }
+      const tx = db.transaction(() => {
+        for (let j = 0; j < slice.length; j++) {
+          ins.run(toBuf(vecs[j]), meetingId, BigInt(slice[j].n), BigInt(createdAtMs));
+        }
+      });
+      tx();
     });
-    tx();
   }
 }
 
@@ -152,9 +523,14 @@ export async function embedMeeting(
 export async function searchKnn(
   db: Database,
   queryVec: Buffer,
-  opts: { k: number; dateFrom?: number; dateTo?: number }
+  opts: {
+    k: number;
+    dateFrom?: number;
+    dateTo?: number;
+    fence?: <Value>(operation: () => Value) => Value;
+  }
 ): Promise<{ meeting_id: string; line_no: number; distance: number }[]> {
-  await ensureVec(db);
+  await ensureVec(db, opts.fence);
   const clauses = ["embedding MATCH @q"];
   const params: Bindings = { q: queryVec, k: BigInt(Math.max(1, opts.k)) };
   if (opts.dateFrom != null) {
@@ -165,10 +541,16 @@ export async function searchKnn(
     clauses.push("created_at <= @to");
     params.to = BigInt(opts.dateTo);
   }
-  return db
-    .prepare(
-      `SELECT meeting_id, CAST(line_no AS INTEGER) AS line_no, distance
-       FROM vec_lines WHERE ${clauses.join(" AND ")} AND k = @k ORDER BY distance`
-    )
-    .all(params) as { meeting_id: string; line_no: number; distance: number }[];
+  const read = () =>
+    db
+      .prepare(
+        `SELECT meeting_id, CAST(line_no AS INTEGER) AS line_no, distance
+         FROM vec_lines WHERE ${clauses.join(" AND ")} AND k = @k ORDER BY distance`,
+      )
+      .all(params) as {
+      meeting_id: string;
+      line_no: number;
+      distance: number;
+    }[];
+  return opts.fence ? opts.fence(read) : read();
 }

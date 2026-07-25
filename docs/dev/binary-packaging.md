@@ -1,3 +1,10 @@
+---
+status: historical
+scope: earlier packaging and implementation-language study
+last_verified: 2026-07-24
+authority: context only; remediation-plan.md controls distribution
+---
+
 # sana-mcp - binary packaging study
 
 How to ship sana-mcp as one native binary per OS/arch, hosted free on GitHub

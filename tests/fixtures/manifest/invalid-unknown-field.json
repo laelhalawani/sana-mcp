@@ -1,0 +1,19 @@
+{
+  "manifestVersion": 1,
+  "packageVersion": "0.3.2",
+  "releaseTag": "v0.3.2",
+  "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+  "installerProtocol": 1,
+  "lifecycleProtocol": 1,
+  "inspectProtocol": 1,
+  "semanticCapability": "keyword",
+  "assets": [
+    {
+      "target": "bun-darwin-arm64",
+      "assetName": "sana-mcp-darwin-arm64",
+      "checksumFileName": "sana-mcp-darwin-arm64.sha256",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+      "downloadUrl": "https://invalid.example/undeclared"
+    }
+  ]
+}

@@ -1,13 +1,14 @@
 // Login helpers layered over sana/auth.ts: the code request/verify side-effects
 // plus waitForSync. Presentation-agnostic (no display strings).
 import type { SanaStore } from "../store/db.js";
+import { RUNTIME_ENV } from "../runtime/env.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // The meeting count only appears after the daemon's brief "listing" phase.
 // Wait up to half the 60s MCP default so login can report it, but never risk
 // the client's request timeout.
-export const COUNT_WAIT_MS = Number(process.env.SANA_COUNT_WAIT_MS ?? 30_000);
+export const COUNT_WAIT_MS = RUNTIME_ENV.countWaitMs;
 
 export interface WaitResult {
   done: boolean;
@@ -33,4 +34,17 @@ export async function waitForSync(store: SanaStore, timeoutMs: number): Promise<
   }
 }
 
-export { requestCode, verifyCode, type LoginResult } from "../sana/auth.js";
+export {
+  AuthPublicationBusyError,
+  AuthTransitionIncompleteError,
+  RequestCodeLocalTransitionError,
+  RequestCodePreflightError,
+  RequestCodeRemoteError,
+  VerifyCodeLocalTransitionError,
+  VerifyCodePreflightError,
+  VerifyCodeRemoteError,
+  StaleSessionWriterError,
+  requestCode,
+  verifyCode,
+  type LoginResult,
+} from "../sana/auth.js";

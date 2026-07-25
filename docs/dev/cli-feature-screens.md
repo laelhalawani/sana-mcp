@@ -1,3 +1,10 @@
+---
+status: accepted
+scope: human-screen information architecture and interaction intent
+last_verified: 2026-07-24
+authority: subordinate to remediation-plan.md typed ports and failure states
+---
+
 # CLI feature screens
 
 Design for the interactive `sana-mcp` app's feature screens: the per-screen UX

@@ -1,0 +1,29 @@
+{
+  "name": "meeting_transcripts",
+  "title": "Meeting transcripts",
+  "description": "Access your meetings: list and search them, read transcripts, and get summaries, participants, and recording links. New meetings sync automatically shortly after they end. Call meeting_transcripts(\"help\") for a summary of all tools and their usage. Powered by Sana.ai.",
+  "inputSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "tool": {
+        "type": "string",
+        "description": "The name of the meeting transcripts tool you want to use. One of: help, login, status, list, read, search, summary, participants, recording."
+      },
+      "args": {
+        "description": "An optional JSON object of arguments for the chosen tool, e.g. {\"email\":\"you@example.com\"}. Check a tool's argument schema with meeting_transcripts(\"help\", {\"tool\":\"<name>\"}).",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "tool"
+    ]
+  },
+  "execution": {
+    "taskSupport": "forbidden"
+  }
+}

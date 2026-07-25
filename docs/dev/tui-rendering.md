@@ -1,3 +1,10 @@
+---
+status: accepted
+scope: rendering vocabulary and one-region interaction intent only
+last_verified: 2026-07-24
+authority: subordinate to remediation-plan.md terminal-safety requirements
+---
+
 # In-place TUI rendering for the configurer
 
 ## Problem

@@ -1,14 +1,19 @@
 // Presentation-agnostic transcript search: keyword BM25, or hybrid (BM25 +
 // semantic vectors fused via Reciprocal Rank Fusion) when semantic is enabled.
 // Returns typed rows; the MCP handler and CLI render their own output.
-import type { SanaStore } from "../store/db.js";
+import {
+  CacheOperationChangedError,
+  type CacheOperationGuard,
+  type SanaStore,
+} from "../store/db.js";
 import { transcriptLines } from "../sana/transcript.js";
 import {
-  semanticEnabled,
+  semanticCapabilityState,
   embedQuery,
   searchKnn,
   SemanticUnavailableError,
 } from "../semantic/semantic.js";
+import type { SemanticCapabilityState } from "../semantic/semantic.js";
 import { posInt, parseFilters } from "./args.js";
 
 export interface SearchRow {
@@ -25,7 +30,6 @@ export type SearchResult =
   | { kind: "no-query" }
   | { kind: "no-terms"; query: string }
   | { kind: "error"; query: string; message: string }
-  | { kind: "semantic-unavailable"; query: string; message: string }
   | {
       kind: "ok";
       query: string;
@@ -38,6 +42,18 @@ export type SearchResult =
       limit: number;
       offset: number;
       hasMore: boolean;
+      degradation?:
+        | {
+            code: "SEMANTIC_CAPABILITY_UNAVAILABLE";
+            message: string;
+          }
+        | {
+            code: "SEMANTIC_RUNTIME_UNAVAILABLE" | "SEMANTIC_RUNTIME_ERROR";
+            message?: string;
+            cause:
+              | { kind: "ERROR"; name: string; message: string }
+              | { kind: "UNKNOWN_THROWN_VALUE" };
+          };
     };
 
 /** Window of text around the first match, whitespace-collapsed, with ellipses. */
@@ -50,7 +66,19 @@ export function snippetAround(text: string, query: string, pad = 80): string {
   return `${start > 0 ? "..." : ""}${core}${end < text.length ? "..." : ""}`;
 }
 
-export async function runSearch(store: SanaStore, args: Record<string, unknown>): Promise<SearchResult> {
+export interface SearchRuntimeOverrides {
+  /** @internal Deterministic semantic-failure injection for runtime tests. */
+  readonly semanticState?: SemanticCapabilityState;
+  readonly embedQuery?: typeof embedQuery;
+  readonly searchKnn?: typeof searchKnn;
+  readonly guard?: CacheOperationGuard;
+}
+
+export async function runSearch(
+  store: SanaStore,
+  args: Record<string, unknown>,
+  runtime: SearchRuntimeOverrides = {},
+): Promise<SearchResult> {
   const query = typeof args.query === "string" ? args.query.trim() : "";
   if (!query) return { kind: "no-query" };
 
@@ -69,27 +97,60 @@ export async function runSearch(store: SanaStore, args: Record<string, unknown>)
   const { dateFrom, dateTo } = parseFilters(args);
 
   // --- keyword-only (BM25) when semantic search is disabled ---
-  if (!semanticEnabled()) {
-    let rows: SearchRow[], total: number;
+  const semanticState = runtime.semanticState ?? semanticCapabilityState();
+  const useSemantic = semanticState.kind === "available";
+  const checkpoint = (): void => {
+    if (runtime.guard) store.assertCacheOperation(runtime.guard);
+  };
+  const fence = <Value>(operation: () => Value): Value =>
+    runtime.guard
+      ? store.withCacheOperation(runtime.guard, operation)
+      : operation();
+  const runKeyword = (
+    degradation?: Extract<SearchResult, { kind: "ok" }>["degradation"],
+  ): SearchResult => {
     try {
-      total = store.countLineMatches(match, { dateFrom, dateTo });
-      rows = store.searchLines(match, { limit, offset, sort, dateFrom, dateTo });
+      const read = (): readonly [number, SearchRow[]] => [
+        store.countLineMatches(match, { dateFrom, dateTo }),
+        store.searchLines(match, {
+          limit,
+          offset,
+          sort,
+          dateFrom,
+          dateTo,
+        }),
+      ];
+      const [total, rows] = runtime.guard
+        ? store.withCacheOperation(runtime.guard, read)
+        : read();
+      return {
+        kind: "ok",
+        query,
+        anchor,
+        mode: "keyword",
+        sort,
+        rows,
+        total,
+        page,
+        limit,
+        offset,
+        hasMore: offset + rows.length < total,
+        ...(degradation ? { degradation } : {}),
+      };
     } catch (e) {
+      if (e instanceof CacheOperationChangedError) throw e;
       return { kind: "error", query, message: (e as Error).message };
     }
-    return {
-      kind: "ok",
-      query,
-      anchor,
-      mode: "keyword",
-      sort,
-      rows,
-      total,
-      page,
-      limit,
-      offset,
-      hasMore: offset + rows.length < total,
-    };
+  };
+  if (!useSemantic) {
+    return runKeyword(
+      semanticState.kind === "unsupported"
+        ? {
+            code: "SEMANTIC_CAPABILITY_UNAVAILABLE",
+            message: semanticState.message,
+          }
+        : undefined,
+    );
   }
 
   // --- hybrid (BM25 + semantic vectors, fused via Reciprocal Rank Fusion) ---
@@ -97,8 +158,19 @@ export async function runSearch(store: SanaStore, args: Record<string, unknown>)
   const RRF_K = 60;
   let kw: SearchRow[];
   try {
-    kw = store.searchLines(match, { limit: POOL, offset: 0, sort: "best", dateFrom, dateTo });
+    const read = () =>
+      store.searchLines(match, {
+        limit: POOL,
+        offset: 0,
+        sort: "best",
+        dateFrom,
+        dateTo,
+      });
+    kw = runtime.guard
+      ? store.withCacheOperation(runtime.guard, read)
+      : read();
   } catch (e) {
+    if (e instanceof CacheOperationChangedError) throw e;
     return { kind: "error", query, message: (e as Error).message };
   }
 
@@ -114,11 +186,9 @@ export async function runSearch(store: SanaStore, args: Record<string, unknown>)
     let lines = linesCache.get(mid);
     if (!lines) {
       const t = store.getTranscript(mid);
-      try {
-        lines = t ? transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text })) : [];
-      } catch {
-        lines = [];
-      }
+      lines = t
+        ? transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text }))
+        : [];
       linesCache.set(mid, lines);
     }
     const line = lines.find((l) => l.n === ln);
@@ -138,16 +208,36 @@ export async function runSearch(store: SanaStore, args: Record<string, unknown>)
   kw.forEach((r, i) => add(r, i));
 
   try {
-    const qv = await embedQuery(query);
-    const knn = await searchKnn(store.db, qv, { k: POOL, dateFrom, dateTo });
-    knn.forEach((h, i) => {
-      const row = resolve(h.meeting_id, h.line_no);
-      if (row) add(row, i);
-    });
+    checkpoint();
+    const qv = await (runtime.embedQuery ?? embedQuery)(query);
+    checkpoint();
+    const knn = await (runtime.searchKnn ?? searchKnn)(
+      store.db,
+      qv,
+      { k: POOL, dateFrom, dateTo, fence },
+    );
+    checkpoint();
+    const resolveRows = () =>
+      knn.forEach((h, i) => {
+        const row = resolve(h.meeting_id, h.line_no);
+        if (row) add(row, i);
+      });
+    if (runtime.guard) store.withCacheOperation(runtime.guard, resolveRows);
+    else resolveRows();
   } catch (e) {
-    if (e instanceof SemanticUnavailableError)
-      return { kind: "semantic-unavailable", query, message: e.message };
-    // Any other embedding error: fall back to the keyword results already fused.
+    if (e instanceof CacheOperationChangedError) throw e;
+    const cause =
+      e instanceof Error
+        ? { kind: "ERROR" as const, name: e.name, message: e.message }
+        : { kind: "UNKNOWN_THROWN_VALUE" as const };
+    return runKeyword({
+      code:
+        e instanceof SemanticUnavailableError
+          ? "SEMANTIC_RUNTIME_UNAVAILABLE"
+          : "SEMANTIC_RUNTIME_ERROR",
+      ...(e instanceof Error ? { message: e.message } : {}),
+      cause,
+    });
   }
 
   const itemsAll = [...fused.values()];

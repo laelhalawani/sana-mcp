@@ -36,7 +36,7 @@ export const TOOLS: ToolDoc[] = [
       "Read a meeting transcript as numbered lines. With no line selection it reports the line count and options; use full:true for the whole thing, or lines:[start,end] for a range. A line is one spoken turn. (Summary, participants and recording are separate tools.)",
     args:
       'meeting_id: string (required); full: boolean (read all); lines: [start,end] (1-based line range); timestamps: boolean (default true)',
-    example: 'meeting_transcripts("read", {"meeting_id":"v72HzzJDZx9WqTmF", "lines":[22,26]})',
+    example: 'meeting_transcripts("read", {"meeting_id":"<meeting-id>", "lines":[22,26]})',
   },
   {
     name: "search",
@@ -50,20 +50,20 @@ export const TOOLS: ToolDoc[] = [
     name: "summary",
     summary: "Get a meeting's summary, plus notes (by topic) and action items.",
     args: "meeting_id: string (required)",
-    example: 'meeting_transcripts("summary", {"meeting_id":"v72HzzJDZx9WqTmF"})',
+    example: 'meeting_transcripts("summary", {"meeting_id":"<meeting-id>"})',
   },
   {
     name: "participants",
     summary: "List a meeting's participants (name, email, host).",
     args: "meeting_id: string (required)",
-    example: 'meeting_transcripts("participants", {"meeting_id":"v72HzzJDZx9WqTmF"})',
+    example: 'meeting_transcripts("participants", {"meeting_id":"<meeting-id>"})',
   },
   {
     name: "recording",
     summary:
       "Get a temporary link to a meeting's recording. Fetched live from Sana (the only tool that hits the network); the URL expires after a few hours.",
     args: "meeting_id: string (required)",
-    example: 'meeting_transcripts("recording", {"meeting_id":"v72HzzJDZx9WqTmF"})',
+    example: 'meeting_transcripts("recording", {"meeting_id":"<meeting-id>"})',
   },
   {
     name: "help",

@@ -1,3 +1,10 @@
+---
+status: superseded
+scope: former combined CLI, installer, runtime, and release specification
+last_verified: 2026-07-24
+superseded_by: remediation-plan.md
+---
+
 # sana-mcp CLI - complete specification
 
 The authoritative spec for the `sana-mcp` command-line tool: how it is

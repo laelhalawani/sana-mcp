@@ -1,3 +1,10 @@
+---
+status: research
+scope: non-binding terminal UI library survey
+last_verified: 2026-07-24
+authority: revalidate before use; remediation-plan.md controls implementation
+---
+
 # TUI library research for the sana-mcp CLI
 
 Date: 2026-07-24. All claims web-verified; sources inline. Written for our

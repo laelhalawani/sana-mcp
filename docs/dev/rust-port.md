@@ -1,3 +1,10 @@
+---
+status: research
+scope: non-binding Rust port feasibility study
+last_verified: 2026-07-24
+authority: revalidate before use; remediation-plan.md controls implementation
+---
+
 # sana-mcp - Rust port feasibility study
 
 Goal: decide whether to port sana-mcp from TypeScript/Node to Rust so it ships

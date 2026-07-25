@@ -1,3 +1,10 @@
+---
+status: superseded
+scope: former installer and configurer presentation proposal
+last_verified: 2026-07-24
+superseded_by: remediation-plan.md
+---
+
 # Installer Flow Polish
 
 Redesign of the one-line install experience (`install.sh` / `install.ps1` plus
