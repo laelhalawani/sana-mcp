@@ -1585,6 +1585,22 @@ test("PowerShell download progress retains bar, size, speed, ETA, and bounded co
         "$Unknown = Format-DownloadProgress 50MB -1 10",
         'if ($Unknown -cnotmatch "50 MB  5 MB/s") { throw "unknown-length size or speed changed" }',
         'if ($Unknown -match "%|ETA") { throw "unknown length invented percent or ETA" }',
+        "$DecimalTotal = [long] (106.1 * 1MB)",
+        "$Early = Format-DownloadProgress 1MB $DecimalTotal 1",
+        "$Middle = Format-DownloadProgress 50MB $DecimalTotal 50",
+        "$DecimalComplete = Format-DownloadProgress $DecimalTotal $DecimalTotal 106.1",
+        'if ($Early -cnotmatch "1/106\\.1 MB" -or $Middle -cnotmatch "50/106\\.1 MB" -or $DecimalComplete -cnotmatch "106\\.1/106\\.1 MB") { throw "decimal-size rendering changed" }',
+        'if ($Early.IndexOf("/") -ne $Middle.IndexOf("/") -or $Middle.IndexOf("/") -ne $DecimalComplete.IndexOf("/")) { throw "current-size width did not reserve the total width" }',
+        'if ($Early.IndexOf(" MB/s") -ne $Middle.IndexOf(" MB/s") -or $Middle.IndexOf(" MB/s") -ne $DecimalComplete.IndexOf(" MB/s")) { throw "downstream progress columns shifted" }',
+        'if ($Early.Length -ne $Middle.Length -or $Middle.Length -ne $DecimalComplete.Length) { throw "fixed-width progress lines changed length" }',
+        "$OriginalCulture = [Threading.Thread]::CurrentThread.CurrentCulture",
+        "try {",
+        '  [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo("de-DE")',
+        "  $Invariant = Format-DownloadProgress 1.5MB 10.5MB 1.5",
+        '  if ($Invariant -cnotmatch "1\\.5/10\\.5 MB") { throw "progress numbers followed the host locale" }',
+        "} finally {",
+        "  [Threading.Thread]::CurrentThread.CurrentCulture = $OriginalCulture",
+        "}",
         "",
       ].join("\n"),
     );
@@ -1813,8 +1829,36 @@ test("Windows confirms incompatible replacement before download and resets state
   );
   assert.match(
     installer,
-    /if \(\$OldPresent\) \{\s+Write-Host "Existing MCP client registrations were kept unchanged\."\s+\$ConfigTransactionState = "no-mutation"/u,
+    /if \(\$OldPresent\) \{\s+if \(\$IncompatibleStateReset\) \{\s+Write-Host "Existing MCP client registrations will be reviewed after installation\."\s+\} else \{\s+Write-Host "Existing MCP client registrations were kept unchanged\."/u,
   );
+  const committedReset = installer.indexOf(
+    '$ResetCommit["state"] -cne "committed"',
+  );
+  const incompatibleCommitted = installer.indexOf(
+    "$Committed = $true",
+    committedReset,
+  );
+  const incompatibleTransactionClosed = installer.indexOf(
+    "$TransactionActive = $false",
+    incompatibleCommitted,
+  );
+  const postCommitSetup = installer.indexOf(
+    "Invoke-PostInstallConfigurer $Destination",
+    incompatibleTransactionClosed,
+  );
+  assert.ok(committedReset >= 0);
+  assert.ok(incompatibleCommitted > committedReset);
+  assert.ok(incompatibleTransactionClosed > incompatibleCommitted);
+  assert.ok(postCommitSetup > incompatibleTransactionClosed);
+  assert.match(
+    installer,
+    /if \(\$env:SANA_MCP_UPDATE -eq "1"\)[\s\S]*?elseif \(\$env:SANA_MCP_YES -eq "1"\)[\s\S]*?Invoke-PostInstallConfigurer \$Destination -Yes/u,
+  );
+  assert.match(
+    installer,
+    /Start-Process\s+`\s+-FilePath \$Executable\s+`\s+-ArgumentList \$Arguments\s+`\s+-NoNewWindow\s+`\s+-Wait\s+`\s+-PassThru/u,
+  );
+  assert.doesNotMatch(installer, /& \$Destination install/u);
   assert.match(
     installer,
     /__reset-incompatible-state rollback[\s\S]*?incompatible local-state rollback was incomplete/u,
@@ -1890,7 +1934,7 @@ test("PowerShell deferred-install command quotes the executable and invokes it",
   if (!powershell) return;
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
-  const start = installer.indexOf("function Format-InstallCommand");
+  const start = installer.indexOf("function Format-ExecutableCommand");
   const end = installer.indexOf("\nfunction Open-HttpsResponse", start);
   assert.notEqual(start, -1);
   assert.notEqual(end, -1);
@@ -1917,6 +1961,30 @@ test("PowerShell deferred-install command quotes the executable and invokes it",
         `$Command = Format-InstallCommand '${executableTarget.replaceAll("'", "''")}'`,
         "$Observed = Invoke-Expression $Command",
         'if ($Observed -cne "install") { throw "formatted command did not invoke the target with install" }',
+        `$YesCommand = Format-InstallCommand '${executableTarget.replaceAll("'", "''")}' -Yes`,
+        'if ($YesCommand -cnotmatch " install --yes$") { throw "unattended retry command omitted --yes" }',
+        '$script:ConfigurerExitCode = 0',
+        "function Start-Process {",
+        "  param(",
+        "    [string] $FilePath,",
+        "    [object[]] $ArgumentList,",
+        "    [switch] $NoNewWindow,",
+        "    [switch] $Wait,",
+        "    [switch] $PassThru",
+        "  )",
+        `  if ($FilePath -cne '${executableTarget.replaceAll("'", "''")}') { throw "configurer used the wrong executable" }`,
+        '  if (-not $NoNewWindow -or -not $Wait -or -not $PassThru) { throw "configurer did not inherit and synchronously hold the console" }',
+        '  $script:ConfigurerArguments = @($ArgumentList)',
+        "  return [pscustomobject]@{ ExitCode = $script:ConfigurerExitCode }",
+        "}",
+        `$PipelineResult = @("irm-body" | ForEach-Object { Invoke-PostInstallConfigurer '${executableTarget.replaceAll("'", "''")}' })`,
+        'if ($PipelineResult.Count -ne 1 -or $PipelineResult[0] -ne $true) { throw "pipeline-shaped configurer launch was contaminated" }',
+        'if ($script:ConfigurerArguments.Count -ne 1 -or $script:ConfigurerArguments[0] -cne "install") { throw "interactive configurer arguments changed" }',
+        `$YesResult = Invoke-PostInstallConfigurer '${executableTarget.replaceAll("'", "''")}' -Yes`,
+        'if (-not $YesResult -or $script:ConfigurerArguments.Count -ne 2 -or $script:ConfigurerArguments[1] -cne "--yes") { throw "unattended configurer arguments changed" }',
+        "$script:ConfigurerExitCode = 9",
+        `$FailedResult = Invoke-PostInstallConfigurer '${executableTarget.replaceAll("'", "''")}'`,
+        'if ($FailedResult) { throw "nonzero configurer exit became success" }',
         'Write-Output "command-format-ok"',
         "",
       ].join("\n"),

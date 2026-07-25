@@ -74,11 +74,46 @@ function Assert-ReleaseTag([string] $Tag) {
   }
 }
 
-function Format-InstallCommand([string] $Executable) {
+function Format-ExecutableCommand([string] $Executable) {
   if ([string]::IsNullOrWhiteSpace($Executable)) {
     throw "The installed executable path is unavailable."
   }
-  return "& '" + $Executable.Replace("'", "''") + "' install"
+  return "& '" + $Executable.Replace("'", "''") + "'"
+}
+
+function Format-InstallCommand(
+  [string] $Executable,
+  [switch] $Yes
+) {
+  $Command = (Format-ExecutableCommand $Executable) + " install"
+  if ($Yes) {
+    return "$Command --yes"
+  }
+  return $Command
+}
+
+function Invoke-PostInstallConfigurer(
+  [string] $Executable,
+  [switch] $Yes
+) {
+  $Arguments = @("install")
+  if ($Yes) {
+    $Arguments += "--yes"
+  }
+  try {
+    $Configurer = Start-Process `
+      -FilePath $Executable `
+      -ArgumentList $Arguments `
+      -NoNewWindow `
+      -Wait `
+      -PassThru
+    if ($Configurer.ExitCode -ne 0) {
+      return $false
+    }
+    return $true
+  } catch {
+    return $false
+  }
 }
 
 function Open-HttpsResponse([string] $Source) {
@@ -182,11 +217,16 @@ function Format-DownloadProgress(
   $SpeedBytes = $BytesRead / $Seconds
   $ReadMegabytes = [Math]::Round($BytesRead / 1MB, 1)
   $SpeedMegabytes = [Math]::Round($SpeedBytes / 1MB, 1)
+  $InvariantCulture = [Globalization.CultureInfo]::InvariantCulture
+  $ReadMegabytesText =
+    $ReadMegabytes.ToString("0.#", $InvariantCulture)
+  $SpeedMegabytesText =
+    $SpeedMegabytes.ToString("0.#", $InvariantCulture)
   if ($TotalBytes -le 0) {
     return (
       "`r  {0} MB  {1} MB/s " -f
-        $ReadMegabytes,
-        $SpeedMegabytes
+        $ReadMegabytesText,
+        $SpeedMegabytesText
     )
   }
 
@@ -196,6 +236,10 @@ function Format-DownloadProgress(
   )
   $Percent = [int] [Math]::Floor($Ratio * 100)
   $TotalMegabytes = [Math]::Round($TotalBytes / 1MB, 1)
+  $TotalMegabytesText =
+    $TotalMegabytes.ToString("0.#", $InvariantCulture)
+  $ReadMegabytesText =
+    $ReadMegabytesText.PadLeft($TotalMegabytesText.Length)
   $RemainingSeconds = if ($SpeedBytes -gt 0) {
     [Math]::Max(0.0, ($TotalBytes - $BytesRead) / $SpeedBytes)
   } else {
@@ -209,9 +253,9 @@ function Format-DownloadProgress(
     "`r  [{0}] {1,3}%  {2}/{3} MB  {4} MB/s  ETA {5} " -f
       $Bar,
       $Percent,
-      $ReadMegabytes,
-      $TotalMegabytes,
-      $SpeedMegabytes,
+      $ReadMegabytesText,
+      $TotalMegabytesText,
+      $SpeedMegabytesText,
       $Eta
   )
 }
@@ -1718,7 +1762,11 @@ try {
   $ConfigJournalPreexisting = Test-Path -LiteralPath $ConfigJournalFile
   $ConfigInteractiveAttempted = $false
   if ($OldPresent) {
-    Write-Host "Existing MCP client registrations were kept unchanged."
+    if ($IncompatibleStateReset) {
+      Write-Host "Existing MCP client registrations will be reviewed after installation."
+    } else {
+      Write-Host "Existing MCP client registrations were kept unchanged."
+    }
     $ConfigTransactionState = "no-mutation"
     $ConfigureExit = 0
   } elseif ($env:SANA_MCP_YES -eq "1") {
@@ -1874,6 +1922,8 @@ try {
           $ResetCommit["quarantinePresent"] -cne "false") {
         throw "reset cleanup returned an invalid committed response"
       }
+      $Committed = $true
+      $TransactionActive = $false
     } finally {
       if ($null -eq $PreviousResetAuthority) {
         Remove-Item Env:SANA_MCP_INCOMPATIBLE_RESET -ErrorAction SilentlyContinue
@@ -1908,7 +1958,42 @@ try {
   }
   Write-Host "Installed $Destination"
   if ($IncompatibleStateReset) {
-    Write-Host "Run sana-mcp to sign in again; meetings will be re-synced automatically."
+    $InteractiveSetup =
+      [Environment]::UserInteractive -and
+      -not [Console]::IsInputRedirected -and
+      -not [Console]::IsOutputRedirected
+    if ($env:SANA_MCP_UPDATE -eq "1") {
+      Write-Host "Setup was deferred because this replacement was started by sana-mcp update."
+      Write-Host "Run this command: $(Format-InstallCommand $Destination)"
+    } elseif ($env:SANA_MCP_YES -eq "1") {
+      Write-Host "Registering sana-mcp with detected MCP clients."
+      $SetupSucceeded =
+        Invoke-PostInstallConfigurer $Destination -Yes
+      if (-not $SetupSucceeded) {
+        [Console]::Error.WriteLine(
+          "sana-mcp: installation succeeded, but client registration did not complete."
+        )
+        [Console]::Error.WriteLine(
+          "sana-mcp: retry with: $(Format-InstallCommand $Destination -Yes)"
+        )
+      }
+      Write-Host "Run this command to sign in: $(Format-ExecutableCommand $Destination)"
+    } elseif ($InteractiveSetup) {
+      Write-Host "Starting sana-mcp setup."
+      $SetupSucceeded =
+        Invoke-PostInstallConfigurer $Destination
+      if (-not $SetupSucceeded) {
+        [Console]::Error.WriteLine(
+          "sana-mcp: installation succeeded, but setup did not complete."
+        )
+        [Console]::Error.WriteLine(
+          "sana-mcp: retry with: $(Format-InstallCommand $Destination)"
+        )
+      }
+    } else {
+      Write-Host "Setup was deferred because no interactive terminal is available."
+      Write-Host "Run this command: $(Format-InstallCommand $Destination)"
+    }
   }
   if (-not $NewPathManaged -and $MatchingEntries.Count -eq 0) {
     Write-Host "Add $InstallDir to PATH to run sana-mcp from new shells."
