@@ -1,0 +1,20 @@
+{
+  "list": "Showing 1 out of 4 meeting transcripts.\n\n| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | status (ready/downloading/processing/failed) | title (string) |\n|---|---|---|---|\n| 2026-01-05 10:00 | meeting-delta | failed | Delta failed |\n\nUse meeting_transcripts(\"list\", {\"page\":2}) to see the next page.\n\nPer meeting (by id): read (transcript), summary, participants, recording.",
+  "read": "# Alpha planning\n2026-01-02 | 2 lines | 5 words | showing lines 1-1\n\n1\t[0:05] Alex: Contract coverage works.",
+  "search": "Showing 1 matching lines for \"coverage\" (keyword, ranked by relevance).\n\n| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | line (int) | title (string) | snippet (string) |\n|---|---|---|---|---|\n| 2026-01-02 10:00 | meeting-alpha | 1 | Alpha planning | Contract coverage works. |\n\nRead around a hit with meeting_transcripts(\"read\", {\"meeting_id\":\"<id>\", \"lines\":[<line>-2, <line>+2]}).",
+  "summary": "# Alpha planning\n2026-01-02\n\nShort summary: Contract verification.\n\nSummary:\nThe team verified the contract.\n\nAction items:\n- Review fixtures (assignee: Alex; due: 2026-01-04)\n\nNotes:\n- Coverage: Exercise every safe output path.",
+  "participants": "Participants for \"Alpha planning\" (2):\n\n| name (string) | email (string) | host (yes/no) |\n|---|---|---|\n| Alex | alex@example.invalid | yes |\n| Blair | blair@example.invalid | no |",
+  "recordingError": "Could not fetch the recording link: contract tests block external network access",
+  "recordingMissingId": "Provide a meeting id: meeting_transcripts(\"recording\", {\"meeting_id\":\"...\"}).",
+  "loginMissingEmail": "To sign in, provide the email connected to your Sana.ai subscription: meeting_transcripts(\"login\", {\"email\":\"you@example.com\"}). A 6-digit code will be emailed to that address.",
+  "loginCodeError": "No sign-in code was submitted to Sana. The sign-in code could not be submitted because no matching challenge is pending. Request a new challenge with meeting_transcripts(\"login\", {\"email\":\"contract@example.invalid\"}).",
+  "summaryMissingId": "Provide a meeting id: meeting_transcripts(\"summary\", {\"meeting_id\":\"...\"}).",
+  "participantsMissingId": "Provide a meeting id: meeting_transcripts(\"participants\", {\"meeting_id\":\"...\"}).",
+  "readGuidance": "# Alpha planning\n2026-01-02 | 2 lines | 5 words\n\nThis transcript has 2 lines. Choose how to read it:\n- Whole thing:  meeting_transcripts(\"read\", {\"meeting_id\":\"meeting-alpha\", \"full\":true})\n- A range:      meeting_transcripts(\"read\", {\"meeting_id\":\"meeting-alpha\", \"lines\":[start, end]})\n  (one line = one thing said by a person; line numbers come from \"search\" or a prior read)",
+  "searchNextPage": "Showing 1 out of 2 matching lines for \"contract\" (keyword, newest).\n\n| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | line (int) | title (string) | snippet (string) |\n|---|---|---|---|---|\n| 2026-01-03 10:00 | meeting-beta | 1 | Beta review | Review contract path. |\n\nUse meeting_transcripts(\"search\", {\"query\":\"contract\", \"page\":2}) to see the next page.\n\nRead around a hit with meeting_transcripts(\"read\", {\"meeting_id\":\"<id>\", \"lines\":[<line>-2, <line>+2]}).",
+  "status": "Up to date. 4 meetings, 2 transcripts stored.\nNew meetings sync automatically shortly after they end.\nLast sync: 2026-01-03T12:00:00.000Z.",
+  "readMissingId": "Provide a meeting id: meeting_transcripts(\"read\", {\"meeting_id\":\"...\"}). Get ids from meeting_transcripts(\"list\") or \"search\".",
+  "searchMissingQuery": "Provide a search query: meeting_transcripts(\"search\", {\"query\":\"...\"}). Optional: page, limit, sort, filter.",
+  "statusSyncing": "Sync in progress: building the meeting list.\nMeeting tools are unavailable until it completes.",
+  "readStillListing": "Still syncing the meeting list. Check meeting_transcripts(\"status\") for current progress."
+}

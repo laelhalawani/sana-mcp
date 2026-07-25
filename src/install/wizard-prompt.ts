@@ -1,8 +1,7 @@
 // A custom interactive toggle-list for the sana-mcp configurer.
-// - Rows are the DETECTED clients, each a checkbox reflecting its CURRENT
-//   registration state (on = registered).
+// - Detected clients and existing registrations are shown first.
+// - `v` reveals safely configurable clients that were not detected.
 // - up/down move, space toggles, enter confirms, esc/q cancels.
-// - `v` reveals the non-detected clients as dimmed, unselectable rows.
 // - A persistent footer lists the keyboard shortcuts.
 import {
   createPrompt,
@@ -13,11 +12,9 @@ import {
   isDownKey,
   isEnterKey,
   isSpaceKey,
-  makeTheme,
-  usePrefix,
   type Status,
 } from "@inquirer/core";
-import { cursorHide } from "@inquirer/ansi";
+import type { TerminalUi } from "../app/ui.js";
 
 export interface WizardRow {
   id: string;
@@ -36,24 +33,27 @@ interface WizardConfig {
   message: string;
   rows: WizardRow[];
   serverName: string;
+  ui: TerminalUi;
 }
 
-// ANSI helpers (kept local so we don't depend on a color lib).
-const c = {
-  dim: (s: string) => `\x1b[2m${s}\x1b[22m`,
-  bold: (s: string) => `\x1b[1m${s}\x1b[22m`,
-  cyan: (s: string) => `\x1b[36m${s}\x1b[39m`,
-  green: (s: string) => `\x1b[32m${s}\x1b[39m`,
-  yellow: (s: string) => `\x1b[33m${s}\x1b[39m`,
-};
+export function wizardEmptyMessage(
+  detectedCount: number,
+  undetectedCount: number,
+  showAll: boolean
+): string | undefined {
+  if (detectedCount + undetectedCount === 0)
+    return "No safely configurable clients are available.";
+  if (!showAll && detectedCount === 0 && undetectedCount > 0)
+    return "No clients detected. Press v to review manual opt-in clients.";
+  return undefined;
+}
 
 export const wizardPrompt = createPrompt<WizardResult, WizardConfig>((config, done) => {
-  const theme = makeTheme({});
+  const ui = config.ui;
   const detected = useMemo(() => config.rows.filter((r) => r.detected), [config.rows]);
   const others = useMemo(() => config.rows.filter((r) => !r.detected), [config.rows]);
 
   const [status, setStatus] = useState<Status>("idle");
-  const prefix = usePrefix({ status, theme });
   const [showAll, setShowAll] = useState(false);
   const [cursor, setCursor] = useState(0);
   // desired on/off state, seeded from current registration
@@ -63,8 +63,7 @@ export const wizardPrompt = createPrompt<WizardResult, WizardConfig>((config, do
     return d;
   });
 
-  // Only detected rows are selectable.
-  const selectable = detected;
+  const selectable = showAll ? [...detected, ...others] : detected;
 
   useKeypress((key, rl) => {
     if (status !== "idle") return;
@@ -88,6 +87,8 @@ export const wizardPrompt = createPrompt<WizardResult, WizardConfig>((config, do
     }
     const name = key.name?.toLowerCase();
     if (name === "v") {
+      if (showAll && cursor >= detected.length)
+        setCursor(Math.max(0, detected.length - 1));
       setShowAll(!showAll);
       return;
     }
@@ -109,45 +110,53 @@ export const wizardPrompt = createPrompt<WizardResult, WizardConfig>((config, do
   });
 
   if (status === "done") {
-    return `${prefix} ${config.message}`;
+    return ui.line(config.message).text;
   }
 
-  const lines: string[] = [`${prefix} ${c.bold(config.message)}`];
+  const lines: string[] = [ui.color.bold(config.message).text];
 
-  if (selectable.length === 0) {
-    lines.push(c.dim("  No supported AI clients detected on this machine."));
-  }
+  const emptyMessage = wizardEmptyMessage(
+    detected.length,
+    others.length,
+    showAll
+  );
+  if (emptyMessage)
+    lines.push(ui.color.dim(`  ${emptyMessage}`).text);
 
   selectable.forEach((row, i) => {
+    if (showAll && others.length > 0 && i === detected.length)
+      lines.push(
+        ui.color.dim("  Not detected (manual opt-in)").text
+      );
     const active = i === cursor;
     const on = desired[row.id];
-    const box = on ? c.green("[x]") : "[ ]";
-    const pointer = active ? c.cyan(">") : " ";
-    const label = active ? c.cyan(row.name) : row.name;
-    const changed = on !== row.current ? c.yellow(on ? "  (will enable)" : "  (will disable)") : "";
-    lines.push(`${pointer} ${box} ${label}${changed}`);
+    const box = on
+      ? ui.color.green(ui.glyphs.check)
+      : ui.text(ui.glyphs.uncheck);
+    const pointer = active
+      ? ui.color.cyan(ui.glyphs.pointer)
+      : ui.text(" ");
+    const label = active ? ui.color.cyan(row.name) : ui.text(row.name);
+    const changed =
+      on !== row.current
+        ? ui.color.yellow(on ? "  (will enable)" : "  (will disable)")
+        : ui.text("");
+    lines.push(ui.line(pointer, " ", box, " ", label, changed).text);
   });
-
-  if (showAll && others.length) {
-    lines.push(c.dim("  - not detected -"));
-    for (const row of others) {
-      lines.push(c.dim(`    [ ] ${row.name}`));
-    }
-  }
 
   // Persistent footer: keyboard shortcuts.
   const shortcuts = [
-    `${c.bold("up/down")} move`,
-    `${c.bold("space")} toggle`,
-    `${c.bold("a")} all`,
-    others.length ? `${c.bold("v")} ${showAll ? "hide" : "show"} undetected` : "",
-    `${c.bold("enter")} confirm`,
-    `${c.bold("esc/q")} cancel`,
+    "up/down move",
+    "space toggle",
+    "a all shown",
+    others.length ? `v ${showAll ? "hide" : "show"} undetected` : "",
+    "enter confirm",
+    "esc/q cancel",
   ]
     .filter(Boolean)
-    .join(c.dim("  |  "));
+    .join("  |  ");
   lines.push("");
-  lines.push(c.dim(shortcuts));
+  lines.push(ui.color.dim(shortcuts).text);
 
-  return `${lines.join("\n")}${cursorHide}`;
+  return lines.join("\n");
 });

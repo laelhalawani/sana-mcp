@@ -1,112 +1,405 @@
 name: release
 
-# Build self-contained sana-mcp binaries and publish a release. The version
-# lives in package.json (single source of truth; cli.ts/mcp.ts read it).
-# Triggers:
-#   - push a v* tag   -> release that exact tag
-#   - push to main    -> release v<package.json version>, but only if that tag
-#                        doesn't exist yet (so bump "version", merge, get a release)
-#   - workflow_dispatch -> release a chosen tag
-# Tags containing "-" (e.g. v0.1.0-rc1) are published as prereleases.
+# Releases are deliberate: an existing exact tag is selected manually, then the
+# protected `release` environment approves that commit before any build starts.
 on:
-  push:
-    tags: ["v*"]
-    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build and attach binaries to"
+        description: "Existing package-matching tag to release (for example v0.3.2)"
         required: true
-        default: "v0.1.0"
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
-  resolve:
-    runs-on: ubuntu-latest
+  authorize:
+    runs-on: ubuntu-24.04
+    environment: release
     outputs:
-      tag: ${{ steps.r.outputs.tag }}
-      skip: ${{ steps.r.outputs.skip }}
+      tag: ${{ steps.verify.outputs.tag }}
+      sha: ${{ steps.verify.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
-      - id: r
+          persist-credentials: false
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.14"
+      - id: verify
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          else
-            tag="v$(jq -r .version package.json)"
-            if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
-              echo "$tag already released; skipping"
-              echo "tag=" >> "$GITHUB_OUTPUT"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "Releasing new version $tag"
-              echo "tag=$tag" >> "$GITHUB_OUTPUT"
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-            fi
-          fi
+          set -euo pipefail
+          package_tag="v$(bun -e 'import p from "./package.json"; process.stdout.write(p.version)')"
+          test "$REQUESTED_TAG" = "$package_tag" ||
+            { echo "Tag $REQUESTED_TAG does not match package version $package_tag" >&2; exit 1; }
+          git show-ref --verify --quiet "refs/tags/$REQUESTED_TAG" ||
+            { echo "$REQUESTED_TAG is not an existing tag" >&2; exit 1; }
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$REQUESTED_TAG")" ||
+            { echo "Checkout is not the exact requested tag commit" >&2; exit 1; }
+          source_sha="$(git rev-parse "$REQUESTED_TAG^{commit}")"
+          test "${#source_sha}" -eq 40 ||
+            { echo "Resolved source commit is not a full SHA" >&2; exit 1; }
+          case "$source_sha" in
+            *[!a-f0-9]*) echo "Resolved source commit is not lowercase hexadecimal" >&2; exit 1 ;;
+          esac
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
 
-  build:
-    needs: resolve
-    if: needs.resolve.outputs.skip != 'true'
-    name: build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+  linux:
+    needs: authorize
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: linux-x64,     bun_target: bun-linux-x64 }
-          - { target: linux-arm64,   bun_target: bun-linux-arm64 }
-          - { target: darwin-x64,    bun_target: bun-darwin-x64 }
-          - { target: darwin-arm64,  bun_target: bun-darwin-arm64 }
-          - { target: windows-x64,   bun_target: bun-windows-x64,   ext: .exe }
-          - { target: windows-arm64, bun_target: bun-windows-arm64, ext: .exe }
+          - target: bun-linux-x64
+            runner: ubuntu-24.04
+            asset: sana-mcp-linux-x64
+            libc: glibc
+          - target: bun-linux-x64-musl
+            runner: ubuntu-24.04
+            asset: sana-mcp-linux-x64-musl
+            libc: musl
+          - target: bun-linux-arm64
+            runner: ubuntu-24.04-arm
+            asset: sana-mcp-linux-arm64
+            libc: glibc
+          - target: bun-linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            asset: sana-mcp-linux-arm64-musl
+            libc: musl
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: "1.3.14"
-      - run: bun install --no-progress
-      - name: Compile
+      - run: bun install --frozen-lockfile --no-progress
+      - name: Build through canonical release configuration
+        run: bun scripts/release.ts build --target "${{ matrix.target }}" --outfile "${{ matrix.asset }}"
+      - name: Execute inspect and smoke check
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          LIBC: ${{ matrix.libc }}
+          SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
         run: |
-          bun build src/cli.ts --compile \
-            --target ${{ matrix.bun_target }} \
-            --external @huggingface/transformers \
-            --external sqlite-vec \
-            --outfile sana-mcp-${{ matrix.target }}${{ matrix.ext }}
-      - name: Checksum
-        run: sha256sum "sana-mcp-${{ matrix.target }}${{ matrix.ext }}" > "sana-mcp-${{ matrix.target }}${{ matrix.ext }}.sha256"
-      # Upload as a workflow artifact; a single downstream job publishes the
-      # release so the 6 parallel builds don't race to create it.
-      - uses: actions/upload-artifact@v4
+          set -euo pipefail
+          chmod 755 "$ASSET"
+          if [ "$LIBC" = musl ]; then
+            docker run --rm -v "$PWD:/work:ro" -w /work \
+              alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+              "/work/$ASSET" __inspect --format json > "inspect-$TARGET.json"
+            docker run --rm -v "$PWD:/work:ro" -w /work \
+              alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
+              "/work/$ASSET" --help >/dev/null
+          else
+            "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
+            "./$ASSET" --help >/dev/null
+          fi
+          bun scripts/release.ts attest \
+            --target "$TARGET" \
+            --artifact "$ASSET" \
+            --inspect-file "inspect-$TARGET.json" \
+            --commit-sha "$SOURCE_SHA" \
+            --output "attestation-$TARGET.json"
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: sana-mcp-${{ matrix.target }}
-          path: |
-            sana-mcp-${{ matrix.target }}${{ matrix.ext }}
-            sana-mcp-${{ matrix.target }}${{ matrix.ext }}.sha256
-          retention-days: 1
+          name: release-${{ matrix.target }}
           if-no-files-found: error
+          retention-days: 1
+          path: |
+            ${{ matrix.asset }}
+            attestation-${{ matrix.target }}.json
+
+  macos:
+    needs: authorize
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-darwin-x64
+            runner: macos-15-intel
+            asset: sana-mcp-darwin-x64
+          - target: bun-darwin-arm64
+            runner: macos-15
+            asset: sana-mcp-darwin-arm64
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile --no-progress
+      - name: Build through canonical release configuration
+        run: bun scripts/release.ts build --target "${{ matrix.target }}" --outfile "${{ matrix.asset }}"
+      - name: Execute inspect and smoke check
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          set -euo pipefail
+          chmod 755 "$ASSET"
+          "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
+          "./$ASSET" --help >/dev/null
+          bun scripts/release.ts attest \
+            --target "$TARGET" \
+            --artifact "$ASSET" \
+            --inspect-file "inspect-$TARGET.json" \
+            --commit-sha "$SOURCE_SHA" \
+            --output "attestation-$TARGET.json"
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            ${{ matrix.asset }}
+            attestation-${{ matrix.target }}.json
+
+  windows:
+    needs: authorize
+    name: bun-windows-x64
+    runs-on: windows-2022
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile --no-progress
+      - name: Build through canonical release configuration
+        run: bun scripts/release.ts build --target bun-windows-x64 --outfile sana-mcp-windows-x64.exe
+      - name: Validate the Windows installer syntax
+        shell: powershell
+        run: |
+          $Tokens = $null
+          $Errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "install.ps1"),
+            [ref] $Tokens,
+            [ref] $Errors
+          ) | Out-Null
+          if ($Errors.Count -gt 0) {
+            $Errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+      - name: Execute inspect and smoke check
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          & .\sana-mcp-windows-x64.exe __inspect --format json |
+            Set-Content -LiteralPath inspect-bun-windows-x64.json -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw "Standalone inspect failed: $LASTEXITCODE" }
+          & .\sana-mcp-windows-x64.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Standalone smoke check failed: $LASTEXITCODE" }
+          bun scripts/release.ts attest `
+            --target bun-windows-x64 `
+            --artifact sana-mcp-windows-x64.exe `
+            --inspect-file inspect-bun-windows-x64.json `
+            --commit-sha $env:SOURCE_SHA `
+            --output attestation-bun-windows-x64.json
+          if ($LASTEXITCODE -ne 0) { throw "Attestation failed: $LASTEXITCODE" }
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-bun-windows-x64
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            sana-mcp-windows-x64.exe
+            attestation-bun-windows-x64.json
 
   publish:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.skip != 'true'
-    runs-on: ubuntu-latest
+    needs: [authorize, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile --no-progress
+      # actions/download-artifact v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
           path: dist-assets
           merge-multiple: true
-      - name: Publish release (single writer, no race)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.resolve.outputs.tag }}
-          files: dist-assets/*
-          prerelease: ${{ contains(needs.resolve.outputs.tag, '-') }}
-          fail_on_unmatched_files: true
+      - name: Assemble and validate the exact release tuple
+        env:
+          RELEASE_TAG: ${{ needs.authorize.outputs.tag }}
+          SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          set -euo pipefail
+          bun scripts/release.ts assemble \
+            --tag "$RELEASE_TAG" \
+            --commit-sha "$SOURCE_SHA" \
+            --artifacts-dir dist-assets \
+            --output-dir release-assets
+          sh -n release-assets/install.sh
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 33
+      - name: Publish the immutable tuple
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.authorize.outputs.tag }}
+          SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse FETCH_HEAD^{commit})" = "$SOURCE_SHA" ||
+            { echo "Release tag moved after authorization" >&2; exit 1; }
+          tag_without_build="${RELEASE_TAG%%+*}"
+          expected_prerelease=false
+          case "$tag_without_build" in
+            *-*) expected_prerelease=true ;;
+          esac
+
+          publish_work="$(mktemp -d)"
+          trap 'find "$publish_work" -depth -delete' EXIT
+          release_json="$publish_work/release.json"
+          release_error="$publish_work/release.error"
+          local_names="$publish_work/local-names"
+          remote_names="$publish_work/remote-names"
+          download_dir="$publish_work/downloads"
+          mkdir "$download_dir"
+          find release-assets -maxdepth 1 -type f -printf '%f\n' |
+            LC_ALL=C sort > "$local_names"
+
+          fetch_release() {
+            gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+              > "$release_json" 2> "$release_error"
+          }
+
+          validate_release_identity() {
+            mapfile -t identity < <(
+              bun -e '
+                import { readFileSync } from "node:fs";
+                const release = JSON.parse(readFileSync(process.argv[1], "utf8"));
+                console.log(release.tag_name);
+                console.log(release.target_commitish);
+                console.log(String(release.draft));
+                console.log(release.name);
+                console.log(String(release.prerelease));
+              ' "$release_json"
+            )
+            test "${identity[0]}" = "$RELEASE_TAG" ||
+              { echo "Existing release tag does not match the requested tag" >&2; exit 1; }
+            test "${identity[1]}" = "$SOURCE_SHA" ||
+              { echo "Existing release targets a different source commit" >&2; exit 1; }
+            release_is_draft="${identity[2]}"
+            test "${identity[3]}" = "$RELEASE_TAG" ||
+              { echo "Existing release title does not match the requested tag" >&2; exit 1; }
+            test "${identity[4]}" = "$expected_prerelease" ||
+              { echo "Existing release prerelease classification is incorrect" >&2; exit 1; }
+          }
+
+          verify_remote_assets() {
+            require_complete=$1
+            bun -e '
+              import { readFileSync } from "node:fs";
+              const release = JSON.parse(readFileSync(process.argv[1], "utf8"));
+              for (const asset of release.assets.map((asset) => asset.name).sort()) {
+                console.log(asset);
+              }
+            ' "$release_json" > "$remote_names"
+            find "$download_dir" -mindepth 1 -depth -delete
+            while IFS= read -r asset; do
+              test -n "$asset" || continue
+              case "$asset" in
+                */*|*\\*|.*) echo "Existing draft contains an unsafe asset name: $asset" >&2; exit 1 ;;
+              esac
+              test -f "release-assets/$asset" ||
+                { echo "Existing release contains an unexpected asset: $asset" >&2; exit 1; }
+              gh release download "$RELEASE_TAG" \
+                --pattern "$asset" \
+                --dir "$download_dir"
+              cmp -s "release-assets/$asset" "$download_dir/$asset" ||
+                { echo "Existing release asset differs from the authorized tuple: $asset" >&2; exit 1; }
+            done < "$remote_names"
+            if [ "$require_complete" = "true" ]; then
+              cmp -s "$local_names" "$remote_names" ||
+                { echo "Existing release does not contain the complete authorized asset set" >&2; exit 1; }
+            fi
+          }
+
+          if fetch_release; then
+            validate_release_identity
+          elif grep -q "HTTP 404" "$release_error"; then
+            prerelease=()
+            if [ "$expected_prerelease" = "true" ]; then
+              prerelease=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --draft \
+              --target "$SOURCE_SHA" \
+              --title "$RELEASE_TAG" \
+              "${prerelease[@]}"
+            fetch_release
+            validate_release_identity
+          else
+            cat "$release_error" >&2
+            exit 1
+          fi
+
+          if [ "$release_is_draft" = "false" ]; then
+            verify_remote_assets true
+            echo "Release $RELEASE_TAG is already published with the authorized tuple."
+            exit 0
+          fi
+
+          verify_remote_assets false
+          missing_assets=()
+          while IFS= read -r asset; do
+            grep -Fxq "$asset" "$remote_names" ||
+              missing_assets+=("release-assets/$asset")
+          done < "$local_names"
+          if [ "${#missing_assets[@]}" -gt 0 ]; then
+            gh release upload "$RELEASE_TAG" "${missing_assets[@]}"
+          fi
+
+          fetch_release
+          validate_release_identity
+          test "$release_is_draft" = "true" ||
+            { echo "Release publication state changed concurrently" >&2; exit 1; }
+          verify_remote_assets true
+          gh release edit "$RELEASE_TAG" --draft=false

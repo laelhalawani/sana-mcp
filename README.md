@@ -12,20 +12,45 @@ unlocking search, read, summarize, and more through a single
 macOS / Linux:
 
 ```bash
-curl -fsSL https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.sh | sh
+sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://github.com/Lumen-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
+irm -ErrorAction Stop https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
 ```
 
-The installer puts `sana-mcp` on your `PATH`, then opens an interactive
+The installer selects the release for your OS, CPU, and (on Linux) libc, verifies
+the release manifest, checksums, and embedded binary identity, puts `sana-mcp` on
+your `PATH`, then opens an interactive
 configurer: it detects your AI clients, lets you toggle which ones to connect
 (space to toggle, `v` to reveal undetected clients, enter to confirm), and offers
 to sign you in. Run `sana-mcp` anytime to reopen it and change what's connected or
 sign in later.
+
+When the installer has no interactive terminal, it installs the verified binary
+and prints the exact `sana-mcp install` command to run later; it does not guess
+which clients to change. For an intentional unattended install, set
+`SANA_MCP_YES=1` to configure every detected client without showing the picker.
+If a terminal is present but interactive controls are disabled by redirection,
+CI, or terminal policy, the installer makes the same explicit deferral and keeps
+the verified runtime installed.
+
+During an upgrade, the new binary, PATH entry, and installer receipt are
+published before the new runtime opens local state. After that boundary, a
+configuration or health failure keeps the new runtime and recovery inventory in
+place instead of restoring an older executable against possibly newer local
+state; the error prints the retained locations and the next manual action.
+
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.3.2` to pin an install. Linux
+x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
+published. Windows ARM64 is not yet in the verified release matrix.
+
+The first upgrade from an older, pre-receipt installer will refuse to overwrite
+an unproven binary. If that happens, confirm and rename the exact binary path
+reported by the installer as a backup, then rerun the one-line command. The
+refusal does not touch your Sana session or meeting cache.
 
 ## What it does
 
@@ -178,7 +203,8 @@ progress, then ask your agent to search, read, or summarize your meetings.
 
 - **On every login**, a fresh catch-up sync runs and the meeting tools are held
   until it finishes, so a returning user always sees current content. `status`
-  reports progress and an ETA; if there is little new, it finishes in seconds.
+  reports authoritative completed and total counts until the remaining work is
+  finished.
 - **Between logins**, the daemon checks periodically for new meetings and pulls
   them in the background without interrupting anything. A meeting still
   downloading shows as `downloading` in `list`.
@@ -196,8 +222,8 @@ keyword + semantic results fused by Reciprocal Rank Fusion:
 
 ```bash
 # From a source checkout (installs the optional deps transformers.js + sqlite-vec)
-npm install
-SANA_SEMANTIC=1 sana-mcp daemon
+bun install
+SANA_SEMANTIC=1 bun src/cli.ts daemon
 # set SANA_SEMANTIC=1 for the MCP server process too
 ```
 
@@ -207,9 +233,10 @@ stored in the same SQLite database via `sqlite-vec`. When enabled, embeddings ar
 built as part of the login catch-up because they are required for hybrid ranking.
 
 > The embedding model and `sqlite-vec` are optional dependencies. They are
-> installed by `npm install` (source), but are **not bundled in the prebuilt
-> binary**. If the model cannot be loaded, `search` transparently falls back to
-> keyword (BM25) ranking - so enabling `SANA_SEMANTIC=1` is always safe.
+> installed by `bun install` (source), but are **not bundled in the prebuilt
+> binary**. If the model cannot be loaded, `search` returns keyword (BM25)
+> results with an explicit semantic-degradation notice; it never presents those
+> results as hybrid search.
 
 ## Configuration
 
@@ -248,13 +275,18 @@ Requires [Bun](https://bun.sh) 1.3+.
 git clone https://github.com/Lumen-AiApp/sana-ai-mcp.git
 cd sana-ai-mcp
 bun install
-bun run typecheck     # tsc --noEmit
-bun run compile       # -> dist/sana-mcp (current platform)
+bun run check         # typecheck + isolated-safe test suite
+bun run compile -- --target bun-linux-x64  # -> dist/sana-mcp
 ```
 
-Run from source with `bun src/cli.ts ...` (e.g. `bun src/cli.ts install`). The
-prebuilt binaries in Releases are built this way for all six targets
-(linux/darwin/windows, x64/arm64).
+Run from source explicitly with `bun src/cli.ts ...` (for example,
+`bun src/cli.ts install`); source checkout commands do not rely on a globally
+installed `sana-mcp`. The
+compile target is always explicit; valid published targets are
+`bun-linux-x64`, `bun-linux-x64-musl`, `bun-linux-arm64`,
+`bun-linux-arm64-musl`, `bun-darwin-x64`, `bun-darwin-arm64`, and
+`bun-windows-x64`. Releases are built only from a manually selected existing tag
+after approval of the protected GitHub `release` environment.
 
 ## License
 

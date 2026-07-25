@@ -1,75 +1,150 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import fs from "node:fs";
-import os from "node:os";
+import { z } from "zod";
+import { BUILD_INFO, isStandaloneBuild } from "./runtime/build-info.js";
+import {
+  parseRuntimeDirectories,
+  RUNTIME_ENV,
+} from "./runtime/env.js";
+import { requireAuthoritativeHome } from "./runtime/home.js";
+import {
+  ensureSecureDirectories,
+  readJsonFile,
+  writeJsonAtomic,
+  type SecureFileOptions,
+} from "./runtime/secure-files.js";
 
-// Project root = one level up from this file's directory (src/ or dist/).
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const PROJECT_ROOT = path.resolve(here, "..");
 
 /**
- * Whether we are running inside a `bun build --compile`-produced standalone
- * binary. When true, the project's dist/ tree is bundled into the executable
- * and no longer lives on disk, so callers must not reference source/dist paths
- * and persistent data should live under the user's home directory.
+ * Compatibility wrapper for existing consumers. The answer comes exclusively
+ * from the injected build identity; executable names and virtual paths are not
+ * consulted.
  */
 export function isCompiledBinary(): boolean {
-  // Bun's first-class flag when available (newer Bun).
-  if (
-    typeof Bun !== "undefined" &&
-    (Bun as { isStandaloneExecutable?: boolean }).isStandaloneExecutable === true
-  )
-    return true;
-  // Bun <= 1.3.x doesn't set isStandaloneExecutable. Its standalone-EXE bundles
-  // run modules from a virtual filesystem root (/$bunfs on unix, ~BUN / B:\~BUN
-  // on Windows); that's a reliable signal that survives renaming the binary.
-  const url = import.meta.url;
-  if (url.includes("/$bunfs/") || /(?:^|\/|\\)~BUN(?:\/|\\)/i.test(url) || url.includes("B:\\~BUN"))
-    return true;
-  // Fallback: a compiled binary's process.execPath is our app binary, not the
-  // bun/node interpreter. (Misfires only if a user renames it to node/bun.)
-  return !/^(node|bun)(\.exe)?$/i.test(path.basename(process.execPath));
+  return isStandaloneBuild();
 }
 
-export const DATA_DIR = process.env.SANA_DATA_DIR
-  ? path.resolve(process.env.SANA_DATA_DIR)
-  : (isCompiledBinary() ? path.join(os.homedir(), ".sana-mcp") : path.join(PROJECT_ROOT, "data"));
+export { BUILD_INFO };
 
-export const SESSION_FILE = path.join(DATA_DIR, "session.json");
-export const CONFIG_FILE = path.join(DATA_DIR, "config.json");
-export const TRANSCRIPTS_DIR = process.env.SANA_TRANSCRIPTS_DIR
-  ? path.resolve(process.env.SANA_TRANSCRIPTS_DIR)
-  : path.join(DATA_DIR, "transcripts");
+export interface StoragePaths {
+  readonly dataDir: string;
+  readonly sessionFile: string;
+  readonly configFile: string;
+  readonly transcriptsDir: string;
+}
 
-// Default Sana web app origin. Overridable; the login flow will also record
-// whichever origin you actually end up on after signing in.
-export const DEFAULT_BASE_URL = process.env.SANA_BASE_URL || "https://sana.ai";
+export function resolveStoragePaths(): StoragePaths {
+  const configured = parseRuntimeDirectories();
+  const dataDir =
+    configured.dataDir ??
+    (BUILD_INFO.standalone
+      ? path.join(requireAuthoritativeHome(), ".sana-mcp")
+      : path.join(PROJECT_ROOT, "data"));
+  return Object.freeze({
+    dataDir,
+    sessionFile: path.join(dataDir, "session.json"),
+    configFile: path.join(dataDir, "config.json"),
+    transcriptsDir:
+      configured.transcriptsDir ?? path.join(dataDir, "transcripts"),
+  });
+}
 
-// A transcript download that fails this many times is marked "failed" and no
-// longer blocks a login catch-up (a fresh login resets the counter and retries).
-export const MAX_TRANSCRIPT_ATTEMPTS = Number(process.env.SANA_MAX_ATTEMPTS ?? 5);
+export function dataDirectory(): string {
+  return resolveStoragePaths().dataDir;
+}
+
+export function sessionFile(): string {
+  return resolveStoragePaths().sessionFile;
+}
+
+export function transcriptsDirectory(): string {
+  return resolveStoragePaths().transcriptsDir;
+}
+
+export const DEFAULT_BASE_URL = RUNTIME_ENV.baseUrl;
+export const MAX_TRANSCRIPT_ATTEMPTS = RUNTIME_ENV.maxTranscriptAttempts;
+
+const originSchema = z.string().transform((raw, context) => {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    context.addIssue({ code: "custom", message: "must be an absolute HTTP(S) origin" });
+    return z.NEVER;
+  }
+  const loopback =
+    parsed.hostname === "localhost" ||
+    parsed.hostname === "127.0.0.1" ||
+    parsed.hostname === "[::1]";
+  if (
+    (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+    (parsed.protocol === "http:" && !loopback) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    context.addIssue({
+      code: "custom",
+      message:
+        "must be an HTTPS (or loopback HTTP) origin without credentials, path, query, or fragment",
+    });
+    return z.NEVER;
+  }
+  return parsed.origin;
+});
+
+const appConfigSchema = z
+  .object({
+    baseUrl: originSchema,
+    loggedInOrigin: originSchema.optional(),
+  })
+  .strict();
 
 export interface AppConfig {
   baseUrl: string;
-  // The origin the browser landed on after login (e.g. https://sana.ai).
   loggedInOrigin?: string;
 }
 
-export function ensureDataDir(): void {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
-}
+export class AppConfigValidationError extends Error {
+  readonly code = "INVALID_APP_CONFIG";
 
-export function loadConfig(): AppConfig {
-  try {
-    const raw = fs.readFileSync(CONFIG_FILE, "utf8");
-    return JSON.parse(raw) as AppConfig;
-  } catch {
-    return { baseUrl: DEFAULT_BASE_URL };
+  constructor(readonly issues: readonly string[]) {
+    super("Application configuration is invalid");
+    this.name = "AppConfigValidationError";
   }
 }
 
-export function saveConfig(cfg: AppConfig): void {
-  ensureDataDir();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+export function ensureDataDir(options: SecureFileOptions = {}): void {
+  const storage = resolveStoragePaths();
+  ensureSecureDirectories([storage.dataDir, storage.transcriptsDir], options);
+}
+
+export function loadConfig(options: SecureFileOptions = {}): AppConfig {
+  const result = readJsonFile(
+    resolveStoragePaths().configFile,
+    appConfigSchema,
+    options,
+  );
+  if (result.kind === "missing") return { baseUrl: DEFAULT_BASE_URL };
+  return result.value;
+}
+
+export function saveConfig(cfg: AppConfig, options: SecureFileOptions = {}): void {
+  const validated = appConfigSchema.safeParse(cfg);
+  if (!validated.success) {
+    throw new AppConfigValidationError(
+      validated.error.issues.map(
+        (issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`,
+      ),
+    );
+  }
+  const persisted: AppConfig = { baseUrl: validated.data.baseUrl };
+  if (validated.data.loggedInOrigin !== undefined) {
+    persisted.loggedInOrigin = validated.data.loggedInOrigin;
+  }
+  writeJsonAtomic(resolveStoragePaths().configFile, persisted, options);
 }

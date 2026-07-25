@@ -1,3 +1,10 @@
+---
+status: research
+scope: non-binding Go embedding-runtime study
+last_verified: 2026-07-24
+authority: revalidate before use; remediation-plan.md controls implementation
+---
+
 # sana-mcp Go Port - On-device Embeddings (lazy MiniLM over ONNX Runtime)
 
 Status: July 2026. Every version, URL, header, file size, and function

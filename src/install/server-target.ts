@@ -1,5 +1,6 @@
 import path from "node:path";
-import { PROJECT_ROOT, isCompiledBinary } from "../config.js";
+import { PROJECT_ROOT } from "../config.js";
+import { isStandaloneBuild } from "../runtime/build-info.js";
 
 export interface ServerTarget {
   command: string;
@@ -8,13 +9,14 @@ export interface ServerTarget {
 }
 
 /**
- * The command an MCP client should run to start this sana-mcp server.
- * Compiled binary: <execPath> mcp (the CLI's mcp subcommand runs the server).
- * Dev (bun): <execPath> <abs>/src/mcp.ts. bun runs TypeScript natively, so no
- * build step or loader is needed; process.execPath is the bun binary. The MCP
- * server needs no special env, so none is set.
+ * Return the exact target installed into MCP client configuration.
+ * Standalone identity comes from the compile-time build marker. Source mode
+ * intentionally points to the current Bun executable and repository entrypoint.
  */
 export function serverTarget(): ServerTarget {
-  if (isCompiledBinary()) return { command: process.execPath, args: ["mcp"] };
-  return { command: process.execPath, args: [path.join(PROJECT_ROOT, "src", "mcp.ts")] };
+  if (isStandaloneBuild()) return { command: process.execPath, args: ["mcp"] };
+  return {
+    command: process.execPath,
+    args: [path.join(PROJECT_ROOT, "src", "mcp.ts")],
+  };
 }

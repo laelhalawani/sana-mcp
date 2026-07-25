@@ -1,65 +1,122 @@
-import { SanaStore } from "../store/db.js";
+import {
+  SanaStore,
+  SyncGenerationChangedError,
+  type SyncCycleIdentity,
+} from "../store/db.js";
 import { SanaClient } from "../sana/client.js";
 import { SessionExpiredError } from "../sana/types.js";
 import { renderTranscript, countWords, transcriptLines } from "../sana/transcript.js";
-import { isDaemonAlive, acquireDaemonLock, releaseDaemonLock } from "./lock.js";
+import {
+  acquireDaemonLease,
+  DaemonLeaseLostError,
+  DaemonStaleOwnerError,
+  heartbeatDaemonLease,
+} from "./lock.js";
 import {
   semanticEnabled,
+  semanticCapabilityState,
   embedMeeting,
   EMBED_DIM,
   EMBED_MODEL,
   SemanticUnavailableError,
 } from "../semantic/semantic.js";
+import { RUNTIME_ENV } from "../runtime/env.js";
+import {
+  publishClientSession,
+  requireCurrentSession,
+} from "../sana/session-publication.js";
+import {
+  clearDaemonControl,
+  daemonStopRequested,
+  publishDaemonControl,
+  type DaemonControlIdentity,
+} from "./control.js";
 
-const INCREMENTAL_INTERVAL_MS = Number(process.env.SANA_SYNC_INTERVAL_MS ?? 10 * 60_000);
+const INCREMENTAL_INTERVAL_MS = RUNTIME_ENV.syncIntervalMs;
 const HEARTBEAT_MS = 5_000;
-const REQUEST_DELAY_MS = Number(process.env.SANA_REQUEST_DELAY_MS ?? 150);
+const REQUEST_DELAY_MS = RUNTIME_ENV.requestDelayMs;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
-function heartbeat(store: SanaStore): void {
-  store.updateSyncState({ daemon_pid: process.pid, daemon_heartbeat_ms: Date.now() });
+class DaemonStopRequestedError extends Error {
+  constructor() {
+    super("Daemon stop requested");
+    this.name = "DaemonStopRequestedError";
+  }
+}
+
+function heartbeat(
+  store: SanaStore,
+  control: DaemonControlIdentity,
+): boolean {
+  heartbeatDaemonLease(store, control.instanceId);
+  return daemonStopRequested(control.instanceId);
 }
 
 /** Sleep in small chunks so heartbeats keep flowing and shutdown is prompt. */
-async function heartbeatSleep(store: SanaStore, ms: number, stop: () => boolean): Promise<void> {
+async function heartbeatSleep(
+  store: SanaStore,
+  ms: number,
+  stop: () => boolean,
+  control: DaemonControlIdentity,
+): Promise<void> {
   const end = Date.now() + ms;
   while (Date.now() < end && !stop()) {
-    heartbeat(store);
+    if (heartbeat(store, control)) return;
     await sleep(Math.min(HEARTBEAT_MS, end - Date.now()));
   }
 }
 
-function markNeedsLogin(store: SanaStore): void {
-  store.updateSyncState({
-    phase: "needs_login",
-    message: "Not logged in. Run meeting_transcripts(\"login\", {email}).",
-    error: null,
-  });
+function markNeedsLogin(
+  store: SanaStore,
+  client: Pick<SanaClient, "sessionVersion">,
+): "marked" | "stale" {
+  return store.markNeedsLoginIfCurrent(
+    client.sessionVersion(),
+    "Not logged in. Run meeting_transcripts(\"login\", {email}).",
+  );
 }
 
 /** One sync cycle: refresh the meeting list, then download missing transcripts. */
-async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
-  const firstEver = store.getSyncState().last_full_sync_ms == null;
-  // When this cycle began. We only release the login block if this cycle
-  // started at/after the last catch-up request (see `caughtUp` below), so a
-  // login that races an in-flight cycle isn't prematurely reported complete.
-  const cycleStart = Date.now();
-
+export async function syncOnce(
+  store: SanaStore,
+  client: SanaClient,
+  cycle: SyncCycleIdentity,
+  leaseInstanceId: string,
+  stopRequested: () => boolean = () => false,
+): Promise<void> {
+  const heartbeatOrStop = (): void => {
+    heartbeatDaemonLease(store, leaseInstanceId);
+    if (stopRequested()) throw new DaemonStopRequestedError();
+  };
+  const initialState = store.getSyncState();
+  const identityChanged =
+    initialState.cache_user_id !== cycle.userId ||
+    initialState.cache_workspace_id !== cycle.workspaceId;
+  const firstEver =
+    identityChanged || initialState.last_full_sync_ms == null;
+  const writeAuthState = <Value>(operation: () => Value): Value =>
+    store.writeSyncGeneration(cycle, operation);
+  const write = <Value>(operation: () => Value): Value =>
+    store.writeCacheGeneration(cycle, operation);
   // --- refresh meeting list (stop early once a page is fully known, unless
   //     this is the very first sync where we want everything). ---
-  store.updateSyncState({
-    phase: "listing",
-    message: firstEver ? "Fetching your meetings..." : "Checking for new meetings...",
-    error: null,
+  writeAuthState(() => {
+    store.updateSyncState({
+      phase: "listing",
+      message: firstEver ? "Fetching your meetings..." : "Checking for new meetings...",
+      error: null,
+    });
   });
   let discovered = 0;
+  const listedAssets: Array<Parameters<SanaStore["upsertMeeting"]>[0]> = [];
   await client.walkMeetings((assets) => {
+    store.assertSyncGeneration(cycle);
     let newOnThisPage = 0;
     for (const a of assets) {
       const existed = store.getMeeting(a.id);
-      store.upsertMeeting({
+      listedAssets.push({
         id: a.id,
         external_id: a.externalId ?? null,
         name: a.name,
@@ -71,45 +128,64 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
       if (!existed) newOnThisPage++;
     }
     discovered += newOnThisPage;
-    heartbeat(store);
+    heartbeatOrStop();
+    store.assertSyncGeneration(cycle);
     // Incremental runs can stop once a whole page is already known.
-    if (!firstEver && newOnThisPage === 0) return false;
+    if (!identityChanged && !firstEver && newOnThisPage === 0) return false;
   });
 
+  if (identityChanged) {
+    // The complete listing succeeded for the authoritative identity, so the
+    // previous rebuildable cache can now be replaced without exposing it.
+    store.activateCacheIdentity(cycle);
+  }
+  write(() => {
+    for (const meeting of listedAssets) store.upsertMeeting(meeting);
+  });
   const total = store.countMeetings();
-  store.updateSyncState({ meetings_total: total });
+  write(() => {
+    store.updateSyncState({ meetings_total: total });
+  });
 
   // --- download transcript + metadata for incomplete meetings ---
   // A meeting is complete only when it has both a transcript and metadata; we
   // fetch just the missing part so existing transcripts are not re-downloaded.
   let incomplete = store.meetingsIncomplete();
-  const cap = Number(process.env.SANA_MAX_NEW_TRANSCRIPTS ?? 0);
+  const cap = RUNTIME_ENV.maxNewTranscripts;
   if (cap > 0) incomplete = incomplete.slice(0, cap);
-  store.updateSyncState({
-    phase: incomplete.length ? "downloading" : "synced",
-    transcripts_total: total,
-    transcripts_done: store.countComplete(),
-    message: incomplete.length ? `Downloading meetings: 0/${incomplete.length}...` : "Up to date.",
+  write(() => {
+    store.updateSyncState({
+      phase: incomplete.length ? "downloading" : "synced",
+      transcripts_total: total,
+      transcripts_done: store.countComplete(),
+      message: incomplete.length ? `Downloading meetings: 0/${incomplete.length}...` : "Up to date.",
+    });
   });
 
   let done = 0;
   let failed = 0;
   for (const id of incomplete) {
     try {
+      let transcript:
+        | Omit<import("../store/db.js").TranscriptRow, "fetched_ms">
+        | undefined;
       if (!store.getTranscript(id)) {
         const segs = await client.getTranscription(id);
-        store.saveTranscript({
+        transcript = {
           meeting_id: id,
           text: renderTranscript(segs),
           json: JSON.stringify(segs),
           word_count: countWords(segs),
           segment_count: segs.length,
-        });
+        };
       }
+      let metadata:
+        | Parameters<SanaStore["saveMetadata"]>[0]
+        | undefined;
       if (!store.getMetadata(id)) {
         const meta = await client.getMeetingById(id);
         const participants = await client.getMeetingParticipants(id);
-        store.saveMetadata({
+        metadata = {
           meeting_id: id,
           summary: (meta?.summary ?? null) as string | null,
           summary_short: (meta?.summaryShort ?? null) as string | null,
@@ -118,21 +194,30 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
             : null,
           participants_json: JSON.stringify(participants),
           has_recording: meta?.recordingUrl || meta?.fallbackRecordingUrl ? 1 : 0,
-        });
+        };
       }
-      store.clearFailure(id);
+      write(() => {
+        if (transcript) store.saveTranscript(transcript);
+        if (metadata) store.saveMetadata(metadata);
+        store.clearFailure(id);
+      });
       done++;
     } catch (e) {
       if (e instanceof SessionExpiredError) throw e; // abort the whole cycle
-      store.recordFailure(id, (e as Error).message);
+      if (e instanceof SyncGenerationChangedError) throw e;
+      write(() => {
+        store.recordFailure(id, (e as Error).message);
+      });
       failed++;
     }
     if ((done + failed) % 3 === 0 || done + failed === incomplete.length) {
-      store.updateSyncState({
-        transcripts_done: store.countComplete(),
-        message: `Downloading meetings: ${done}/${incomplete.length}${failed ? ` (${failed} failed)` : ""}...`,
+      write(() => {
+        store.updateSyncState({
+          transcripts_done: store.countComplete(),
+          message: `Downloading meetings: ${done}/${incomplete.length}${failed ? ` (${failed} failed)` : ""}...`,
+        });
       });
-      heartbeat(store);
+      heartbeatOrStop();
     }
     await sleep(REQUEST_DELAY_MS);
   }
@@ -142,13 +227,22 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
   // built with them --external), we do NOT fail the whole sync: we skip
   // embeddings for this run so the login block can still clear and keyword
   // search keeps working. Only a genuinely available-but-failing model retries.
+  const semanticState = semanticCapabilityState();
   let semanticUsable = semanticEnabled();
+  if (semanticState.kind === "unsupported") {
+    log(
+      "semantic search unavailable, continuing with keyword search:",
+      semanticState.message,
+    );
+  }
   if (semanticUsable) {
     const needEmbed = store.meetingsMissingEmbedding();
     if (needEmbed.length) {
-      store.updateSyncState({
-        phase: "downloading",
-        message: `Embedding meetings: 0/${needEmbed.length}...`,
+      write(() => {
+        store.updateSyncState({
+          phase: "downloading",
+          message: `Embedding meetings: 0/${needEmbed.length}...`,
+        });
       });
     }
     let emb = 0;
@@ -157,12 +251,26 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
         const t = store.getTranscript(id);
         if (!t) continue;
         const meeting = store.getMeeting(id);
+        if (meeting?.created_at_ms == null) {
+          throw new Error(
+            "Cannot create a semantic embedding because the meeting has no authoritative creation timestamp; refresh the meeting list before retrying.",
+          );
+        }
         const lines = transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text }));
-        await embedMeeting(store.db, id, meeting?.created_at_ms ?? Date.now(), lines);
-        store.markEmbedded(id, EMBED_DIM, EMBED_MODEL);
-        store.clearFailure(id);
+        await embedMeeting(
+          store.db,
+          id,
+          meeting.created_at_ms,
+          lines,
+          (commit) => write(commit),
+        );
+        write(() => {
+          store.markEmbedded(id, EMBED_DIM, EMBED_MODEL);
+          store.clearFailure(id);
+        });
         emb++;
       } catch (e) {
+        if (e instanceof SyncGenerationChangedError) throw e;
         if (e instanceof SemanticUnavailableError) {
           // Embeddings can't run in this environment; degrade to keyword-only
           // for the rest of this process and stop trying to embed.
@@ -170,11 +278,15 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
           log("semantic search unavailable, continuing with keyword search:", e.message);
           break;
         }
-        store.recordFailure(id, (e as Error).message);
+        write(() => {
+          store.recordFailure(id, (e as Error).message);
+        });
       }
       if (emb % 3 === 0 || emb === needEmbed.length) {
-        store.updateSyncState({ message: `Embedding meetings: ${emb}/${needEmbed.length}...` });
-        heartbeat(store);
+        write(() => {
+          store.updateSyncState({ message: `Embedding meetings: ${emb}/${needEmbed.length}...` });
+        });
+        heartbeatOrStop();
       }
     }
   }
@@ -184,9 +296,9 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
     store.meetingsIncomplete().length === 0 &&
     (!semanticUsable || store.meetingsMissingEmbedding().length === 0);
   // Finalize atomically: clear the login block only if this cycle both did all
-  // its work AND started at/after the pending catch-up request (see
-  // finishSyncCycle) - a single SQL statement, so a login committing
-  // blocking:1 mid-cycle is never clobbered by a stale read here.
+  // its work AND used the current confirmed authentication generation (see
+  // finishSyncCycle). This is one SQL statement, so a login committing a new
+  // generation mid-cycle cannot be clobbered by a stale cycle.
   store.finishSyncCycle({
     message: `Up to date - ${total} meetings, ${store.countComplete()} complete.`,
     meetings_total: total,
@@ -195,80 +307,200 @@ async function syncOnce(store: SanaStore, client: SanaClient): Promise<void> {
     last_full_sync_ms: firstEver ? now : store.getSyncState().last_full_sync_ms,
     last_incremental_ms: now,
     workDone,
-    cycleStart,
+    cycle,
   });
   if (discovered > 0 || done > 0) log(`sync: +${discovered} meetings, +${done} transcripts`);
 }
 
 export async function runDaemon(): Promise<void> {
   const store = new SanaStore();
-
-  if (isDaemonAlive(store)) {
-    log("daemon already running (pid", store.getSyncState().daemon_pid, ") - exiting");
-    return;
-  }
-
-  if (!acquireDaemonLock()) {
-    log("daemon lock held - exiting");
-    return;
-  }
-
+  let leaseAcquired = false;
+  let leaseInstanceId: string | undefined;
+  let control: DaemonControlIdentity | undefined;
+  let primaryError: unknown;
   let stopping = false;
   const stop = () => stopping;
   const shutdown = (sig: string) => {
     log("received", sig, "- shutting down");
     stopping = true;
   };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
-
-  heartbeat(store);
-  log("daemon started, pid", process.pid);
+  const onSigterm = () => shutdown("SIGTERM");
+  const onSigint = () => shutdown("SIGINT");
 
   try {
+    const claim = acquireDaemonLease(store);
+    if (claim.kind === "busy") {
+      if (claim.ownerHeartbeat === "stale") {
+        throw new DaemonStaleOwnerError(claim.ownerPid);
+      }
+      log("daemon already running (pid", claim.ownerPid, ") - exiting");
+      return;
+    }
+    leaseAcquired = true;
+    leaseInstanceId = claim.instanceId;
+    const activeControl = publishDaemonControl(process.pid, {
+      instanceId: claim.instanceId,
+    });
+    control = activeControl;
+    process.on("SIGTERM", onSigterm);
+    process.on("SIGINT", onSigint);
+
+    log("daemon started, pid", process.pid);
+
     while (!stopping) {
+      if (daemonStopRequested(activeControl.instanceId)) {
+        stopping = true;
+        break;
+      }
       const client = SanaClient.load();
       if (!client.hasAuthCookie()) {
-        markNeedsLogin(store);
-        await heartbeatSleep(store, 15_000, stop);
+        markNeedsLogin(store, client);
+        await heartbeatSleep(store, 15_000, stop, activeControl);
+        if (daemonStopRequested(activeControl.instanceId)) stopping = true;
         continue;
       }
+      let activeCycle: SyncCycleIdentity | undefined;
       try {
-        const me = await client.me();
-        if (!me) {
-          markNeedsLogin(store);
-          await heartbeatSleep(store, 15_000, stop);
+        const loadedVersion = client.sessionVersion();
+        if (
+          loadedVersion.generation > 0 &&
+          loadedVersion.publicationToken !== null &&
+          loadedVersion.userId != null &&
+          loadedVersion.workspaceId != null
+        ) {
+          activeCycle = requireCurrentSession(store, client);
+        }
+        await client.me();
+        publishClientSession(store, client, "refresh", loadedVersion);
+        const currentClient = SanaClient.load();
+        activeCycle = requireCurrentSession(store, currentClient);
+        await syncOnce(
+          store,
+          currentClient,
+          activeCycle,
+          activeControl.instanceId,
+          () => daemonStopRequested(activeControl.instanceId),
+        );
+      } catch (e) {
+        if (e instanceof DaemonLeaseLostError) throw e;
+        if (e instanceof DaemonStopRequestedError) {
+          stopping = true;
           continue;
         }
-        client.save();
-        await syncOnce(store, client);
-      } catch (e) {
+        if (e instanceof SyncGenerationChangedError) {
+          log("sync session changed; restarting with the confirmed generation");
+          continue;
+        }
         if (e instanceof SessionExpiredError) {
-          markNeedsLogin(store);
-          await heartbeatSleep(store, 15_000, stop);
+          if (markNeedsLogin(store, client) === "stale") continue;
+          await heartbeatSleep(store, 15_000, stop, activeControl);
+          if (daemonStopRequested(activeControl.instanceId)) stopping = true;
           continue;
         }
         log("sync error:", (e as Error).message);
-        store.updateSyncState({ phase: "error", error: (e as Error).message });
-        await heartbeatSleep(store, 30_000, stop);
+        if (activeCycle !== undefined) {
+          try {
+            store.writeSyncGeneration(activeCycle, () => {
+              store.updateSyncState({
+                phase: "error",
+                error: (e as Error).message,
+              });
+            });
+          } catch (stateError) {
+            if (stateError instanceof SyncGenerationChangedError) continue;
+            throw stateError;
+          }
+        }
+        await heartbeatSleep(store, 30_000, stop, activeControl);
+        if (daemonStopRequested(activeControl.instanceId)) stopping = true;
         continue;
       }
       if (store.getSyncState().blocking === 1) {
         // Catch-up not complete (transient failures remain retriable) - retry soon.
-        await heartbeatSleep(store, 10_000, stop);
+        await heartbeatSleep(store, 10_000, stop, activeControl);
       } else {
         // Wake early if a login requests a fresh catch-up (blocking flips to 1).
         await heartbeatSleep(
           store,
           INCREMENTAL_INTERVAL_MS,
-          () => stopping || store.getSyncState().blocking === 1
+          () => stopping || store.getSyncState().blocking === 1,
+          activeControl,
         );
       }
+      if (daemonStopRequested(activeControl.instanceId)) stopping = true;
     }
+  } catch (error) {
+    primaryError = error;
   } finally {
-    releaseDaemonLock();
-    store.updateSyncState({ daemon_pid: null, daemon_heartbeat_ms: null });
+    process.off("SIGTERM", onSigterm);
+    process.off("SIGINT", onSigint);
+    if (control !== undefined) {
+      try {
+        clearDaemonControl(control);
+      } catch (error) {
+        primaryError =
+          primaryError === undefined
+            ? error
+            : new AggregateError(
+                [primaryError, error],
+                "Daemon execution or control cleanup failed",
+              );
+      }
+    }
+    finalizeDaemonResources(
+      store,
+      leaseAcquired,
+      leaseInstanceId,
+      primaryError,
+    );
+    if (leaseAcquired) log("daemon stopped");
+  }
+}
+
+/**
+ * Complete daemon cleanup in successor-safe order. Each action is attempted
+ * even if an earlier action fails, and every failure remains observable.
+ *
+ * @internal Exported to exercise failure aggregation without starting a daemon.
+ */
+export function finalizeDaemonResources(
+  store: Pick<SanaStore, "clearDaemonIdentityIfOwned" | "close">,
+  leaseAcquired: boolean,
+  leaseInstanceId?: string,
+  primaryError?: unknown,
+): void {
+  const errors: unknown[] = [];
+  if (primaryError !== undefined) errors.push(primaryError);
+
+  if (leaseAcquired) {
+    try {
+      if (leaseInstanceId === undefined) {
+        throw new Error(
+          "Acquired daemon lease is missing its instance identity",
+        );
+      }
+      const result = store.clearDaemonIdentityIfOwned(
+        process.pid,
+        leaseInstanceId,
+      );
+      if (result === "not-owner") {
+        log(
+          "daemon identity was not cleared because it no longer belongs to pid",
+          process.pid,
+        );
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  try {
     store.close();
-    log("daemon stopped");
+  } catch (error) {
+    errors.push(error);
+  }
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Daemon execution or cleanup failed");
   }
 }
