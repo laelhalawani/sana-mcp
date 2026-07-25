@@ -2,7 +2,7 @@
 # Install the latest sana-mcp release:
 #   sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.sh
 # Pin a release:
-#   SANA_MCP_VERSION=v0.4.1 sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Lumen-AiApp/sana-ai-mcp/releases/download/v0.4.1/install.sh
+#   SANA_MCP_VERSION=v0.4.2 sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Lumen-AiApp/sana-ai-mcp/releases/download/v0.4.2/install.sh
 set -eu
 set -f
 umask 077
@@ -730,7 +730,8 @@ read_properties() {
   properties_file=$1
   P_format=""; P_manifestVersion=""; P_manifestSha256=""
   P_packageVersion=""; P_releaseTag=""; P_sourceCommit=""; P_installerProtocol=""
-  P_lifecycleProtocol=""; P_inspectProtocol=""; P_semanticCapability=""
+  P_lifecycleProtocol=""; P_inspectProtocol=""; P_stateCompatibility=""
+  P_semanticCapability=""; P_installerAssetName=""; P_installerSha256=""
   P_target=""; P_libc=""; P_assetName=""; P_checksumFileName=""; P_sha256=""
   seen=" "
   while IFS= read -r line || [ -n "$line" ]; do
@@ -759,7 +760,10 @@ read_properties() {
       installerProtocol) P_installerProtocol=$value ;;
       lifecycleProtocol) P_lifecycleProtocol=$value ;;
       inspectProtocol) P_inspectProtocol=$value ;;
+      stateCompatibility) P_stateCompatibility=$value ;;
       semanticCapability) P_semanticCapability=$value ;;
+      installerAssetName) P_installerAssetName=$value ;;
+      installerSha256) P_installerSha256=$value ;;
       target) P_target=$value ;;
       libc) P_libc=$value ;;
       assetName) P_assetName=$value ;;
@@ -774,7 +778,17 @@ read_properties() {
   [ "$P_installerProtocol" = "1" ] || fail "unsupported installer protocol"
   [ "$P_lifecycleProtocol" = "1" ] || fail "unsupported lifecycle protocol"
   [ "$P_inspectProtocol" = "1" ] || fail "unsupported inspect protocol"
+  case "$P_stateCompatibility" in
+    ""|0|0*|*[!0-9]*) fail "release state compatibility is invalid" ;;
+  esac
   [ "$P_semanticCapability" = "keyword" ] || fail "unsupported binary capability"
+  [ "$P_installerAssetName" = "install.sh" ] ||
+    fail "release metadata does not bind the POSIX installer"
+  [ "${#P_installerSha256}" -eq 64 ] ||
+    fail "release installer SHA-256 is invalid"
+  case "$P_installerSha256" in
+    *[!a-f0-9]*) fail "release installer SHA-256 is invalid" ;;
+  esac
   [ "$P_target" = "$target" ] || fail "release metadata target does not match this system"
   [ "$P_releaseTag" = "v$P_packageVersion" ] || fail "release version and tag do not match"
   validate_release_tag "$P_releaseTag"
@@ -819,8 +833,10 @@ read_inspect() {
   inspect_file=$1
   expected_version=$2
   expected_target=$3
+  inspect_context=$4
   I_inspectProtocol=""; I_version=""; I_target=""
-  I_installerProtocol=""; I_lifecycleProtocol=""; I_semanticCapability=""
+  I_installerProtocol=""; I_lifecycleProtocol=""; I_stateCompatibility=""
+  I_semanticCapability=""
   seen=" "
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
@@ -841,23 +857,52 @@ read_inspect() {
       target) I_target=$value ;;
       installerProtocol) I_installerProtocol=$value ;;
       lifecycleProtocol) I_lifecycleProtocol=$value ;;
+      stateCompatibility) I_stateCompatibility=$value ;;
       semanticCapability) I_semanticCapability=$value ;;
       *) fail "downloaded binary returned an unknown inspection field" ;;
     esac
   done < "$inspect_file"
-  [ "$I_inspectProtocol" = "1" ] &&
+
+  case "$inspect_context" in
+    release)
+      expected_installer_protocol=$P_installerProtocol
+      expected_lifecycle_protocol=$P_lifecycleProtocol
+      expected_inspect_protocol=$P_inspectProtocol
+      expected_state_compatibility=$P_stateCompatibility
+      [ -n "$I_stateCompatibility" ] ||
+        fail "downloaded binary did not report state compatibility"
+      ;;
+    receipt)
+      expected_installer_protocol=$R_installerProtocol
+      expected_lifecycle_protocol=$R_lifecycleProtocol
+      expected_inspect_protocol=$R_inspectProtocol
+      expected_state_compatibility=$R_stateCompatibility
+      if [ "$R_format" = "sana-mcp-install-v1" ] &&
+        [ -z "$I_stateCompatibility" ]; then
+        I_stateCompatibility=1
+      fi
+      [ -n "$I_stateCompatibility" ] ||
+        fail "existing binary did not report the state compatibility in its installer receipt"
+      ;;
+    *) fail "installer inspection context is invalid" ;;
+  esac
+
+  [ "$I_inspectProtocol" = "$expected_inspect_protocol" ] &&
     [ "$I_version" = "$expected_version" ] &&
     [ "$I_target" = "$expected_target" ] &&
-    [ "$I_installerProtocol" = "1" ] &&
-    [ "$I_lifecycleProtocol" = "1" ] &&
+    [ "$I_installerProtocol" = "$expected_installer_protocol" ] &&
+    [ "$I_lifecycleProtocol" = "$expected_lifecycle_protocol" ] &&
+    [ "$I_stateCompatibility" = "$expected_state_compatibility" ] &&
     [ "$I_semanticCapability" = "keyword" ] ||
-    fail "downloaded binary identity does not match the release manifest"
+    fail "binary identity does not match its authoritative release metadata"
 }
 
 read_receipt() {
   receipt_file=$1
   R_format=""; R_version=""; R_target=""; R_sourceCommit=""
   R_binarySha256=""; R_pathProfile=""; R_pathBlockSha256=""
+  R_installerProtocol=""; R_lifecycleProtocol=""; R_inspectProtocol=""
+  R_stateCompatibility=""
   seen=" "
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
@@ -880,11 +925,33 @@ read_receipt() {
       binarySha256) R_binarySha256=$value ;;
       pathProfile) R_pathProfile=$value ;;
       pathBlockSha256) R_pathBlockSha256=$value ;;
+      installerProtocol) R_installerProtocol=$value ;;
+      lifecycleProtocol) R_lifecycleProtocol=$value ;;
+      inspectProtocol) R_inspectProtocol=$value ;;
+      stateCompatibility) R_stateCompatibility=$value ;;
       *) fail "installer receipt contains an unknown key" ;;
     esac
   done < "$receipt_file"
-  [ "$R_format" = "sana-mcp-install-v1" ] ||
-    fail "existing binary has no supported installer receipt"
+  case "$R_format" in
+    sana-mcp-install-v1)
+      [ -z "$R_installerProtocol$R_lifecycleProtocol$R_inspectProtocol$R_stateCompatibility" ] ||
+        fail "version 1 installer receipt contains version 2 state"
+      R_installerProtocol=1
+      R_lifecycleProtocol=1
+      R_inspectProtocol=1
+      R_stateCompatibility=1
+      ;;
+    sana-mcp-install-v2)
+      [ "$R_installerProtocol" = "1" ] &&
+        [ "$R_lifecycleProtocol" = "1" ] &&
+        [ "$R_inspectProtocol" = "1" ] ||
+        fail "version 2 installer receipt protocol state is invalid"
+      case "$R_stateCompatibility" in
+        ""|0|0*|*[!0-9]*) fail "version 2 installer receipt state compatibility is invalid" ;;
+      esac
+      ;;
+    *) fail "existing binary has no supported installer receipt" ;;
+  esac
   validate_release_tag "v$R_version"
   [ "${#R_sourceCommit}" -eq 40 ] || fail "installer receipt source commit is invalid"
   [ "${#R_binarySha256}" -eq 64 ] || fail "installer receipt binary hash is invalid"
@@ -1161,7 +1228,7 @@ download_binary "$base_url/$P_assetName" "$tmp_dir/binary" ||
 chmod 755 "$tmp_dir/binary"
 "$tmp_dir/binary" __inspect --format properties > "$tmp_dir/inspect.properties" ||
   fail "downloaded binary could not report its release identity"
-read_inspect "$tmp_dir/inspect.properties" "$P_packageVersion" "$P_target"
+read_inspect "$tmp_dir/inspect.properties" "$P_packageVersion" "$P_target" release
 
 if [ -n "${SANA_MCP_INSTALL_DIR:-}" ]; then
   install_dir=$SANA_MCP_INSTALL_DIR
@@ -1214,11 +1281,21 @@ if [ -e "$dest" ] || [ -e "$receipt" ]; then
   read_receipt "$receipt"
   [ "$R_target" = "$target" ] ||
     fail "existing installer receipt targets a different platform"
-  [ "$(hash_file "$dest")" = "$R_binarySha256" ] ||
+  current_binary_sha256=$(hash_file "$dest")
+  [ "$current_binary_sha256" = "$R_binarySha256" ] ||
     fail "existing binary changed after installation; refusing to overwrite it"
+  if [ "${SANA_MCP_UPDATE:-0}" = "1" ]; then
+    [ "${SANA_MCP_EXPECTED_INSTALLED_VERSION:-}" = "$R_version" ] &&
+      [ "${SANA_MCP_EXPECTED_INSTALLED_TARGET:-}" = "$R_target" ] &&
+      [ "${SANA_MCP_EXPECTED_INSTALLED_SHA256:-}" = "$current_binary_sha256" ] &&
+      [ "${SANA_MCP_EXPECTED_INSTALLED_STATE_COMPATIBILITY:-}" = "$R_stateCompatibility" ] ||
+      fail "installed runtime changed after sana-mcp update obtained authority"
+  fi
   "$dest" __inspect --format properties > "$tmp_dir/old-inspect.properties" ||
     fail "existing binary cannot prove its installer identity"
-  read_inspect "$tmp_dir/old-inspect.properties" "$R_version" "$R_target"
+  read_inspect "$tmp_dir/old-inspect.properties" "$R_version" "$R_target" receipt
+  [ "$R_stateCompatibility" = "$P_stateCompatibility" ] ||
+    fail "existing local state is incompatible with this release; automatic POSIX state replacement is not supported yet"
   "$dest" __lifecycle health --format properties > "$tmp_dir/lifecycle.properties" ||
     fail "existing runtime does not support the required lifecycle protocol"
   read_lifecycle "$tmp_dir/lifecycle.properties"
@@ -1228,6 +1305,8 @@ if [ -e "$dest" ] || [ -e "$receipt" ]; then
   old_present=1
   path_profile=$R_pathProfile
 else
+  [ "${SANA_MCP_UPDATE:-0}" != "1" ] ||
+    fail "installed runtime changed after sana-mcp update obtained authority"
   if [ -n "${HOME:-}" ]; then
     path_profile=$(select_path_profile)
   else
@@ -1302,13 +1381,17 @@ fi
 PATH="$install_dir:${PATH:-}"; export PATH
 
 {
-  printf '%s\n' 'format=sana-mcp-install-v1'
+  printf '%s\n' 'format=sana-mcp-install-v2'
   printf 'version=%s\n' "$P_packageVersion"
   printf 'target=%s\n' "$P_target"
   printf 'sourceCommit=%s\n' "$P_sourceCommit"
   printf 'binarySha256=%s\n' "$P_sha256"
   printf 'pathProfile=%s\n' "$path_profile"
   printf 'pathBlockSha256=%s\n' "$expected_path_hash"
+  printf 'installerProtocol=%s\n' "$P_installerProtocol"
+  printf 'lifecycleProtocol=%s\n' "$P_lifecycleProtocol"
+  printf 'inspectProtocol=%s\n' "$P_inspectProtocol"
+  printf 'stateCompatibility=%s\n' "$P_stateCompatibility"
 } > "$tmp_dir/new-receipt"
 staged_receipt=$(mktemp "$install_dir/.sana-mcp-receipt.XXXXXX") ||
   fail "could not stage the installer receipt in $install_dir"
@@ -1319,16 +1402,21 @@ assert_installer_locks_owned
 mv -f "$staged_receipt" "$receipt"
 staged_receipt=""
 
-config_journal_dir="$install_dir/.sana-mcp-config-transaction"
-config_journal_file="$config_journal_dir/client-config-transaction.json"
-[ ! -L "$config_journal_dir" ] ||
-  fail "client configuration journal directory must not be a symbolic link"
-if [ -e "$config_journal_file" ] || [ -L "$config_journal_file" ]; then
-  config_journal_preexisting=1
+if [ "$old_present" = "0" ]; then
+  config_journal_dir="$install_dir/.sana-mcp-config-transaction"
+  config_journal_file="$config_journal_dir/client-config-transaction.json"
+  [ ! -L "$config_journal_dir" ] ||
+    fail "client configuration journal directory must not be a symbolic link"
+  if [ -e "$config_journal_file" ] || [ -L "$config_journal_file" ]; then
+    config_journal_preexisting=1
+  fi
 fi
 configure_status=0
 config_interactive_attempted=0
-if [ "${SANA_MCP_YES:-0}" = "1" ]; then
+if [ "$old_present" = "1" ]; then
+  config_transaction_state=no-mutation
+  printf '%s\n' "Existing client configuration was left unchanged."
+elif [ "${SANA_MCP_YES:-0}" = "1" ]; then
   live_state_touched=1
   assert_installer_locks_owned
   set +e

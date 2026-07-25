@@ -4,6 +4,7 @@ export const SUPPORTED_RELEASE_PROTOCOLS = Object.freeze({
   installerProtocol: 1,
   lifecycleProtocol: 1,
   inspectProtocol: 1,
+  stateCompatibility: 1,
 } as const);
 
 export const SOURCE_SEMANTIC_CAPABILITY = "source-semantic" as const;

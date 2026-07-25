@@ -77,13 +77,50 @@ test("assembles one complete manifest-bound release tuple", async () => {
       manifest.assets.map((asset) => asset.target),
       RELEASE_TARGETS,
     );
+    assert.equal(
+      manifest.stateCompatibility,
+      SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility,
+    );
     const diskManifest = parseReleaseManifestJson(
       await readFile(path.join(output, "manifest.json"), "utf8"),
     );
     assert.deepEqual(diskManifest, manifest);
+    const futureStateManifest = structuredClone(manifest);
+    (futureStateManifest as { stateCompatibility: number }).stateCompatibility =
+      SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility + 1;
+    assert.equal(
+      parseReleaseManifestJson(JSON.stringify(futureStateManifest))
+        .stateCompatibility,
+      SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility + 1,
+    );
+    for (const invalidStateCompatibility of [0, -1, 1.5, "1", null]) {
+      const invalidManifest = structuredClone(manifest) as unknown as Record<
+        string,
+        unknown
+      >;
+      invalidManifest.stateCompatibility = invalidStateCompatibility;
+      assert.throws(() =>
+        parseReleaseManifestJson(JSON.stringify(invalidManifest)),
+      );
+    }
+    const missingStateCompatibility = structuredClone(manifest) as unknown as Record<
+      string,
+      unknown
+    >;
+    delete missingStateCompatibility.stateCompatibility;
+    assert.throws(() =>
+      parseReleaseManifestJson(JSON.stringify(missingStateCompatibility)),
+    );
 
     const manifestSha256 = await sha256File(path.join(output, "manifest.json"));
+    const installerSha256 = {
+      "install.ps1": await sha256File(path.join(output, "install.ps1")),
+      "install.sh": await sha256File(path.join(output, "install.sh")),
+    } as const;
     for (const asset of manifest.assets) {
+      const installerAssetName = asset.target.startsWith("bun-windows-")
+        ? "install.ps1"
+        : "install.sh";
       const properties = await readFile(
         path.join(output, releaseMetadataFileName(asset.target)),
         "utf8",
@@ -93,9 +130,40 @@ test("assembles one complete manifest-bound release tuple", async () => {
       assert.match(properties, new RegExp(`^sourceCommit=${sourceCommit}$`, "m"));
       assert.match(properties, new RegExp(`^target=${asset.target}$`, "m"));
       assert.match(properties, new RegExp(`^assetName=${asset.assetName}$`, "m"));
+      assert.match(
+        properties,
+        new RegExp(
+          `^stateCompatibility=${SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility}$`,
+          "m",
+        ),
+      );
+      assert.match(
+        properties,
+        new RegExp(`^installerAssetName=${installerAssetName}$`, "m"),
+      );
+      assert.match(
+        properties,
+        new RegExp(
+          `^installerSha256=${installerSha256[installerAssetName]}$`,
+          "m",
+        ),
+      );
       assert.equal(
         await sha256File(path.join(output, asset.assetName)),
         asset.sha256,
+      );
+    }
+    for (const installerAssetName of [
+      "install.ps1",
+      "install.sh",
+    ] as const) {
+      assert.equal(
+        await readFile(path.join(output, `${installerAssetName}.sha256`), "utf8"),
+        `${installerSha256[installerAssetName]}  ${installerAssetName}\n`,
+      );
+      assert.equal(
+        installerSha256[installerAssetName],
+        await sha256File(path.join(process.cwd(), installerAssetName)),
       );
     }
 
@@ -103,7 +171,9 @@ test("assembles one complete manifest-bound release tuple", async () => {
       (await readdir(output)).sort(),
       [
         "install.ps1",
+        "install.ps1.sha256",
         "install.sh",
+        "install.sh.sha256",
         "manifest.json",
         "manifest.json.sha256",
         "manifest.schema.json",
@@ -193,6 +263,30 @@ test("rejects stale artifacts, incomplete matrices, and mismatched tags", async 
         artifactsDirectory: artifacts,
         outputDirectory: path.join(temporary, "incomplete"),
       }),
+    );
+
+    await makeArtifacts(artifacts);
+    const incompatibleAttestationPath = path.join(
+      artifacts,
+      `attestation-${RELEASE_TARGETS[1]}.json`,
+    );
+    const incompatibleAttestation = JSON.parse(
+      await readFile(incompatibleAttestationPath, "utf8"),
+    ) as { inspect: { stateCompatibility: number } };
+    incompatibleAttestation.inspect.stateCompatibility =
+      SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility + 1;
+    await writeFile(
+      incompatibleAttestationPath,
+      `${JSON.stringify(incompatibleAttestation)}\n`,
+    );
+    await assert.rejects(
+      assembleRelease({
+        releaseTag: `v${packageMetadata.version}`,
+        sourceCommit,
+        artifactsDirectory: artifacts,
+        outputDirectory: path.join(temporary, "incompatible-state"),
+      }),
+      /stateCompatibility/,
     );
   } finally {
     await rm(temporary, { recursive: true, force: true });

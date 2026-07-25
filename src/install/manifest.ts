@@ -59,6 +59,7 @@ export interface ReleaseManifest {
   readonly installerProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.installerProtocol;
   readonly lifecycleProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.lifecycleProtocol;
   readonly inspectProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol;
+  readonly stateCompatibility: number;
   readonly semanticCapability: ReleaseSemanticCapability;
   readonly assets: readonly ReleaseAsset[];
 }
@@ -185,6 +186,7 @@ const releaseManifestSchema = z
     installerProtocol: z.literal(SUPPORTED_RELEASE_PROTOCOLS.installerProtocol),
     lifecycleProtocol: z.literal(SUPPORTED_RELEASE_PROTOCOLS.lifecycleProtocol),
     inspectProtocol: z.literal(SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol),
+    stateCompatibility: z.number().int().positive(),
     semanticCapability: z.literal(STANDALONE_SEMANTIC_CAPABILITY),
     assets: z.array(releaseAssetSchema).min(1).max(RELEASE_TARGETS.length),
   })

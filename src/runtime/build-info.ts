@@ -29,6 +29,7 @@ declare const __SANA_BUILD_TARGET__: unknown;
 declare const __SANA_INSTALLER_PROTOCOL__: unknown;
 declare const __SANA_LIFECYCLE_PROTOCOL__: unknown;
 declare const __SANA_INSPECT_PROTOCOL__: unknown;
+declare const __SANA_STATE_COMPATIBILITY__: unknown;
 declare const __SANA_SEMANTIC_CAPABILITY__: unknown;
 
 const packageVersionSchema = z
@@ -49,6 +50,9 @@ const standaloneMarkersSchema = z
       SUPPORTED_RELEASE_PROTOCOLS.lifecycleProtocol,
     ),
     inspectProtocol: z.literal(SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol),
+    stateCompatibility: z.literal(
+      SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility,
+    ),
     semanticCapability: z.literal(STANDALONE_SEMANTIC_CAPABILITY),
   })
   .strict();
@@ -62,6 +66,7 @@ export type BuildInfo =
       installerProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.installerProtocol;
       lifecycleProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.lifecycleProtocol;
       inspectProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol;
+      stateCompatibility: typeof SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility;
       semanticCapability: typeof SOURCE_SEMANTIC_CAPABILITY;
     }>
   | Readonly<{
@@ -72,6 +77,7 @@ export type BuildInfo =
       installerProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.installerProtocol;
       lifecycleProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.lifecycleProtocol;
       inspectProtocol: typeof SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol;
+      stateCompatibility: typeof SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility;
       semanticCapability: typeof STANDALONE_SEMANTIC_CAPABILITY;
     }>;
 
@@ -82,6 +88,7 @@ export interface BuildMarkers {
   readonly installerProtocol?: unknown;
   readonly lifecycleProtocol?: unknown;
   readonly inspectProtocol?: unknown;
+  readonly stateCompatibility?: unknown;
   readonly semanticCapability?: unknown;
 }
 
@@ -161,6 +168,10 @@ function injectedBuildMarkers(): BuildMarkers {
       typeof __SANA_INSPECT_PROTOCOL__ === "undefined"
         ? undefined
         : __SANA_INSPECT_PROTOCOL__,
+    stateCompatibility:
+      typeof __SANA_STATE_COMPATIBILITY__ === "undefined"
+        ? undefined
+        : __SANA_STATE_COMPATIBILITY__,
     semanticCapability:
       typeof __SANA_SEMANTIC_CAPABILITY__ === "undefined"
         ? undefined
@@ -188,6 +199,7 @@ export function serializeStandaloneBuildInfoProperties(
     `target=${info.target}`,
     `installerProtocol=${info.installerProtocol}`,
     `lifecycleProtocol=${info.lifecycleProtocol}`,
+    `stateCompatibility=${info.stateCompatibility}`,
     `semanticCapability=${info.semanticCapability}`,
     "",
   ].join("\n");
@@ -257,6 +269,9 @@ export function createStandaloneBuildConfig(
       ),
       __SANA_INSPECT_PROTOCOL__: String(
         SUPPORTED_RELEASE_PROTOCOLS.inspectProtocol,
+      ),
+      __SANA_STATE_COMPATIBILITY__: String(
+        SUPPORTED_RELEASE_PROTOCOLS.stateCompatibility,
       ),
       __SANA_SEMANTIC_CAPABILITY__: JSON.stringify(
         STANDALONE_SEMANTIC_CAPABILITY,
