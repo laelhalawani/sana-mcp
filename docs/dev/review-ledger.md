@@ -1873,3 +1873,6 @@ Final validation evidence:
 - the final bounded tag-visibility correction passed its workflow contract test,
   behavioral publication test, typecheck, and diff validation; a fresh reviewer
   returned zero findings.
+- the post-release main workflow authorized the existing `v0.4.5` and skipped
+  every build/publication job successfully; final local cleanup reported zero
+  isolated test roots and zero test Sana processes.
