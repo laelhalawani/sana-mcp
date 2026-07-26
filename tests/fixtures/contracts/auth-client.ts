@@ -71,6 +71,10 @@ export class SanaClient {
     return scenario !== "signed-out";
   }
 
+  pendingSignInChallenge(): null {
+    return null;
+  }
+
   sessionVersion(): Readonly<{
     generation: number;
     publicationToken: string;

@@ -8,6 +8,7 @@ import {
   inspectConfigOwnership,
   planFileChange,
 } from "../../src/install/writers.js";
+import { claudeCodePredecessorEntry } from "../../src/install/clients.js";
 
 const target = { command: "/opt/sana-mcp", args: ["mcp"] };
 
@@ -112,6 +113,46 @@ test("foreign same-name entries are never replaced or removed", () => {
     assert.equal(plan(file).state, "collision");
     assert.equal(plan(file, "remove").state, "collision");
     assert.equal(fs.readFileSync(file, "utf8"), original);
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+
+test("an exact predecessor entry is owned, unchanged on register, and removable", () => {
+  const directory = temporaryDirectory();
+  const file = path.join(directory, "client.json");
+  const predecessor = {
+    type: "stdio",
+    command: target.command,
+    args: target.args,
+    env: {},
+  };
+  const original = `${JSON.stringify({
+    mcpServers: { "sana-mcp": predecessor },
+    retained: true,
+  })}\n`;
+  const options = {
+    file,
+    format: "json" as const,
+    topKey: "mcpServers",
+    name: "sana-mcp",
+    target,
+    predecessors: [claudeCodePredecessorEntry],
+  };
+  try {
+    fs.writeFileSync(file, original);
+    assert.equal(
+      planFileChange({ ...options, operation: "register" }).state,
+      "noop",
+    );
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+    const removal = planFileChange({ ...options, operation: "remove" });
+    assert.equal(removal.state, "ready");
+    assert.equal(applyFileChange(removal).state, "applied");
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), {
+      mcpServers: {},
+      retained: true,
+    });
   } finally {
     fs.rmSync(directory, { recursive: true });
   }
