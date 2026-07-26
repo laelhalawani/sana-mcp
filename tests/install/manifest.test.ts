@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import packageMetadata from "../../package.json" with { type: "json" };
 import {
   RELEASE_MANIFEST_VERSION,
   RELEASE_TARGETS,
@@ -321,8 +322,8 @@ test("parses the versioned manifest and preserves every exact declared mapping",
   assert.equal(lifecycleProtocol, 1);
   assert.equal(inspectProtocol, 1);
   assert.equal(manifest.manifestVersion, 1);
-  assert.equal(manifest.packageVersion, "0.4.5");
-  assert.equal(manifest.releaseTag, "v0.4.5");
+  assert.equal(manifest.packageVersion, packageMetadata.version);
+  assert.equal(manifest.releaseTag, `v${packageMetadata.version}`);
   assert.equal(
     manifest.sourceCommit,
     "0123456789abcdef0123456789abcdef01234567",
