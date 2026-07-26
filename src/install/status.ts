@@ -44,6 +44,7 @@ export async function registrationStatus(
     name,
     target,
     build: client.install.build,
+    predecessors: client.install.predecessors,
   });
   return { ...ownership, pathState: "known", file: resolution.path };
 }

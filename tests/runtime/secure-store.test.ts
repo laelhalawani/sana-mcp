@@ -831,4 +831,391 @@ describe("private SQLite storage", () => {
     `);
     expect(child.status, child.stderr).toBe(0);
   });
+
+  test("pid-less request-code recovery is identical for claim and reconcile", () => {
+    const { child } = isolatedStore(`
+      const readyToken =
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const requestToken =
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const readyTuple = {
+        generation: 1,
+        publicationToken: readyToken,
+        userId: "user-ready",
+        workspaceId: "workspace-ready",
+      };
+      const immediate = new SanaStore(file + ".immediate");
+      const readyLogin = immediate.claimAuthPublication(
+        {
+          generation: 0,
+          publicationToken: null,
+          userId: null,
+          workspaceId: null,
+        },
+        {
+          userId: readyTuple.userId,
+          workspaceId: readyTuple.workspaceId,
+        },
+        "login",
+        readyToken,
+        90,
+        () => false,
+      );
+      if (readyLogin.kind !== "acquired") {
+        throw new Error("ready-cache login setup failed");
+      }
+      immediate.confirmAuthPublication(readyLogin.intent, 1);
+      immediate.activateCacheIdentity(readyTuple);
+      immediate.updateSyncState({
+        phase: "synced",
+        blocking: 0,
+        auth_pending: 0,
+      });
+      const pendingRequest = immediate.claimAuthPublication(
+        readyTuple,
+        {
+          userId: readyTuple.userId,
+          workspaceId: readyTuple.workspaceId,
+        },
+        "request-code",
+        requestToken,
+        91,
+        () => false,
+      );
+      if (pendingRequest.kind !== "acquired") {
+        throw new Error("ready-cache request-code claim failed");
+      }
+      immediate.confirmAuthPublication(pendingRequest.intent, 2);
+      const immediateState = immediate.getSyncState();
+      let oldCacheRejected = false;
+      try {
+        immediate.captureCacheOperation({
+          ...readyTuple,
+          generation: 2,
+          publicationToken: requestToken,
+        });
+      } catch (error) {
+        oldCacheRejected = error?.code === "CACHE_OPERATION_CHANGED";
+      }
+      if (
+        immediateState.blocking !== 1 ||
+        immediateState.auth_pending !== 0 ||
+        immediateState.auth_issue_code !== null ||
+        immediateState.auth_user_id !== readyTuple.userId ||
+        immediateState.auth_workspace_id !== readyTuple.workspaceId ||
+        immediateState.cache_user_id !== readyTuple.userId ||
+        immediateState.cache_workspace_id !== readyTuple.workspaceId ||
+        !oldCacheRejected
+      ) {
+        throw new Error(
+          "confirmed request-code exposed the previously ready cache",
+        );
+      }
+      immediate.close();
+
+      const source = {
+        generation: 0,
+        publicationToken: null,
+        userId: null,
+        workspaceId: null,
+      };
+      const targetA = {
+        generation: 1,
+        publicationToken: "11111111-1111-4111-8111-111111111111",
+        userId: null,
+        workspaceId: null,
+      };
+      const tokenA = targetA.publicationToken;
+      const tokenB = "22222222-2222-4222-8222-222222222222";
+      const claimRequest = (store, token, pid, observed = source) =>
+        store.claimAuthPublication(
+          observed,
+          { userId: null, workspaceId: null },
+          "request-code",
+          token,
+          pid,
+          () => false,
+        );
+      const leavePersistenceUnknown = (store, claim) => {
+        if (claim.kind !== "acquired") {
+          throw new Error("request-code setup claim failed");
+        }
+        if (
+          store.markAuthPublicationIncomplete(
+            claim.intent,
+            "AUTH_SESSION_PERSISTENCE_UNKNOWN",
+            "request-code persistence was uncertain",
+            1,
+          ) !== "released"
+        ) {
+          throw new Error("request-code owner was not released");
+        }
+        const state = store.getSyncState();
+        if (
+          state.auth_transition_pid !== null ||
+          state.auth_transition_token !== claim.intent.operationToken ||
+          state.auth_transition_kind !== "request-code" ||
+          state.auth_issue_code !== null ||
+          state.auth_issue_message !== null ||
+          state.auth_pending !== 0 ||
+          state.blocking !== 0
+        ) {
+          throw new Error(
+            "request-code uncertainty manufactured an issue or cache block",
+          );
+        }
+      };
+
+      const reconcileSource = new SanaStore(file + ".reconcile-source");
+      reconcileSource.updateSyncState({ blocking: 0, auth_pending: 0 });
+      leavePersistenceUnknown(
+        reconcileSource,
+        claimRequest(reconcileSource, tokenA, 101),
+      );
+      const sourceRecovered = reconcileSource.reconcileAuthState(
+        source,
+        () => false,
+      );
+      if (
+        sourceRecovered.kind !== "current" ||
+        reconcileSource.getSyncState().auth_transition_token !== null ||
+        reconcileSource.getSyncState().blocking !== 0
+      ) {
+        throw new Error(
+          "reconcile did not abort the unwritten request at its source block",
+        );
+      }
+      if (claimRequest(reconcileSource, tokenB, 102).kind !== "acquired") {
+        throw new Error("next request could not start after reconcile recovery");
+      }
+      reconcileSource.close();
+
+      const claimSource = new SanaStore(file + ".claim-source");
+      claimSource.updateSyncState({ blocking: 0, auth_pending: 0 });
+      leavePersistenceUnknown(
+        claimSource,
+        claimRequest(claimSource, tokenA, 201),
+      );
+      const claimRecovered = claimRequest(claimSource, tokenB, 202);
+      if (
+        claimRecovered.kind !== "acquired" ||
+        claimSource.getSyncState().auth_transition_token !== tokenB ||
+        claimSource.getSyncState().blocking !== 0
+      ) {
+        throw new Error("claim did not use the same source-tuple recovery");
+      }
+      claimSource.close();
+
+      const reconcileTarget = new SanaStore(file + ".reconcile-target");
+      reconcileTarget.updateSyncState({ blocking: 0, auth_pending: 0 });
+      leavePersistenceUnknown(
+        reconcileTarget,
+        claimRequest(reconcileTarget, tokenA, 301),
+      );
+      const targetRecovered = reconcileTarget.reconcileAuthState(
+        targetA,
+        () => false,
+      );
+      if (
+        targetRecovered.kind !== "current" ||
+        targetRecovered.generation !== 1 ||
+        reconcileTarget.getSyncState().auth_publication_token !== tokenA ||
+        reconcileTarget.getSyncState().blocking !== 1
+      ) {
+        throw new Error(
+          "reconcile did not block after confirming the durable target tuple",
+        );
+      }
+      reconcileTarget.close();
+
+      const claimTarget = new SanaStore(file + ".claim-target");
+      claimTarget.updateSyncState({ blocking: 0, auth_pending: 0 });
+      leavePersistenceUnknown(
+        claimTarget,
+        claimRequest(claimTarget, tokenA, 401),
+      );
+      const targetThenClaimed = claimRequest(
+        claimTarget,
+        tokenB,
+        402,
+        targetA,
+      );
+      if (
+        targetThenClaimed.kind !== "acquired" ||
+        targetThenClaimed.intent.targetGeneration !== 2 ||
+        targetThenClaimed.intent.sourceGeneration !== 1 ||
+        claimTarget.getSyncState().blocking !== 1
+      ) {
+        throw new Error("claim did not confirm target before the next request");
+      }
+      claimTarget.close();
+
+      const live = new SanaStore(file + ".live");
+      live.updateSyncState({ blocking: 0, auth_pending: 0 });
+      const liveClaim = claimRequest(live, tokenA, 501);
+      if (liveClaim.kind !== "acquired") throw new Error("live setup failed");
+      const busy = live.claimAuthPublication(
+        source,
+        { userId: null, workspaceId: null },
+        "request-code",
+        tokenB,
+        502,
+        (pid) => pid === 501,
+      );
+      if (busy.kind !== "busy" || busy.ownerPid !== 501) {
+        throw new Error("live request-code owner was recovered");
+      }
+      live.close();
+
+      const mismatch = new SanaStore(file + ".mismatch");
+      mismatch.updateSyncState({ blocking: 0, auth_pending: 0 });
+      leavePersistenceUnknown(
+        mismatch,
+        claimRequest(mismatch, tokenA, 601),
+      );
+      const mismatched = mismatch.reconcileAuthState(
+        {
+          generation: 1,
+          publicationToken:
+            "33333333-3333-4333-8333-333333333333",
+          userId: null,
+          workspaceId: null,
+        },
+        () => false,
+      );
+      if (
+        mismatched.kind !== "incomplete" ||
+        mismatched.code !== "AUTH_PUBLICATION_INCOMPLETE"
+      ) {
+        throw new Error("foreign target tuple was recovered");
+      }
+      mismatch.close();
+    `);
+    expect(child.status, child.stderr).toBe(0);
+  });
+
+  test("v0.4.5 request-code poison is cleared only when provenance is exact", () => {
+    const { child } = isolatedStore(`
+      const source = {
+        generation: 0,
+        publicationToken: null,
+        userId: null,
+        workspaceId: null,
+      };
+      const tokenA = "11111111-1111-4111-8111-111111111111";
+      const tokenB = "22222222-2222-4222-8222-222222222222";
+      const beginUnknownRequest = (store) => {
+        const claim = store.claimAuthPublication(
+          source,
+          { userId: null, workspaceId: null },
+          "request-code",
+          tokenA,
+          101,
+          () => false,
+        );
+        if (claim.kind !== "acquired") throw new Error("setup claim failed");
+        store.markAuthPublicationIncomplete(
+          claim.intent,
+          "AUTH_SESSION_PERSISTENCE_UNKNOWN",
+          "request-code persistence was uncertain",
+          1,
+        );
+        return claim;
+      };
+
+      let exact = new SanaStore(file + ".exact");
+      const exactClaim = beginUnknownRequest(exact);
+      exact.updateSyncState({
+        blocking: 1,
+        auth_pending: 1,
+        auth_issue_code: "AUTH_SESSION_PERSISTENCE_UNKNOWN",
+        auth_issue_message:
+          "The saved Sana session is not bound to the configured Sana origin; sign in again",
+        auth_issue_operation_token: exactClaim.intent.operationToken,
+        auth_issue_generation: exactClaim.intent.targetGeneration,
+        auth_issue_kind: "request-code",
+      });
+      exact.close();
+      exact = new SanaStore(file + ".exact");
+      const retried = exact.claimAuthPublication(
+        source,
+        { userId: null, workspaceId: null },
+        "request-code",
+        tokenB,
+        202,
+        () => false,
+      );
+      const exactState = exact.getSyncState();
+      if (
+        retried.kind !== "acquired" ||
+        exactState.auth_transition_token !== tokenB ||
+        exactState.auth_issue_code !== null ||
+        exactState.auth_issue_message !== null ||
+        exactState.auth_issue_operation_token !== null ||
+        exactState.auth_issue_generation !== null ||
+        exactState.auth_issue_kind !== null ||
+        exactState.auth_pending !== 0 ||
+        exactState.blocking !== 1
+      ) {
+        throw new Error(
+          "exact v0.4.5 poison was not recovered without changing blocking",
+        );
+      }
+      exact.close();
+
+      const unrelated = new SanaStore(file + ".unrelated");
+      beginUnknownRequest(unrelated);
+      unrelated.updateSyncState({
+        blocking: 1,
+        auth_pending: 1,
+        auth_issue_code: "AUTH_EXTERNAL_BLOCK",
+        auth_issue_message: "an unrelated authentication problem remains",
+        auth_issue_operation_token: null,
+        auth_issue_generation: null,
+        auth_issue_kind: null,
+      });
+      const issueBefore = JSON.stringify({
+        code: unrelated.getSyncState().auth_issue_code,
+        message: unrelated.getSyncState().auth_issue_message,
+        token: unrelated.getSyncState().auth_issue_operation_token,
+        generation: unrelated.getSyncState().auth_issue_generation,
+        kind: unrelated.getSyncState().auth_issue_kind,
+        pending: unrelated.getSyncState().auth_pending,
+        blocking: unrelated.getSyncState().blocking,
+      });
+      const blocked = unrelated.claimAuthPublication(
+        source,
+        { userId: null, workspaceId: null },
+        "request-code",
+        tokenB,
+        303,
+        () => false,
+      );
+      const unrelatedState = unrelated.getSyncState();
+      const issueAfter = JSON.stringify({
+        code: unrelatedState.auth_issue_code,
+        message: unrelatedState.auth_issue_message,
+        token: unrelatedState.auth_issue_operation_token,
+        generation: unrelatedState.auth_issue_generation,
+        kind: unrelatedState.auth_issue_kind,
+        pending: unrelatedState.auth_pending,
+        blocking: unrelatedState.blocking,
+      });
+      const inspected = unrelated.reconcileAuthState(source, () => false);
+      if (
+        blocked.kind !== "incomplete" ||
+        blocked.code !== "AUTH_EXTERNAL_BLOCK" ||
+        inspected.kind !== "incomplete" ||
+        inspected.code !== "AUTH_EXTERNAL_BLOCK" ||
+        unrelatedState.auth_transition_token !== null ||
+        issueAfter !== issueBefore
+      ) {
+        throw new Error(
+          "unrelated issue was overwritten or did not block a request",
+        );
+      }
+      unrelated.close();
+    `);
+    expect(child.status, child.stderr).toBe(0);
+  });
 });

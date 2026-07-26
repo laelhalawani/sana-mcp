@@ -521,3 +521,111 @@ test("Windows removal retries a transient unlink after rechecking the preimage",
     fs.rmSync(directory, { recursive: true });
   }
 });
+
+test("Windows never attempts a parent-directory flush after a mutation", () => {
+  const directory = temporaryDirectory();
+  const published = path.join(directory, "published.json");
+  const ambiguous = path.join(directory, "ambiguous.json");
+  const removed = path.join(directory, "removed.json");
+  let flushCalls = 0;
+  const operations = {
+    ...ordinaryConfigOperations,
+    platform: "win32" as const,
+    flushParent() {
+      flushCalls += 1;
+      throw new Error("Windows directory flush must not be called");
+    },
+  };
+  try {
+    fs.writeFileSync(published, "before\n");
+    assert.equal(
+      publishConfigAtomic(
+        published,
+        readConfigSnapshot(published),
+        "after\n",
+        () => ({ ok: true }),
+        operations,
+      ).state,
+      "published",
+    );
+
+    fs.writeFileSync(ambiguous, "before\n");
+    assert.equal(
+      publishConfigAtomic(
+        ambiguous,
+        readConfigSnapshot(ambiguous),
+        "after\n",
+        () => ({ ok: false, reason: "injected ambiguity" }),
+        operations,
+      ).state,
+      "ambiguous",
+    );
+
+    fs.writeFileSync(removed, "before\n");
+    assert.equal(
+      removeConfigAtomic(
+        removed,
+        readConfigSnapshot(removed),
+        operations,
+      ).state,
+      "removed",
+    );
+    assert.equal(flushCalls, 0);
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+
+test("POSIX still flushes the parent after published, ambiguous, and removed mutations", () => {
+  const directory = temporaryDirectory();
+  const published = path.join(directory, "published.json");
+  const ambiguous = path.join(directory, "ambiguous.json");
+  const removed = path.join(directory, "removed.json");
+  let flushCalls = 0;
+  const operations = {
+    ...ordinaryConfigOperations,
+    platform: "linux" as const,
+    flushParent() {
+      flushCalls += 1;
+      return undefined;
+    },
+  };
+  try {
+    fs.writeFileSync(published, "before\n");
+    assert.equal(
+      publishConfigAtomic(
+        published,
+        readConfigSnapshot(published),
+        "after\n",
+        () => ({ ok: true }),
+        operations,
+      ).state,
+      "published",
+    );
+
+    fs.writeFileSync(ambiguous, "before\n");
+    assert.equal(
+      publishConfigAtomic(
+        ambiguous,
+        readConfigSnapshot(ambiguous),
+        "after\n",
+        () => ({ ok: false, reason: "injected ambiguity" }),
+        operations,
+      ).state,
+      "ambiguous",
+    );
+
+    fs.writeFileSync(removed, "before\n");
+    assert.equal(
+      removeConfigAtomic(
+        removed,
+        readConfigSnapshot(removed),
+        operations,
+      ).state,
+      "removed",
+    );
+    assert.equal(flushCalls, 3);
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});

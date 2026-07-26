@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import {
   applyClientChange,
+  applyPlannedClientChanges,
+  configPathIdentity,
   planClientChange,
+  planClientChanges,
   validateServerName,
   type ConfigPathProvenance,
 } from "../../src/install/apply.js";
@@ -177,5 +180,155 @@ test("config path provenance is exhaustively discriminated", () => {
         assert.fail(`unexpected provenance ${String(exhaustive)}`);
       }
     }
+  }
+});
+
+test("a later planning failure keeps every direct client change read-only", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "sana-mcp-batch-"));
+  const first = path.join(directory, "first.json");
+  const second = path.join(directory, "second.json");
+  fs.writeFileSync(
+    second,
+    '{"mcpServers":{"sana-mcp":{"command":"foreign","args":[]}}}\n',
+  );
+  try {
+    const changes = await planClientChanges([
+      {
+        client: { ...fixture(first), id: "first", name: "First" },
+        serverName: "sana-mcp",
+        target,
+        desired: "present",
+      },
+      {
+        client: { ...fixture(second), id: "second", name: "Second" },
+        serverName: "sana-mcp",
+        target,
+        desired: "present",
+      },
+    ]);
+    assert.deepEqual(
+      changes.map((change) => change.state),
+      ["ready", "collision"],
+    );
+    const results = await applyPlannedClientChanges(changes);
+    assert.deepEqual(
+      results.map((result) => result.state),
+      ["planned", "collision"],
+    );
+    assert.equal(fs.existsSync(first), false);
+    assert.match(fs.readFileSync(second, "utf8"), /foreign/u);
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+
+test("relative/absolute and Windows-case aliases are rejected before apply", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-mcp-batch-alias-"),
+  );
+  const absolute = path.join(directory, "client.json");
+  const relative = path.relative(process.cwd(), absolute);
+  try {
+    const posix = await planClientChanges([
+      {
+        client: { ...fixture(relative), id: "relative", name: "Relative" },
+        serverName: "sana-mcp",
+        target,
+        desired: "present",
+      },
+      {
+        client: { ...fixture(absolute), id: "absolute", name: "Absolute" },
+        serverName: "sana-mcp",
+        target,
+        desired: "present",
+      },
+    ]);
+    assert.deepEqual(
+      posix.map((change) => change.state),
+      ["unavailable", "unavailable"],
+    );
+    assert.deepEqual(
+      (await applyPlannedClientChanges(posix)).map((result) => result.state),
+      ["unavailable", "unavailable"],
+    );
+    assert.equal(fs.existsSync(absolute), false);
+
+    const windows = await planClientChanges(
+      [
+        {
+          client: {
+            ...fixture("C:\\Users\\Lael\\.claude.json"),
+            id: "upper",
+            name: "Upper",
+          },
+          serverName: "sana-mcp",
+          target,
+          desired: "present",
+        },
+        {
+          client: {
+            ...fixture("c:\\users\\lael\\.CLAUDE.JSON"),
+            id: "lower",
+            name: "Lower",
+          },
+          serverName: "sana-mcp",
+          target,
+          desired: "present",
+        },
+      ],
+      { platform: "win32", cwd: "C:\\workspace" },
+    );
+    assert.deepEqual(
+      windows.map((change) => change.state),
+      ["unavailable", "unavailable"],
+    );
+    assert.equal(
+      configPathIdentity("C:\\Users\\Lael\\.claude.json", {
+        platform: "win32",
+        cwd: "C:\\workspace",
+      }),
+      configPathIdentity("c:\\users\\lael\\.CLAUDE.JSON", {
+        platform: "win32",
+        cwd: "C:\\workspace",
+      }),
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+
+test("a fully ready direct batch applies sequentially in request order", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-mcp-batch-order-"),
+  );
+  const first = path.join(directory, "first.json");
+  const second = path.join(directory, "second.json");
+  try {
+    const changes = await planClientChanges([
+      {
+        client: { ...fixture(first), id: "first", name: "First" },
+        serverName: "sana-mcp",
+        target,
+        desired: "present",
+      },
+      {
+        client: { ...fixture(second), id: "second", name: "Second" },
+        serverName: "sana-mcp",
+        target,
+        desired: "present",
+      },
+    ]);
+    const results = await applyPlannedClientChanges(changes);
+    assert.deepEqual(
+      results.map(({ clientId, state }) => ({ clientId, state })),
+      [
+        { clientId: "first", state: "applied" },
+        { clientId: "second", state: "applied" },
+      ],
+    );
+    assert.equal(fs.existsSync(first), true);
+    assert.equal(fs.existsSync(second), true);
+  } finally {
+    fs.rmSync(directory, { recursive: true });
   }
 });
