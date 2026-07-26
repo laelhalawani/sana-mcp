@@ -16,8 +16,20 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { once } from "node:events";
+import packageMetadata from "../../package.json" with { type: "json" };
 
 const root = path.resolve(import.meta.dirname, "../..");
+const currentVersion = packageMetadata.version;
+const currentTag = `v${currentVersion}`;
+const predecessorVersion = "0.4.5";
+const predecessorTag = `v${predecessorVersion}`;
+const predecessorWindowsFixture =
+  `${predecessorTag}-sana-mcp-windows-x64.exe`;
+const compatibleUpdateInstallerEnvironmentLines = [
+  '  [void]$InstallerInfo.EnvironmentVariables.Remove("SANA_MCP_REPLACE_INCOMPATIBLE")',
+  '  [void]$InstallerInfo.EnvironmentVariables.Remove("SANA_MCP_INCOMPATIBLE_RESET")',
+  `  foreach ($Pair in @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; SANA_DATA_DIR=$Data; SANA_TRANSCRIPTS_DIR=$Transcripts; SANA_MCP_INSTALL_DIR=$Install; SANA_MCP_VERSION="${currentTag}"; SANA_MCP_YES="1"; SANA_MCP_TEST_RELEASE_DIR=$Release; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD"; PSModulePath=$WindowsPowerShellModulePath }.GetEnumerator()) { $InstallerInfo.EnvironmentVariables[$Pair.Key] = $Pair.Value }`,
+] as const;
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
@@ -1606,7 +1618,19 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
   }
 });
 
-test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtime", { timeout: 180_000 }, async () => {
+test("Windows compatible-update E2E strips destructive authority from the installer child", () => {
+  assert.deepEqual(compatibleUpdateInstallerEnvironmentLines.slice(0, 2), [
+    '  [void]$InstallerInfo.EnvironmentVariables.Remove("SANA_MCP_REPLACE_INCOMPATIBLE")',
+    '  [void]$InstallerInfo.EnvironmentVariables.Remove("SANA_MCP_INCOMPATIBLE_RESET")',
+  ]);
+  assert.equal(compatibleUpdateInstallerEnvironmentLines.length, 3);
+  assert.doesNotMatch(
+    compatibleUpdateInstallerEnvironmentLines[2],
+    /SANA_MCP_(?:REPLACE_INCOMPATIBLE|INCOMPATIBLE_RESET)/u,
+  );
+});
+
+test(`Windows full installer replaces an active receipt-backed ${predecessorTag} mcp runtime`, { timeout: 180_000 }, async () => {
   const configuredCurrentBinary =
     process.env.SANA_MCP_TEST_CURRENT_WINDOWS_BINARY;
   const sourceCommit = process.env.SANA_MCP_TEST_SOURCE_COMMIT;
@@ -1629,9 +1653,13 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
   await mkdir(fixture);
   const download = async (name: string): Promise<string> => {
     const response = await fetch(
-      `https://github.com/Etals-AiApp/sana-ai-mcp/releases/download/v0.4.4/${name}`,
+      `https://github.com/Etals-AiApp/sana-ai-mcp/releases/download/${predecessorTag}/${name}`,
     );
-    assert.equal(response.ok, true, `could not download official v0.4.4 ${name}`);
+    assert.equal(
+      response.ok,
+      true,
+      `could not download official ${predecessorTag} ${name}`,
+    );
     const destination = path.join(fixture, name);
     await writeFile(destination, Buffer.from(await response.arrayBuffer()));
     return destination;
@@ -1663,7 +1691,11 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
       sha256: string;
     }>;
   };
-  assert.equal(oldManifest.packageVersion, "0.4.4");
+  assert.equal(oldManifest.packageVersion, predecessorVersion);
+  assert.equal(oldManifest.installerProtocol, 1);
+  assert.equal(oldManifest.lifecycleProtocol, 1);
+  assert.equal(oldManifest.inspectProtocol, 1);
+  assert.equal(oldManifest.stateCompatibility, 1);
   const oldAsset = oldManifest.assets.find(
     (asset) => asset.target === "bun-windows-x64",
   );
@@ -1675,7 +1707,7 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
     `${oldBinaryHash}  sana-mcp-windows-x64.exe`,
   );
   await writeFile(
-    path.join(fixture, "v0.4.4-sana-mcp-windows-x64.exe"),
+    path.join(fixture, predecessorWindowsFixture),
     await readFile(oldBinaryPath),
   );
 
@@ -1701,8 +1733,12 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
     stateCompatibility: number;
     semanticCapability: string;
   };
-  assert.equal(currentIdentity.version, "0.4.5");
+  assert.equal(currentIdentity.version, currentVersion);
   assert.equal(currentIdentity.target, "bun-windows-x64");
+  assert.equal(currentIdentity.installerProtocol, 1);
+  assert.equal(currentIdentity.lifecycleProtocol, 1);
+  assert.equal(currentIdentity.inspectProtocol, 1);
+  assert.equal(currentIdentity.stateCompatibility, 1);
   const currentBinaryHash = sha256(await readFile(currentBinaryPath));
   await writeFile(
     path.join(fixture, "sana-mcp-windows-x64.exe"),
@@ -1835,6 +1871,13 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
       '$RoamingAppData = Join-Path $Profile "AppData\\Roaming"',
       '$Data = Join-Path $Root "data"',
       '$Transcripts = Join-Path $Root "transcripts"',
+      '$DataSentinel = Join-Path $Data "compatible-auth-sentinel.bin"',
+      '$TranscriptSentinel = Join-Path $Transcripts "compatible-transcript-sentinel.txt"',
+      '$DataSentinelBytes = [byte[]](0,1,2,127,128,254,255)',
+      '$TranscriptSentinelText = "compatible transcript sentinel`r`nsecond line"',
+      '$Utf8NoBom = [Text.UTF8Encoding]::new($false)',
+      '$ExpectedDataSentinelBytes = [Convert]::ToBase64String($DataSentinelBytes)',
+      '$ExpectedTranscriptSentinelBytes = [Convert]::ToBase64String($Utf8NoBom.GetBytes($TranscriptSentinelText))',
       '$OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")',
       '$SerializationLock = Join-Path $KnownLocalAppData ".sana-mcp-installer-path.lock"',
       'if (Test-Path -LiteralPath $SerializationLock) { throw "real known-folder serialization lock was present before isolated test: $SerializationLock" }',
@@ -1866,9 +1909,11 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
       "}",
       "try {",
       '  foreach ($Directory in @($Release,$Install,$Other,$Profile,$LocalAppData,$RoamingAppData,$Data,$Transcripts)) { [IO.Directory]::CreateDirectory($Directory) | Out-Null }',
+      '  [IO.File]::WriteAllBytes($DataSentinel, $DataSentinelBytes)',
+      '  [IO.File]::WriteAllText($TranscriptSentinel, $TranscriptSentinelText, $Utf8NoBom)',
       '  [IO.Directory]::CreateDirectory((Join-Path $Profile ".codex")) | Out-Null',
       '  Copy-Item -Path (Join-Path $FixtureSource "*") -Destination $Release -Force',
-      '  Copy-Item -LiteralPath (Join-Path $FixtureSource "v0.4.4-sana-mcp-windows-x64.exe") -Destination $InstalledBinary',
+      `  Copy-Item -LiteralPath (Join-Path $FixtureSource "${predecessorWindowsFixture}") -Destination $InstalledBinary`,
       '  Copy-Item -LiteralPath $InstalledBinary -Destination $OtherBinary',
       '  Copy-Item -LiteralPath (Join-Path $FixtureSource "old-receipt") -Destination (Join-Path $Install ".sana-mcp-install-v1")',
       '  $OldProcess = Start-IsolatedMcp $InstalledBinary $Data',
@@ -1884,7 +1929,7 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
       '  $InstallerInfo.CreateNoWindow = $true',
       '  $InstallerInfo.RedirectStandardOutput = $true',
       '  $InstallerInfo.RedirectStandardError = $true',
-      '  foreach ($Pair in @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; SANA_DATA_DIR=$Data; SANA_TRANSCRIPTS_DIR=$Transcripts; SANA_MCP_INSTALL_DIR=$Install; SANA_MCP_VERSION="v0.4.5"; SANA_MCP_YES="1"; SANA_MCP_TEST_RELEASE_DIR=$Release; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD"; PSModulePath=$WindowsPowerShellModulePath }.GetEnumerator()) { $InstallerInfo.EnvironmentVariables[$Pair.Key] = $Pair.Value }',
+      ...compatibleUpdateInstallerEnvironmentLines,
       '  $InstallerProcess = [Diagnostics.Process]::Start($InstallerInfo)',
       '  $Stdout = $InstallerProcess.StandardOutput.ReadToEnd()',
       '  $Stderr = $InstallerProcess.StandardError.ReadToEnd()',
@@ -1895,8 +1940,10 @@ test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtim
       '  if ($Stdout -cnotmatch "Installed .*sana-mcp.exe" -or $Stdout -cnotmatch "Registering sana-mcp with 1 detected client") { throw "successful install/configurer handoff was not reported: $Stdout" }',
       '  if ($Stderr -match "could not start|exited with code") { throw "configurer launch warning was emitted: $Stderr" }',
       `  if ((Get-FileHash -LiteralPath $InstalledBinary -Algorithm SHA256).Hash.ToLowerInvariant() -cne "${currentBinaryHash}") { throw "final binary digest mismatch" }`,
+      '  if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($DataSentinel)) -cne $ExpectedDataSentinelBytes) { throw "compatible update mutated the data sentinel" }',
+      '  if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($TranscriptSentinel)) -cne $ExpectedTranscriptSentinelBytes -or [IO.File]::ReadAllText($TranscriptSentinel, $Utf8NoBom) -cne $TranscriptSentinelText) { throw "compatible update mutated the transcript sentinel" }',
       '  $Receipt = @{}; foreach ($Line in [IO.File]::ReadAllLines((Join-Path $Install ".sana-mcp-install-v1"))) { if ($Line) { $Index=$Line.IndexOf("="); $Receipt[$Line.Substring(0,$Index)]=$Line.Substring($Index+1) } }',
-      `  if ($Receipt["version"] -cne "0.4.5" -or $Receipt["binarySha256"] -cne "${currentBinaryHash}" -or $Receipt["sourceCommit"] -cne "${sourceCommit}") { throw "final receipt tuple mismatch" }`,
+      `  if ($Receipt.Count -ne 10 -or $Receipt["format"] -cne "sana-mcp-install-v2" -or $Receipt["version"] -cne "${currentVersion}" -or $Receipt["target"] -cne "bun-windows-x64" -or $Receipt["sourceCommit"] -cne "${sourceCommit}" -or $Receipt["binarySha256"] -cne "${currentBinaryHash}" -or $Receipt["pathManaged"] -cne "false" -or $Receipt["installerProtocol"] -cne "${currentIdentity.installerProtocol}" -or $Receipt["lifecycleProtocol"] -cne "${currentIdentity.lifecycleProtocol}" -or $Receipt["inspectProtocol"] -cne "${currentIdentity.inspectProtocol}" -or $Receipt["stateCompatibility"] -cne "${currentIdentity.stateCompatibility}") { throw "final receipt tuple mismatch" }`,
       '  $Unexpected = @(Get-ChildItem -LiteralPath $Install -Force | Where-Object { $_.Name -notin @("sana-mcp.exe", ".sana-mcp-install-v1") })',
       '  if ($Unexpected.Count -ne 0) { throw "installer artifacts remained: $($Unexpected.Name -join \', \')" }',
       '  if ([Environment]::GetEnvironmentVariable("Path", "User") -cne $OriginalUserPath) { throw "installer changed the real User PATH" }',
