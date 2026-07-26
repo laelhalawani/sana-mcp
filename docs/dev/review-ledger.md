@@ -1980,74 +1980,155 @@ source file differed from `31fafce`.
 
 ### Deployment prep and release-quality boundary
 
-Read-only trace evidence was supplied by:
+Release preparation was independently traced by:
 
-- `/root/minimal_config_cli_trace` for client detection, ownership, planning,
-  atomic config publication, uninstall, and the Windows installer handoff;
-- `/root/minimal_auth_cli_trace` for request-code acceptance, session and store
-  publication, pending challenge recovery, configurer inspection, and retry;
-- `/root/v046_auth_dev` for the final local Git boundary and public GitHub
-  branch, workflow, check, tag, release, and asset-readiness audit.
+- `/root/v046_crosscut_review_1`: complete release workflow, authorization,
+  build, publication, and post-publication path;
+- `/root/v046_crosscut_review_2`: every `0.4.6` version projection and the
+  positive state-compatibility epoch;
+- `/root/v046_auth_dev`: local Git state and public GitHub branch, workflow,
+  check, tag, release, and asset readiness.
 
-The two initial plan reviews, their complete findings and resolutions, and the
-two corrected-plan zero approvals are recorded in the Prep table above. Remote
-deployment preparation found no enforced branch protection, ruleset, required
+Remote preparation found no enforced branch protection, ruleset, required
 status check, or pull-request workflow. The active release workflow publishes
-from `main` only when the package-matching tag is absent, so implementation
-merge and release publication must remain separate:
+from `main` only when the package-matching tag is absent. The finalized plan
+therefore froze a two-PR sequence: merge the repair while `v0.4.5` already
+exists and prove that publication skips, then merge the independently reviewed
+`0.4.6` release-quality projection to trigger publication.
 
-1. Repair PR: merge the reviewed implementation, tests, and this ledger while
-   the package remains `0.4.5`; the existing-tag authorization path must
-   succeed and skip publication.
-2. Release-quality PR: project the exact `0.4.6` version through package,
-   documentation, manifest fixtures, native Windows upgrade coverage, and
-   release workflow expectations; merging this PR is the publication trigger.
+| Release plan review / round | Findings | Resolution | Result |
+|---|---|---|---|
+| `/root/v046_release_plan_review_1`, initial | The contract-quality scope did not own the temporary-only forbidden-data harness or exact `bun run check`; merge evidence did not freeze base/head SHA and merged-tree identity; the public installer could run under the real Windows user and mutate PATH/config; the native Windows file list and timeout were not exact | Froze dual-SHA/tree evidence and the two-PR sequence; assigned the disposable data guard and full Linux quality gate; prohibited real-user public-installer execution in favor of read-only post-publication verification; froze the exact 19-file native Windows command and timeout | correction required |
+| `/root/v046_release_plan_review_2`, initial | The exact native Windows test list and 20-second timeout were not frozen; post-publication isolated installation lacked explicit User PATH isolation; mismatched draft assets needed an immutable fail-closed rule | Added the exact native command, `pathManaged=false` and byte-exact User PATH assertions, read-only remote verification, and mandatory refusal of an immutable draft whose asset tuple mismatches | correction required |
+| `/root/v046_release_plan_review_1`, corrected plan | none | n/a | APPROVED - zero findings |
+| `/root/v046_release_plan_review_2`, corrected plan | none | n/a | APPROVED - zero findings |
 
-The `0.4.6` release retains positive state compatibility epoch `1`. This repair
-changes no state schema or incompatible replacement boundary, so inventing a
-new epoch would force an unnecessary destructive replacement.
+The `0.4.6` release retains positive state-compatibility epoch `1`. No state
+schema or incompatible replacement boundary changed. A receipt-backed
+`v0.4.5` epoch-1 installation is therefore a compatible update and must retain
+authentication, meeting/cache state, transcripts, and User PATH without
+destructive replacement authority.
 
-Exact merge and publication evidence is intentionally pending rather than
-fabricated:
+#### Repair PR evidence
 
-- repair PR number: **TBD after creation**
-- repair head commit: **TBD after commit**
-- repair merge commit: **TBD after merge**
-- existing-tag authorization run: **TBD after merge**
-- release-quality PR number: **TBD after creation**
-- release head commit: **TBD after commit**
-- release merge and `v0.4.6` tag commit: **TBD after publication**
-- full release workflow run and asset verification: **TBD after publication**
+Repair PR **#1** was reviewed at head
+`a1eb4ba98b3151d6897e760c0935143787567f75` and merged as
+`2ce8942c6829fd0a432685cb909a51d72f278edd`. Both commits resolve to the exact
+tree `d98261d5a7426d58bfe37d293876b9f3f0031147`; the merge introduced no
+unreviewed tree change. Workflow run **30195759438** completed the `authorize`
+job successfully and skipped every build and publication job because the
+package-matching `v0.4.5` tag already existed.
 
-The later release-quality scope owns the version projection and release gates,
-including `package.json`, version-bound documentation and installer examples,
-manifest fixtures and assertions, the native Windows installer release test,
-`.github/workflows/release.yml`, and
-`tests/contracts/mcp-stdio.test.ts`. The latter scope must correct the clean
-worktree's absent live-data-alias harness condition and obtain a fresh review;
-it must not weaken the production live-data isolation guard.
+The release branch is based exactly on
+`2ce8942c6829fd0a432685cb909a51d72f278edd`.
 
-Final validation evidence:
+#### Release-quality development ownership and review lineage
 
-- main exact applied changed-scope and transitive suite: 327 passed, 0 failed;
-- the separate full clean-worktree suite encountered the known absent
-  live-data-alias condition in `tests/contracts/mcp-stdio.test.ts`; correction
-  belongs only to the later release-quality scope identified above and is not
-  represented here as a green full-suite result;
+`V046-RELEASE-PROJECTION` development was owned by
+`/root/v046_auth_dev` for exactly:
+
+- `package.json`;
+- `README.md`;
+- `install.sh`;
+- `docs/dev/cli-specs.md`;
+- `tests/fixtures/manifest/invalid-unknown-field.json`;
+- `tests/fixtures/manifest/valid-all-targets.json`;
+- `tests/install/atomic-config.test.ts`;
+- `tests/install/installers.test.ts`;
+- `tests/install/manifest.test.ts`.
+
+`V046-RELEASE-CI` development was owned by
+`/root/v046_release_ci_dev` for exactly:
+
+- `.github/workflows/release.yml`;
+- `tests/release/release.test.ts`;
+- the later dual live-data guard correction in
+  `tests/contracts/mcp-stdio.test.ts` and
+  `tests/fixtures/contracts/block-network.ts`.
+
+`V046-UNINSTALL-NONTY` was a later quality correction owned by
+`/root/v046_auth_dev` for exactly:
+
+- `src/install/install.ts`;
+- `tests/install/configurer-flow.test.ts`;
+- validation-only inspection of the unchanged
+  `tests/tools/cli-configurer-exit.test.ts`.
+
+| Scope / round | Development | Review | Findings | Resolution / result |
+|---|---|---|---|---|
+| `V046-RELEASE-PROJECTION` initial | `/root/v046_auth_dev` | `/root/v046_release_projection_review_1` | The native `v0.4.5` to `v0.4.6` compatible-update gate lacked persistent state sentinels and asserted only part of the final receipt | Added exact byte/text sentinels under isolated data and transcript roots; asserted predecessor and current epoch/protocol identity; asserted the complete ten-field receipt, final binary digest, and unchanged User PATH | correction required fresh review |
+| `V046-RELEASE-PROJECTION` correction 1 | `/root/v046_auth_dev` | `/root/v046_release_projection_review_2` | The full quality harness did not have a dual lexical/canonical live-data guard, and the native installer child inherited host destructive-replacement authority | Split the data guard into a lexical repository-data prohibition and a canonical disposable-alias prohibition; explicitly removed `SANA_MCP_REPLACE_INCOMPATIBLE` and `SANA_MCP_INCOMPATIBLE_RESET` before assigning the isolated installer environment | correction required fresh reviews |
+| `V046-RELEASE-PROJECTION` correction 2 | `/root/v046_auth_dev` plus the independently owned data-guard correction by `/root/v046_release_ci_dev` | `/root/v046_release_projection_review_3` | none | CLEAN - zero findings; 79 scoped tests, typecheck, and diff-check passed |
+| `V046-RELEASE-CI` initial | `/root/v046_release_ci_dev` | `/root/v046_release_ci_review` | The serialized fake-GitHub publication harness had a deterministic 20-second full-suite timeout | Raised only that test's harness timeout to 60 seconds; release retry and production timeout semantics were unchanged | correction required fresh review |
+| `V046-RELEASE-CI` correction 1 | `/root/v046_release_ci_dev` | `/root/v046_release_ci_review_2` | none | CLEAN - zero findings |
+| dual live-data guard correction | `/root/v046_release_ci_dev` | `/root/v046_release_data_guard_review` | none | CLEAN - zero findings; 22 contract tests passed |
+| `V046-UNINSTALL-NONTY` correction | `/root/v046_auth_dev` | `/root/v046_uninstall_nontty_review` | Full POSIX quality exposed mixed unknown-client discovery plus an owned candidate on non-TTY input: uninstall promoted the unrelated discovery error before returning the established interaction-required guidance | Reordered only preselection state handling: unknown-only, interactive, and `--yes` remain fatal before mutation; mixed candidates on non-TTY/no-`--yes` return interaction-unavailable without prompt or write | CLEAN - zero findings; 41 configurer/CLI tests passed |
+
+#### Mandatory release gates
+
+Publication depends on a Linux `quality` job that checks out the authorized SHA,
+installs the frozen lockfile with Bun `1.3.14`, and runs the complete
+`bun run check`. `publish` requires `quality` as well as the authorized Linux,
+macOS, and Windows build jobs.
+
+The native Windows job runs this exact 19-file suite with the frozen
+20-second per-test timeout:
+
+```text
+bun test --timeout 20000 tests/app/runtime.test.ts tests/core/status-auth.test.ts tests/install/apply.test.ts tests/install/atomic-config.test.ts tests/install/clients.test.ts tests/install/config-formats.test.ts tests/install/configurer-flow.test.ts tests/install/status.test.ts tests/install/writers.test.ts tests/runtime/secure-session.test.ts tests/runtime/secure-store.test.ts tests/sana/client.test.ts tests/sana/auth-request.test.ts tests/sana/auth.test.ts tests/sana/session-publication.test.ts tests/sync/daemon.test.ts tests/tools/dispatch-auth.test.ts tests/install/config-transaction.test.ts tests/install/config-transaction-flow.test.ts
+```
+
+After that suite, Windows builds the canonical `bun-windows-x64` standalone and
+executes the filtered official `v0.4.5` to candidate `v0.4.6` installer gate.
+That gate proves:
+
+- predecessor manifest and candidate standalone installer, lifecycle, inspect,
+  and state-compatibility values are all exactly `1`;
+- exact byte/text sentinels in isolated data and transcript directories survive
+  the compatible update unchanged;
+- the published binary and complete ten-field epoch-1 installer receipt match
+  the authorized candidate tuple;
+- `pathManaged=false`, the isolated User PATH is byte-for-byte unchanged, and
+  no incompatible-replacement authority is inherited by the installer child;
+- only the proven old installed-path MCP process is retired, while an unrelated
+  same-name process survives.
+
+The contract gate independently blocks repository `data/` and every descendant
+lexically before canonical filesystem inspection, then blocks a separate
+disposable symlink/junction target canonically. Required guard environment
+variables fail closed, and cleanup is limited to exact temporary roots.
+
+A pre-existing WSL-only extracted PowerShell helper test cannot find
+`Assert-NotReparse` because its extracted function range omits that dependency.
+It is outside the filtered native Windows release gate and was not changed by
+this stage. No broad WSL installer-suite result is represented as green.
+
+#### Pending release evidence
+
+The following values remain intentionally unresolved and must not be inferred:
+
+- release-quality PR number: **TBD**
+- release-quality reviewed head commit and tree: **TBD**
+- release-quality merge commit and tree: **TBD**
+- full release workflow run: **TBD**
+- `v0.4.6` tag and tag target: **TBD**
+- published release identity and complete asset verification: **TBD**
+
+Repair validation remains:
+
+- exact applied changed-scope and transitive suite: 327 passed, 0 failed;
 - `bun run typecheck` and `git diff --check`: passed;
-- native Windows Bun config/auth/runtime coverage: 114 effective auth,
-  configurer, store, status, daemon, dispatch, and AppRuntime tests passed after
-  applying a longer timeout to one UNC-hosted child-process test;
+- native Windows Bun config/auth/runtime coverage: 114 effective tests passed
+  after applying a longer timeout to one UNC-hosted child-process test;
 - native Windows config coverage exercised actual atomic publication, exact
   predecessor ownership, alias rejection, full-set preplanning, and zero
   directory-flush calls; one POSIX-only injected durability test is not
   portable to a Windows filesystem and is not product-path evidence;
 - a natively built Windows standalone passed inspect/help and an isolated
-  end-to-end config scenario: the exact historical Claude entry stayed
-  byte-for-byte unchanged, a later foreign Gemini entry caused zero writes,
-  clean retry registered Cursor without EPERM/durability warnings, uninstall
-  removed both managed registrations, and no temporary config artifact
-  remained;
-- validation used only isolated temporary Windows/WSL roots and mocked auth
-  network paths. It did not touch the live installation, live client configs,
-  live Sana state, or send a real sign-in code.
+  end-to-end config scenario: the historical Claude entry stayed byte-exact, a
+  later foreign Gemini entry caused zero writes, retry registered Cursor
+  without durability warnings, uninstall removed both managed registrations,
+  and no temporary config artifact remained;
+- validation used only isolated temporary roots and mocked auth network paths;
+  it did not touch live installation, client config, Sana state, or send a real
+  sign-in code.
