@@ -298,6 +298,21 @@ test("release workflow binds every build and publish step to the authorized comm
     path.join(process.cwd(), ".github/workflows/release.yml"),
     "utf8",
   );
+  const parsedWorkflow = YAML.parse(workflow) as {
+    jobs: Record<
+      string,
+      {
+        needs?: string | string[];
+        if?: string;
+        steps?: Array<{
+          name?: string;
+          run?: string;
+          uses?: string;
+          with?: Record<string, unknown>;
+        }>;
+      }
+    >;
+  };
   const actionUses = [...workflow.matchAll(/uses:\s+\S+@(\S+)/g)];
   assert.ok(actionUses.length > 0);
   for (const action of actionUses) {
@@ -324,14 +339,14 @@ test("release workflow binds every build and publish step to the authorized comm
       workflow.match(
         /if: needs\.authorize\.outputs\.skip != 'true'/g,
       ) ?? []
-    ).length >= 4,
+    ).length >= 5,
   );
   assert.ok(
     (
       workflow.match(
         /ref: \$\{\{ needs\.authorize\.outputs\.sha \}\}/g,
       ) ?? []
-    ).length >= 4,
+    ).length >= 5,
   );
   assert.ok(
     (
@@ -404,6 +419,60 @@ test("release workflow binds every build and publish step to the authorized comm
   assert.match(
     workflow,
     /gh release edit "\$RELEASE_TAG" --draft=false[\s\S]*verify_remote_assets true\s+verify_release_tag/,
+  );
+
+  const quality = parsedWorkflow.jobs.quality;
+  assert.ok(quality);
+  assert.equal(quality.needs, "authorize");
+  assert.equal(quality.if, "needs.authorize.outputs.skip != 'true'");
+  const qualityCheckout = quality.steps?.find((step) =>
+    step.uses?.startsWith("actions/checkout@")
+  );
+  assert.deepEqual(qualityCheckout, {
+    uses: "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+    with: {
+      ref: "${{ needs.authorize.outputs.sha }}",
+      "persist-credentials": false,
+    },
+  });
+  const qualityBun = quality.steps?.find((step) =>
+    step.uses?.startsWith("oven-sh/setup-bun@")
+  );
+  assert.deepEqual(qualityBun, {
+    uses: "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+    with: {
+      "bun-version": "1.3.14",
+    },
+  });
+  assert.ok(
+    quality.steps?.some(
+      (step) => step.run === "bun install --frozen-lockfile --no-progress",
+    ),
+  );
+  assert.ok(quality.steps?.some((step) => step.run === "bun run check"));
+
+  assert.deepEqual(parsedWorkflow.jobs.publish?.needs, [
+    "authorize",
+    "quality",
+    "linux",
+    "macos",
+    "windows",
+  ]);
+
+  const expectedWindowsRegressionCommand =
+    "bun test --timeout 20000 tests/app/runtime.test.ts tests/core/status-auth.test.ts tests/install/apply.test.ts tests/install/atomic-config.test.ts tests/install/clients.test.ts tests/install/config-formats.test.ts tests/install/configurer-flow.test.ts tests/install/status.test.ts tests/install/writers.test.ts tests/runtime/secure-session.test.ts tests/runtime/secure-store.test.ts tests/sana/client.test.ts tests/sana/auth-request.test.ts tests/sana/auth.test.ts tests/sana/session-publication.test.ts tests/sync/daemon.test.ts tests/tools/dispatch-auth.test.ts tests/install/config-transaction.test.ts tests/install/config-transaction-flow.test.ts";
+  const windowsSteps = parsedWorkflow.jobs.windows?.steps;
+  assert.equal(
+    windowsSteps?.find(
+      (step) => step.name === "Run native Windows regression suite",
+    )?.run,
+    expectedWindowsRegressionCommand,
+  );
+  assert.equal(
+    windowsSteps?.find(
+      (step) => step.name === "Exercise the full native Windows installer replacement",
+    )?.run,
+    'bun test tests/install/installers.test.ts --test-name-pattern "Windows full installer replaces an active receipt-backed v0.4.5 mcp runtime"',
   );
 });
 
@@ -674,7 +743,9 @@ linuxOnlyTest("release resolver distinguishes version reuse, new versions, and l
   }
 });
 
-linuxOnlyTest("release publication resumes only a matching draft and re-verifies every asset", { timeout: 20_000 }, async () => {
+// This executes many serialized fake-GitHub subprocess scenarios, including
+// bounded visibility retries, so allow for process startup under full-suite load.
+linuxOnlyTest("release publication resumes only a matching draft and re-verifies every asset", { timeout: 60_000 }, async () => {
   const workflow = YAML.parse(
     await readFile(
       path.join(process.cwd(), ".github/workflows/release.yml"),
