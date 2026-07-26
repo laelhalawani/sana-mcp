@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   CLIENTS,
+  claudeCodePredecessorEntry,
   detectClient,
   opencodeEntry,
   vscodeEntry,
@@ -39,6 +40,35 @@ test("client entry builders expose exact target-bearing fields", () => {
     args: ["mcp"],
     env: target.env,
   });
+  assert.deepEqual(claudeCodePredecessorEntry(target), {
+    type: "stdio",
+    command: target.command,
+    args: ["mcp"],
+    env: target.env,
+  });
+  assert.deepEqual(
+    claudeCodePredecessorEntry({
+      command: target.command,
+      args: ["mcp"],
+    }),
+    {
+      type: "stdio",
+      command: target.command,
+      args: ["mcp"],
+      env: {},
+    },
+  );
+});
+
+test("only Claude Code declares the exact official predecessor entry", () => {
+  const claudeCode = CLIENTS.find((client) => client.id === "claude-code");
+  assert.ok(claudeCode);
+  assert.deepEqual(claudeCode.install.predecessors, [
+    claudeCodePredecessorEntry,
+  ]);
+  for (const client of CLIENTS)
+    if (client.id !== "claude-code")
+      assert.equal(client.install.predecessors, undefined, client.id);
 });
 
 test("detection exceptions become unavailable instead of absence", () => {

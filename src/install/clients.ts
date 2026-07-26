@@ -23,6 +23,7 @@ export interface FileInstall {
   path: () => PathResolution;
   topKey?: string;
   build?: EntryBuilder;
+  predecessors?: readonly EntryBuilder[];
 }
 
 export interface ClientDef {
@@ -73,6 +74,14 @@ export const vscodeEntry: EntryBuilder = (entry) => {
   if (entry.env && Object.keys(entry.env).length > 0) value.env = { ...entry.env };
   return value;
 };
+
+/** Exact entry emitted by the official pre-v0.4 Claude Code configurer. */
+export const claudeCodePredecessorEntry: EntryBuilder = (entry) => ({
+  type: "stdio",
+  command: entry.command,
+  args: [...entry.args],
+  env: entry.env ? { ...entry.env } : {},
+});
 
 function claudeDesktopConfig(): PathResolution {
   if (process.platform === "darwin")
@@ -201,6 +210,7 @@ export const CLIENTS: readonly ClientDef[] = [
       format: "json",
       path: () => home(".claude.json"),
       topKey: "mcpServers",
+      predecessors: [claudeCodePredecessorEntry],
     },
     reloadHint: "restart Claude Code sessions",
   },

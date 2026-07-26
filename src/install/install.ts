@@ -32,8 +32,8 @@ import {
   type WizardResult,
 } from "./wizard-prompt.js";
 import {
-  applyClientChange,
-  planClientChange,
+  applyPlannedClientChanges,
+  planClientChanges,
   validateServerName,
   type ApplyResult,
   type ConfigPathProvenance,
@@ -769,6 +769,7 @@ function printApplyResult(
 interface ConfigurerSessionClient {
   sessionVersion(): SessionVersion;
   hasAuthCookie(): boolean;
+  pendingSignInChallenge(): Readonly<{ email: string }> | null;
 }
 
 function sameSessionVersion(
@@ -780,6 +781,19 @@ function sameSessionVersion(
     left.publicationToken === right.publicationToken &&
     (left.userId ?? null) === (right.userId ?? null) &&
     (left.workspaceId ?? null) === (right.workspaceId ?? null)
+  );
+}
+
+function sameConfigurerSessionClient(
+  left: ConfigurerSessionClient,
+  right: ConfigurerSessionClient,
+): boolean {
+  const leftPending = left.pendingSignInChallenge();
+  const rightPending = right.pendingSignInChallenge();
+  return (
+    sameSessionVersion(left.sessionVersion(), right.sessionVersion()) &&
+    left.hasAuthCookie() === right.hasAuthCookie() &&
+    leftPending?.email === rightPending?.email
   );
 }
 
@@ -849,10 +863,13 @@ function configurerSessionInfo(
   sync: SyncState,
 ): ConfigurerSessionInfo {
   const hasCookie = client.hasAuthCookie();
-  const expired = hasCookie && sync.phase === "needs_login";
+  const hasPendingChallenge =
+    client.pendingSignInChallenge() !== null;
+  const expired =
+    hasCookie && !hasPendingChallenge && sync.phase === "needs_login";
   return {
     hasCookie,
-    loggedIn: hasCookie && !expired,
+    loggedIn: hasCookie && !hasPendingChallenge && !expired,
     expired,
   };
 }
@@ -909,7 +926,7 @@ export function inspectStableConfigurerAuthState<
     );
 
     if (
-      !sameSessionVersion(beforeVersion, afterVersion) ||
+      !sameConfigurerSessionClient(before, after) ||
       !sameAuthSnapshot(firstSync, secondSync)
     )
       continue;
@@ -1156,24 +1173,21 @@ function normalizePromptCancellation(
   return error;
 }
 
-async function applyClient(
-  client: ClientDef,
+async function applyDirectMutations(
+  mutations: readonly InstallerConfigMutation[],
   name: string,
   entry: ReturnType<typeof serverTarget>,
   dryRun: boolean,
-): Promise<ApplyResult> {
-  const change = await planClientChange(client, name, entry, "present");
-  return await applyClientChange(change, { dryRun });
-}
-
-async function applyRemove(
-  client: ClientDef,
-  name: string,
-  entry: ReturnType<typeof serverTarget>,
-  dryRun: boolean,
-): Promise<ApplyResult> {
-  const change = await planClientChange(client, name, entry, "absent");
-  return await applyClientChange(change, { dryRun });
+): Promise<readonly ApplyResult[]> {
+  const changes = await planClientChanges(
+    mutations.map(({ client, desired }) => ({
+      client,
+      serverName: name,
+      target: entry,
+      desired,
+    })),
+  );
+  return await applyPlannedClientChanges(changes, { dryRun });
 }
 
 function pathProvenance(client: ClientDef): ConfigPathProvenance {
@@ -1587,15 +1601,12 @@ export async function runInstall(
         });
         interaction.onPhase?.("post-apply");
       } else {
-        const planned: ApplyResult[] = [];
-        for (const mutation of mutations) {
-          planned.push(
-            mutation.desired === "present"
-              ? await applyClient(mutation.client, serverName, entry, true)
-              : await applyRemove(mutation.client, serverName, entry, true),
-          );
-        }
-        results = planned;
+        results = await applyDirectMutations(
+          mutations,
+          serverName,
+          entry,
+          true,
+        );
       }
       if (writableBatch)
         await validateBatchResultProvenance(
@@ -1636,10 +1647,12 @@ export async function runInstall(
         `Registering sana-mcp with ${detected.length} detected client(s):`,
       ),
     );
-    const sequential: ApplyResult[] = [];
-    for (const client of detected)
-      sequential.push(await applyClient(client, serverName, entry, dryRun));
-    const results: readonly ApplyResult[] = sequential;
+    const results = await applyDirectMutations(
+      detected.map((client) => ({ client, desired: "present" })),
+      serverName,
+      entry,
+      dryRun,
+    );
     const failedClients: string[] = [];
     detected.forEach((client, index) => {
       const result = results[index]!;
@@ -1670,14 +1683,15 @@ export async function runInstall(
     serverName,
     entry,
   );
+  if (collected.blockedClients.length > 0)
+    stopForIncompleteConfiguration(presentation, [
+      ...new Set(collected.blockedClients),
+    ]);
   if (collected.rows.length === 0) {
     presentation.print(
       "No safely configurable supported clients are available.",
     );
-    const discoveryFailures = [
-      ...collected.blockedClients,
-      ...collected.discoveryIssues,
-    ];
+    const discoveryFailures = [...collected.discoveryIssues];
     if (discoveryFailures.length > 0)
       stopForIncompleteConfiguration(presentation, [
         ...new Set(discoveryFailures),
@@ -1734,26 +1748,34 @@ export async function runInstall(
       });
     } else if (desired) {
       acted.push(client);
-      results = [
-        ...results,
-        await applyClient(client, serverName, entry, dryRun),
-      ];
+      mutations.push({ client, desired: "present" });
     } else if (current) {
       acted.push(client);
-      results = [
-        ...results,
-        await applyRemove(client, serverName, entry, dryRun),
-      ];
+      mutations.push({ client, desired: "absent" });
     }
   }
-  if (writableBatch && mutations.length > 0) {
-    interaction.onPhase?.("applying");
-    results = await writableBatch(mutations, {
-      serverName,
-      target: entry,
-    });
-    await validateBatchResultProvenance(mutations, results, serverName, entry);
-    interaction.onPhase?.("post-apply");
+  if (mutations.length > 0) {
+    if (writableBatch) {
+      interaction.onPhase?.("applying");
+      results = await writableBatch(mutations, {
+        serverName,
+        target: entry,
+      });
+      await validateBatchResultProvenance(
+        mutations,
+        results,
+        serverName,
+        entry,
+      );
+      interaction.onPhase?.("post-apply");
+    } else {
+      results = await applyDirectMutations(
+        mutations,
+        serverName,
+        entry,
+        dryRun,
+      );
+    }
   }
 
   presentation.blank();
@@ -2366,15 +2388,16 @@ export async function runUninstall(
     entry,
   );
 
+  if (discovered.discoveryIssues.length > 0) {
+    presentation.print(
+      "Managed registration state could not be determined for every client.",
+    );
+    stopForIncompleteConfiguration(presentation, [
+      ...new Set(discovered.discoveryIssues),
+    ]);
+  }
+
   if (discovered.candidates.length === 0) {
-    if (discovered.discoveryIssues.length > 0) {
-      presentation.print(
-        "Managed registration state could not be determined for every client.",
-      );
-      stopForIncompleteConfiguration(presentation, [
-        ...new Set(discovered.discoveryIssues),
-      ]);
-    }
     presentation.print("No managed client registrations were found.");
     return { disposition: "no-registrations", selectedCount: 0 };
   }
@@ -2409,14 +2432,18 @@ export async function runUninstall(
     return { disposition: "no-selection", selectedCount: 0 };
   }
 
-  const failedClients: string[] = [...discovered.discoveryIssues];
-  const results: ApplyResult[] = [];
-  for (const client of chosen) {
-    const result = await applyRemove(client, serverName, entry, dryRun);
-    results.push(result);
+  const results = await applyDirectMutations(
+    chosen.map((client) => ({ client, desired: "absent" })),
+    serverName,
+    entry,
+    dryRun,
+  );
+  const failedClients: string[] = [];
+  chosen.forEach((client, index) => {
+    const result = results[index]!;
     printApplyResult(presentation, client, result, false);
     if (needsManualAction(result)) failedClients.push(client.name);
-  }
+  });
   if (failedClients.length > 0)
     stopForIncompleteConfiguration(presentation, failedClients);
   presentation.blank();
