@@ -1849,6 +1849,8 @@ the required independent review rounds complete.
 | `/root/v045_really_done` | none | n/a | CLEAN - zero findings |
 | `/root/v045_ci_path_review` | the Windows release-gate fixture used a non-canonical runner temp path, then the canonical-root correction populated real LocalApplicationData before entering guaranteed cleanup | selected the authoritative Windows LocalApplicationData known folder and moved every fixture-root mutation under the harness `try/finally` | correction required fresh review |
 | `/root/v045_ci_path_zero` | none | n/a | CLEAN - zero findings |
+| `/root/v045_ci_module_review` | the pwsh 7 GitHub runner supplied its module path to the nested Windows PowerShell 5.1 test process, preventing the built-in `Get-FileHash` command from loading | the isolated harness now takes `PSModulePath` from the authoritative machine environment, fails if unavailable, and passes it explicitly to the nested installer process | correction required fresh review |
+| `/root/v045_ci_module_zero` | none | n/a | CLEAN - zero findings |
 
 Final validation evidence:
 
@@ -1862,3 +1864,6 @@ Final validation evidence:
   `git diff --check`: passed after the final production correction.
 - the canonical Windows runner-root correction passed `bun run typecheck` and
   `git diff --check`; its fresh read-only review returned zero findings.
+- the Windows PowerShell module-path correction resolved `Get-FileHash` in a
+  native non-interactive process, passed typecheck/diff validation, and received
+  a fresh zero-finding review.
