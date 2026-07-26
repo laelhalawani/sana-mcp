@@ -1943,6 +1943,64 @@ test("uninstall never claims no registrations when config ownership is unavailab
   }
 });
 
+test("noninteractive uninstall reports required interaction before unrelated discovery issues", async () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-uninstall-nontty-"),
+  );
+  const unknownFile = path.join(root, "unknown.json");
+  const ownedFile = path.join(root, "owned.json");
+  const unknownContents = "{broken";
+  const ownedContents = `${JSON.stringify({
+    mcpServers: { "sana-mcp": serverTarget() },
+    unrelated: true,
+  })}\n`;
+  fs.writeFileSync(unknownFile, unknownContents);
+  fs.writeFileSync(ownedFile, ownedContents);
+  const unknownMtime = fs.statSync(unknownFile, { bigint: true }).mtimeNs;
+  const ownedMtime = fs.statSync(ownedFile, { bigint: true }).mtimeNs;
+  const clients = [
+    fixture("unknown", unknownFile, { state: "absent" }),
+    fixture("owned", ownedFile, { state: "absent" }),
+  ];
+  const output: string[] = [];
+  let promptCalls = 0;
+  try {
+    const result = await runUninstall(
+      {},
+      interaction(clients, output, {
+        terminal: terminal({}, true, false),
+        chooseClients: async () => {
+          promptCalls += 1;
+          return ["owned"];
+        },
+      }),
+    );
+    assert.deepEqual(result, {
+      disposition: "interaction-unavailable",
+      selectedCount: 0,
+    });
+    assert.equal(promptCalls, 0);
+    assert.equal(fs.readFileSync(unknownFile, "utf8"), unknownContents);
+    assert.equal(fs.readFileSync(ownedFile, "utf8"), ownedContents);
+    assert.equal(
+      fs.statSync(unknownFile, { bigint: true }).mtimeNs,
+      unknownMtime,
+    );
+    assert.equal(
+      fs.statSync(ownedFile, { bigint: true }).mtimeNs,
+      ownedMtime,
+    );
+    const plain = stripTerminalSequences(output.join("\n"));
+    assert.match(
+      plain,
+      /An interactive terminal is required to choose clients/u,
+    );
+    assert.doesNotMatch(plain, /Configuration is incomplete/u);
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
 test("uninstall never offers or auto-selects present foreign and unreadable registrations", async () => {
   for (const unattended of [false, true]) {
     const root = fs.mkdtempSync(

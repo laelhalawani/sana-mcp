@@ -10,6 +10,11 @@ const forbiddenDataDirText = process.env.SANA_TEST_FORBIDDEN_DATA_DIR;
 if (!forbiddenDataDirText) {
   throw new Error("SANA_TEST_FORBIDDEN_DATA_DIR is required");
 }
+const forbiddenDataAliasTargetText =
+  process.env.SANA_TEST_FORBIDDEN_DATA_ALIAS_TARGET;
+if (!forbiddenDataAliasTargetText) {
+  throw new Error("SANA_TEST_FORBIDDEN_DATA_ALIAS_TARGET is required");
+}
 
 const originalRealpathSync = fs.realpathSync.bind(fs);
 
@@ -38,8 +43,15 @@ function canonicalPotentialPath(value: string): string {
   }
 }
 
-const forbiddenDataDir = comparablePath(
-  canonicalPotentialPath(forbiddenDataDirText),
+function isSameOrDescendant(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+// The repository data path is lexical on purpose: establishing this guard must
+// never resolve or inspect the live directory it protects.
+const forbiddenDataDir = comparablePath(path.resolve(forbiddenDataDirText));
+const forbiddenDataAliasTarget = comparablePath(
+  canonicalPotentialPath(forbiddenDataAliasTargetText),
 );
 
 function guardPath(value: unknown): void {
@@ -52,11 +64,13 @@ function guardPath(value: unknown): void {
   }
   if (text === undefined) return;
 
+  const lexicalCandidate = comparablePath(path.resolve(text));
+  if (isSameOrDescendant(lexicalCandidate, forbiddenDataDir)) {
+    throw new Error("contract tests block repository live-data access");
+  }
+
   const candidate = comparablePath(canonicalPotentialPath(text));
-  if (
-    candidate === forbiddenDataDir ||
-    candidate.startsWith(`${forbiddenDataDir}${path.sep}`)
-  ) {
+  if (isSameOrDescendant(candidate, forbiddenDataAliasTarget)) {
     throw new Error("contract tests block repository live-data access");
   }
 }
