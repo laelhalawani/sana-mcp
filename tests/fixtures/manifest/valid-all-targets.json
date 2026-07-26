@@ -1,7 +1,7 @@
 {
   "manifestVersion": 1,
-  "packageVersion": "0.4.4",
-  "releaseTag": "v0.4.4",
+  "packageVersion": "0.4.5",
+  "releaseTag": "v0.4.5",
   "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
   "installerProtocol": 1,
   "lifecycleProtocol": 1,

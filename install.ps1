@@ -49,8 +49,15 @@ $LockAcquired = $false
 $PathLockAcquired = $false
 $OldBinaryBackup = $null
 $OldReceiptBackup = $null
+$OldBinaryDigest = $null
+$OldReceiptDigest = $null
+$RetiredBinary = $null
+$RetiredReceipt = $null
+$RetiredBinarySafeToDelete = $false
+$RetiredReceiptSafeToDelete = $false
 $NewPathManaged = $false
 $StagedReceipt = $null
+$NewReceiptDigest = $null
 $WrittenUserPath = $null
 $RetainNewRuntime = $false
 $RuntimeStateTouched = $false
@@ -360,6 +367,158 @@ function Get-Sha256([string] $File) {
   return (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-RetiredInstallerFileName(
+  [string] $Destination,
+  [string] $Token
+) {
+  if ($Token -cnotmatch '^[a-f0-9]{32}$') {
+    throw "The retired installer file token is invalid."
+  }
+  $DestinationName = [IO.Path]::GetFileName($Destination)
+  if ([IO.Path]::GetExtension($DestinationName) -ceq ".exe") {
+    return (
+      "." + [IO.Path]::GetFileNameWithoutExtension($DestinationName) +
+      "-retired-" + $Token + ".exe"
+    )
+  }
+  $Prefix = if ($DestinationName.StartsWith(".")) { "" } else { "." }
+  return $Prefix + $DestinationName + "-retired-" + $Token
+}
+
+function Publish-InstallerFile(
+  [string] $Source,
+  [string] $Destination,
+  [string] $ExpectedSourceSha256,
+  [AllowNull()] [string] $ExpectedDestinationSha256,
+  [ref] $RetiredPath
+) {
+  if ((Get-Sha256 $Source) -cne $ExpectedSourceSha256) {
+    throw "The staged file changed before publication."
+  }
+  $SourceParent = [IO.Path]::GetFullPath((Split-Path -Parent $Source))
+  $DestinationParent =
+    [IO.Path]::GetFullPath((Split-Path -Parent $Destination))
+  if (-not [string]::Equals(
+      $SourceParent,
+      $DestinationParent,
+      [StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw "Installer publication requires a same-directory staged file."
+  }
+  $DestinationExists =
+    Test-Path -LiteralPath $Destination -PathType Leaf
+  if ($DestinationExists) {
+    if ([string]::IsNullOrEmpty($ExpectedDestinationSha256) -or
+        (Get-Sha256 $Destination) -cne $ExpectedDestinationSha256) {
+      throw "The installed file changed before publication."
+    }
+    $RetiredName = Get-RetiredInstallerFileName `
+      $Destination `
+      ([Guid]::NewGuid().ToString("N"))
+    $RetiredPath.Value = Join-Path $DestinationParent $RetiredName
+    Move-Item -LiteralPath $Destination `
+      -Destination $RetiredPath.Value
+  } elseif (-not [string]::IsNullOrEmpty($ExpectedDestinationSha256)) {
+    throw "The installed file disappeared before publication."
+  }
+  try {
+    Move-Item -LiteralPath $Source -Destination $Destination
+    if ((Get-Sha256 $Destination) -cne $ExpectedSourceSha256) {
+      throw "The published file checksum is incorrect."
+    }
+  } catch {
+    if (-not [string]::IsNullOrEmpty($RetiredPath.Value) -and
+        (Test-Path -LiteralPath $RetiredPath.Value -PathType Leaf) -and
+        -not (Test-Path -LiteralPath $Destination)) {
+      Move-Item -LiteralPath $RetiredPath.Value `
+        -Destination $Destination
+      $RetiredPath.Value = $null
+    }
+    throw
+  }
+}
+
+function Restore-InstallerFileState(
+  [string] $Destination,
+  [AllowNull()] [string] $PreviousFile,
+  [AllowNull()] [string] $PreviousSha256,
+  [AllowNull()] [string] $ReplacementSha256,
+  [string] $Label
+) {
+  $CurrentSha256 = if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+    Get-Sha256 $Destination
+  } else {
+    $null
+  }
+  if (-not [string]::IsNullOrEmpty($PreviousSha256)) {
+    if ($CurrentSha256 -ceq $PreviousSha256) {
+      return
+    }
+    if ($null -ne $CurrentSha256 -and
+        $CurrentSha256 -cne $ReplacementSha256) {
+      throw "$Label contains unexpected bytes; recovery files were retained."
+    }
+    if ([string]::IsNullOrEmpty($PreviousFile) -or
+        -not (Test-Path -LiteralPath $PreviousFile -PathType Leaf) -or
+        (Get-Sha256 $PreviousFile) -cne $PreviousSha256) {
+      throw "The authoritative previous $Label backup is unavailable."
+    }
+    $Stage = Join-Path (Split-Path -Parent $Destination) (
+      "." + [IO.Path]::GetFileName($Destination) + "-restore-" +
+      [Guid]::NewGuid().ToString("N")
+    )
+    $Retired = $null
+    try {
+      Copy-Item -LiteralPath $PreviousFile -Destination $Stage
+      Publish-InstallerFile `
+        $Stage `
+        $Destination `
+        $PreviousSha256 `
+        $CurrentSha256 `
+        ([ref] $Retired)
+      if ($null -ne $Retired -and
+          (Test-Path -LiteralPath $Retired -PathType Leaf)) {
+        if ([IO.Path]::GetExtension($Destination) -ceq ".exe") {
+          Stop-CanonicalRuntimeProcesses $Retired
+        }
+        Assert-NotReparse $Retired "Retired $Label"
+        if (-not (Test-Path -LiteralPath $Retired -PathType Leaf) -or
+            (Get-Sha256 $Retired) -cne $CurrentSha256) {
+          throw "The retired $Label changed before rollback cleanup."
+        }
+        Remove-Item -LiteralPath $Retired -Force
+      }
+    } finally {
+      if (Test-Path -LiteralPath $Stage) {
+        Remove-Item -LiteralPath $Stage -Force -ErrorAction SilentlyContinue
+      }
+    }
+    return
+  }
+  if ($null -eq $CurrentSha256) {
+    return
+  }
+  if ([string]::IsNullOrEmpty($ReplacementSha256) -or
+      $CurrentSha256 -cne $ReplacementSha256) {
+    throw "$Label contains unexpected bytes; recovery files were retained."
+  }
+  $Retired = Join-Path (Split-Path -Parent $Destination) (
+    Get-RetiredInstallerFileName `
+      $Destination `
+      ([Guid]::NewGuid().ToString("N"))
+  )
+  Move-Item -LiteralPath $Destination -Destination $Retired
+  if ([IO.Path]::GetExtension($Destination) -ceq ".exe") {
+    Stop-CanonicalRuntimeProcesses $Retired
+  }
+  Assert-NotReparse $Retired "Retired $Label"
+  if (-not (Test-Path -LiteralPath $Retired -PathType Leaf) -or
+      (Get-Sha256 $Retired) -cne $ReplacementSha256) {
+    throw "The retired $Label changed before rollback cleanup."
+  }
+  Remove-Item -LiteralPath $Retired -Force
+}
+
 function Get-VerifiedLegacyReleaseDigest([string] $Digest) {
   # Authoritative digests of this repository's Windows x64 assets from the
   # releases published before installer receipts were introduced.
@@ -402,14 +561,15 @@ function Confirm-IncompatibleReplacement([string] $Release) {
   return @("y", "yes") -ccontains $Answer.Trim().ToLowerInvariant()
 }
 
-function Get-LegacyDaemonProcesses([string] $Executable) {
+function Get-CanonicalRuntimeProcesses([string] $Executable) {
   $Resolved = [System.IO.Path]::GetFullPath($Executable)
-  $Escaped = [Regex]::Escape($Resolved)
-  $QuotedDaemon = '^\s*"' + $Escaped + '"\s+daemon(?:\s|$)'
-  $BareDaemon = '^\s*' + $Escaped + '\s+daemon(?:\s|$)'
-  $DaemonProcesses = @()
+  $ImageName = [IO.Path]::GetFileName($Resolved)
+  if ($ImageName -cnotmatch '^[A-Za-z0-9._-]+$') {
+    throw "The sana-mcp process image name is invalid."
+  }
+  $RuntimeProcesses = @()
   foreach ($Process in @(
-    Get-CimInstance Win32_Process -Filter "Name = 'sana-mcp.exe'"
+    Get-CimInstance Win32_Process -Filter "Name = '$ImageName'"
   )) {
     if ([string]::IsNullOrWhiteSpace([string] $Process.ExecutablePath)) {
       continue
@@ -424,19 +584,117 @@ function Get-LegacyDaemonProcesses([string] $Executable) {
     )) {
       continue
     }
-    $CommandLine = [string] $Process.CommandLine
-    if ($CommandLine -notmatch $QuotedDaemon -and
-        $CommandLine -notmatch $BareDaemon) {
-      throw "The official legacy sana-mcp executable is active outside daemon mode; close it and rerun the installer."
+    $RuntimeProcesses += $Process
+  }
+  return @($RuntimeProcesses)
+}
+
+function Get-CanonicalProcessIdentity(
+  [object] $Process,
+  [string] $Executable
+) {
+  if ([string]::IsNullOrWhiteSpace([string] $Process.CreationDate)) {
+    throw "Windows did not provide a creation time for sana-mcp process $($Process.ProcessId)."
+  }
+  return [pscustomobject] @{
+    processId = [int] $Process.ProcessId
+    creationDate = [string] $Process.CreationDate
+    executablePath = [System.IO.Path]::GetFullPath($Executable)
+  }
+}
+
+function Get-RevalidatedCanonicalProcess(
+  [object] $Identity
+) {
+  $Observed = @(
+    Get-CimInstance Win32_Process `
+      -Filter "ProcessId = $($Identity.processId)"
+  )
+  if ($Observed.Count -eq 0) {
+    return $null
+  }
+  if ($Observed.Count -ne 1) {
+    throw "Windows returned an ambiguous process identity for PID $($Identity.processId)."
+  }
+  $Process = $Observed[0]
+  if ([string]::IsNullOrWhiteSpace([string] $Process.ExecutablePath)) {
+    return $null
+  }
+  $ObservedPath = [System.IO.Path]::GetFullPath(
+    [string] $Process.ExecutablePath
+  )
+  if (-not [string]::Equals(
+      $ObservedPath,
+      $Identity.executablePath,
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    [string] $Process.CreationDate -cne $Identity.creationDate) {
+    return $null
+  }
+  return $Process
+}
+
+function Stop-CanonicalRuntimeProcesses([string] $Executable) {
+  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+  $EmptyObservations = 0
+  while ([DateTime]::UtcNow -lt $Deadline) {
+    $Processes = @(Get-CanonicalRuntimeProcesses $Executable)
+    if ($Processes.Count -eq 0) {
+      $EmptyObservations++
+      if ($EmptyObservations -ge 3) {
+        return
+      }
+      Start-Sleep -Milliseconds 100
+      continue
     }
-    $DaemonProcesses += $Process
+    $EmptyObservations = 0
+    foreach ($Process in $Processes) {
+      $Identity = Get-CanonicalProcessIdentity $Process $Executable
+      $Revalidated = Get-RevalidatedCanonicalProcess $Identity
+      if ($null -eq $Revalidated) {
+        continue
+      }
+      $Result = Invoke-CimMethod `
+        -InputObject $Revalidated `
+        -MethodName Terminate
+      if ([int] $Result.ReturnValue -ne 0) {
+        throw "The previous sana-mcp process $($Identity.processId) could not be stopped (code $($Result.ReturnValue))."
+      }
+    }
+    Start-Sleep -Milliseconds 50
+  }
+  $Remaining = @(Get-CanonicalRuntimeProcesses $Executable)
+  if ($Remaining.Count -gt 0) {
+    $Pids = @($Remaining | ForEach-Object { [string] $_.ProcessId })
+    throw "Active processes from the installed sana-mcp path did not stop within ten seconds (PIDs $($Pids -join ', '))."
+  }
+  throw "The installed sana-mcp process retirement barrier did not remain clear."
+}
+
+function Get-LegacyDaemonProcesses([string] $Executable) {
+  $Resolved = [System.IO.Path]::GetFullPath($Executable)
+  $Escaped = [Regex]::Escape($Resolved)
+  $QuotedDaemon = '^\s*"' + $Escaped + '"\s+daemon(?:\s|$)'
+  $BareDaemon = '^\s*' + $Escaped + '\s+daemon(?:\s|$)'
+  $DaemonProcesses = @()
+  foreach ($Process in @(Get-CanonicalRuntimeProcesses $Executable)) {
+    $CommandLine = [string] $Process.CommandLine
+    if ($CommandLine -match $QuotedDaemon -or
+        $CommandLine -match $BareDaemon) {
+      $DaemonProcesses += $Process
+    }
   }
   return @($DaemonProcesses)
 }
 
 function Stop-LegacyDaemon([string] $Executable) {
   foreach ($Process in @(Get-LegacyDaemonProcesses $Executable)) {
-    $Result = Invoke-CimMethod -InputObject $Process -MethodName Terminate
+    $Identity = Get-CanonicalProcessIdentity $Process $Executable
+    $Revalidated = Get-RevalidatedCanonicalProcess $Identity
+    if ($null -eq $Revalidated) {
+      continue
+    }
+    $Result = Invoke-CimMethod -InputObject $Revalidated -MethodName Terminate
     if ([int] $Result.ReturnValue -ne 0) {
       throw "The previous sana-mcp daemon could not be stopped (code $($Result.ReturnValue))."
     }
@@ -522,6 +780,45 @@ function Normalize-PathEntry([string] $Path) {
     $Full = $Full.TrimEnd([char[]]"\/")
   }
   return $Full.ToUpperInvariant()
+}
+
+function ConvertTo-RecoveryPathValue([AllowNull()] [string] $Value) {
+  if ($null -eq $Value) {
+    return "n"
+  }
+  $Encoded = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($Value)
+  ).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+  return "s.$Encoded"
+}
+
+function ConvertFrom-RecoveryPathValue([string] $Value) {
+  if ($Value -ceq "n") {
+    return $null
+  }
+  if ($Value -cnotmatch '^s\.([A-Za-z0-9_-]*)$') {
+    throw "The incompatible recovery PATH value is invalid."
+  }
+  $Encoded = $Matches[1].Replace("-", "+").Replace("_", "/")
+  switch ($Encoded.Length % 4) {
+    0 { }
+    2 { $Encoded += "==" }
+    3 { $Encoded += "=" }
+    default {
+      throw "The incompatible recovery PATH value is invalid."
+    }
+  }
+  try {
+    $Decoded = [Text.Encoding]::UTF8.GetString(
+      [Convert]::FromBase64String($Encoded)
+    )
+  } catch {
+    throw "The incompatible recovery PATH value is invalid."
+  }
+  if ((ConvertTo-RecoveryPathValue $Decoded) -cne $Value) {
+    throw "The incompatible recovery PATH value is not canonical."
+  }
+  return $Decoded
 }
 
 function Read-InstallReceipt([string] $File) {
@@ -792,6 +1089,142 @@ function Remove-ResolvedIncompatibleRecovery([string] $RecoveryDirectory) {
   }
 }
 
+function Get-ValidatedRecoveryReplacementReceiptHash(
+  [string] $Receipt,
+  [hashtable] $Inventory,
+  [bool] $WasLegacy,
+  [bool] $HasReplacementReceiptAuthority
+) {
+  if (-not (Test-Path -LiteralPath $Receipt -PathType Leaf)) {
+    return $null
+  }
+  $ReceiptHash = Get-Sha256 $Receipt
+  if (-not $WasLegacy -and
+      $ReceiptHash -ceq $Inventory["previousReceiptSha256"]) {
+    return $null
+  }
+  if (-not $HasReplacementReceiptAuthority) {
+    throw "The incompatible recovery journal lacks authority for the published replacement receipt."
+  }
+  $ReplacementReceipt = Read-InstallReceipt $Receipt
+  if ($ReplacementReceipt["format"] -cne "sana-mcp-install-v2" -or
+      $ReplacementReceipt["binarySha256"] -cne
+        $Inventory["replacementBinarySha256"] -or
+      $ReplacementReceipt["version"] -cne
+        $Inventory["replacementVersion"] -or
+      $ReplacementReceipt["target"] -cne
+        $Inventory["replacementTarget"] -or
+      $ReplacementReceipt["sourceCommit"] -cne
+        $Inventory["replacementSourceCommit"] -or
+      $ReplacementReceipt["installerProtocol"] -cne
+        $Inventory["replacementInstallerProtocol"] -or
+      $ReplacementReceipt["lifecycleProtocol"] -cne
+        $Inventory["replacementLifecycleProtocol"] -or
+      $ReplacementReceipt["inspectProtocol"] -cne
+        $Inventory["replacementInspectProtocol"] -or
+      $ReplacementReceipt["stateCompatibility"] -cne
+        $Inventory["replacementStateCompatibility"] -or
+      $ReplacementReceipt["pathManaged"] -cne
+        $Inventory["replacementPathManaged"]) {
+    throw "The incompatible recovery replacement receipt is not authoritative."
+  }
+  if ($Inventory.ContainsKey("replacementReceiptSha256") -and
+      $ReceiptHash -cne $Inventory["replacementReceiptSha256"]) {
+    throw "The incompatible recovery replacement receipt digest changed."
+  }
+  return $ReceiptHash
+}
+
+function Remove-OrphanRetiredInstallerFiles(
+  [string] $Executable,
+  [string] $Receipt,
+  [hashtable] $Inventory,
+  [AllowNull()] [string] $AuthorizedReplacementReceiptSha256
+) {
+  $InstallDirectory = [IO.Path]::GetFullPath(
+    (Split-Path -Parent $Executable)
+  )
+  if (-not [string]::Equals(
+      $InstallDirectory,
+      [IO.Path]::GetFullPath((Split-Path -Parent $Receipt)),
+      [StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw "Recovery runtime and receipt directories do not match."
+  }
+  Assert-NotReparse $InstallDirectory "Install directory"
+  $TokenMarker = "0123456789abcdef0123456789abcdef"
+  $BinaryPattern = "^" + [Regex]::Escape(
+    (Get-RetiredInstallerFileName $Executable $TokenMarker)
+  ).Replace($TokenMarker, "[a-f0-9]{32}") + "$"
+  $ReceiptPattern = "^" + [Regex]::Escape(
+    (Get-RetiredInstallerFileName $Receipt $TokenMarker)
+  ).Replace($TokenMarker, "[a-f0-9]{32}") + "$"
+  $Candidates = @(
+    Get-ChildItem -LiteralPath $InstallDirectory -Force |
+      Where-Object {
+        [Regex]::IsMatch(
+          $_.Name,
+          $BinaryPattern,
+          [Text.RegularExpressions.RegexOptions]::CultureInvariant
+        ) -or
+        [Regex]::IsMatch(
+          $_.Name,
+          $ReceiptPattern,
+          [Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+      }
+  )
+  if ($Candidates.Count -gt 64) {
+    throw "Too many retired installer artifacts require recovery."
+  }
+  foreach ($Candidate in $Candidates) {
+    Assert-NotReparse $Candidate.FullName "Retired installer artifact"
+    if ($Candidate.PSIsContainer -or
+        -not (Test-Path -LiteralPath $Candidate.FullName -PathType Leaf)) {
+      throw "A retired installer artifact is not a regular file: $($Candidate.FullName)"
+    }
+    $Digest = Get-Sha256 $Candidate.FullName
+    $IsBinary = [Regex]::IsMatch(
+      $Candidate.Name,
+      $BinaryPattern,
+      [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if ($IsBinary) {
+      if (@(
+          $Inventory["previousBinarySha256"],
+          $Inventory["replacementBinarySha256"]
+        ) -cnotcontains $Digest) {
+        throw "A retired runtime has an unexpected digest: $($Candidate.FullName)"
+      }
+      Stop-CanonicalRuntimeProcesses $Candidate.FullName
+    } else {
+      $AllowedReceiptDigests = @()
+      if ($Inventory["previousReceiptSha256"] -cmatch
+          '^[a-f0-9]{64}$') {
+        $AllowedReceiptDigests +=
+          $Inventory["previousReceiptSha256"]
+      }
+      if (-not [string]::IsNullOrEmpty(
+          $AuthorizedReplacementReceiptSha256)) {
+        $AllowedReceiptDigests +=
+          $AuthorizedReplacementReceiptSha256
+      }
+      if ($AllowedReceiptDigests -cnotcontains $Digest) {
+        throw "A retired receipt has an unexpected or unprovable digest: $($Candidate.FullName)"
+      }
+    }
+    Assert-NotReparse $Candidate.FullName "Retired installer artifact"
+    if (-not (Test-Path -LiteralPath $Candidate.FullName -PathType Leaf) -or
+        (Get-Sha256 $Candidate.FullName) -cne $Digest) {
+      throw "A retired installer artifact changed before deletion: $($Candidate.FullName)"
+    }
+    Remove-Item -LiteralPath $Candidate.FullName -Force
+    if (Test-Path -LiteralPath $Candidate.FullName) {
+      throw "A retired installer artifact could not be removed: $($Candidate.FullName)"
+    }
+  }
+}
+
 function Invoke-PendingIncompatibleRecovery(
   [string] $Executable,
   [string] $Receipt,
@@ -833,7 +1266,11 @@ function Invoke-PendingIncompatibleRecovery(
     "format", "oldWasRunning", "legacyInstall",
     "previousBinarySha256", "previousReceiptSha256",
     "replacementBinarySha256", "replacementVersion",
-    "replacementTarget", "replacementStateCompatibility"
+    "replacementTarget", "replacementStateCompatibility",
+    "replacementSourceCommit", "replacementInstallerProtocol",
+    "replacementLifecycleProtocol", "replacementInspectProtocol",
+    "replacementReceiptSha256", "replacementPathManaged",
+    "previousUserPath", "publishedUserPath"
   )
   if ($Inventory["format"] -cne "sana-mcp-incompatible-recovery-v1" -or
       @("true", "false") -cnotcontains $Inventory["oldWasRunning"] -or
@@ -844,6 +1281,55 @@ function Invoke-PendingIncompatibleRecovery(
       $Inventory["replacementTarget"] -cne "bun-windows-x64" -or
       $Inventory["replacementStateCompatibility"] -cnotmatch '^[1-9][0-9]*$') {
     throw "The incompatible replacement recovery inventory is invalid."
+  }
+  $ReplacementAuthorityKeys = @(
+    "replacementSourceCommit", "replacementInstallerProtocol",
+    "replacementLifecycleProtocol", "replacementInspectProtocol"
+  )
+  $ReplacementAuthorityCount = @(
+    $ReplacementAuthorityKeys | Where-Object {
+      $Inventory.ContainsKey($_)
+    }
+  ).Count
+  if ($ReplacementAuthorityCount -ne 0 -and
+      $ReplacementAuthorityCount -ne $ReplacementAuthorityKeys.Count) {
+    throw "The incompatible replacement recovery receipt authority is incomplete."
+  }
+  $HasReplacementReceiptAuthority =
+    $ReplacementAuthorityCount -eq $ReplacementAuthorityKeys.Count
+  if ($HasReplacementReceiptAuthority -and
+      ($Inventory["replacementSourceCommit"] -cnotmatch '^[a-f0-9]{40}$' -or
+       $Inventory["replacementInstallerProtocol"] -cnotmatch '^[1-9][0-9]*$' -or
+       $Inventory["replacementLifecycleProtocol"] -cnotmatch '^[1-9][0-9]*$' -or
+       $Inventory["replacementInspectProtocol"] -cnotmatch '^[1-9][0-9]*$')) {
+    throw "The incompatible replacement recovery receipt authority is invalid."
+  }
+  if ($Inventory.ContainsKey("replacementReceiptSha256") -and
+      $Inventory["replacementReceiptSha256"] -cnotmatch '^[a-f0-9]{64}$') {
+    throw "The incompatible replacement recovery receipt digest is invalid."
+  }
+  $PathAuthorityKeys = @(
+    "replacementPathManaged", "previousUserPath", "publishedUserPath"
+  )
+  $PathAuthorityCount = @(
+    $PathAuthorityKeys | Where-Object {
+      $Inventory.ContainsKey($_)
+    }
+  ).Count
+  if ($PathAuthorityCount -ne $PathAuthorityKeys.Count) {
+    throw "The incompatible replacement recovery PATH authority is unavailable."
+  }
+  if (@("true", "false") -cnotcontains
+      $Inventory["replacementPathManaged"]) {
+    throw "The incompatible replacement recovery PATH ownership is invalid."
+  }
+  $RecoveryPreviousUserPath =
+    ConvertFrom-RecoveryPathValue $Inventory["previousUserPath"]
+  $RecoveryPublishedUserPath =
+    ConvertFrom-RecoveryPathValue $Inventory["publishedUserPath"]
+  if ($Inventory["replacementPathManaged"] -ceq "false" -and
+      $RecoveryPublishedUserPath -cne $RecoveryPreviousUserPath) {
+    throw "The incompatible replacement recovery PATH journal claims an unowned mutation."
   }
   $PreviousExecutable =
     Join-Path $RecoveryDirectory "previous-sana-mcp.exe"
@@ -881,9 +1367,16 @@ function Invoke-PendingIncompatibleRecovery(
   }
   $JournalFile =
     Join-Path $RecoveryDirectory "incompatible-reset.json"
+  $RecoveryReplacementReceiptHash = $null
   if (-not (Test-Path -LiteralPath $JournalFile -PathType Leaf)) {
     $NeedsReset = $true
     $NeedsCommit = $false
+    $RecoveryReplacementReceiptHash =
+      Get-ValidatedRecoveryReplacementReceiptHash `
+        $Receipt `
+        $Inventory `
+        $WasLegacy `
+        $HasReplacementReceiptAuthority
   } else {
     $StatusFile = [IO.Path]::GetTempFileName()
     $RecoveryInspectFile = [IO.Path]::GetTempFileName()
@@ -933,16 +1426,24 @@ function Invoke-PendingIncompatibleRecovery(
       if (-not $NeedsReset -and -not $NeedsCommit) {
         throw "The incompatible recovery transaction state is invalid."
       }
+      $RecoveryReplacementReceiptHash =
+        Get-ValidatedRecoveryReplacementReceiptHash `
+          $Receipt `
+          $Inventory `
+          $WasLegacy `
+          $HasReplacementReceiptAuthority
       if ($NeedsCommit) {
+        if ([Environment]::GetEnvironmentVariable("Path", "User") -cne
+            $RecoveryPublishedUserPath) {
+          throw "The committed incompatible replacement User PATH changed."
+        }
         if (-not (Test-Path -LiteralPath $Executable -PathType Leaf) -or
-            -not (Test-Path -LiteralPath $Receipt -PathType Leaf)) {
+            -not $Inventory.ContainsKey("replacementReceiptSha256") -or
+            $RecoveryReplacementReceiptHash -cne
+              $Inventory["replacementReceiptSha256"]) {
           throw "The committed incompatible replacement runtime is incomplete."
         }
-        $ReplacementReceipt = Read-InstallReceipt $Receipt
-        if ($ReplacementReceipt["format"] -cne "sana-mcp-install-v2" -or
-            $ReplacementReceipt["binarySha256"] -cne
-              $Inventory["replacementBinarySha256"] -or
-            (Get-Sha256 $Executable) -cne
+        if ((Get-Sha256 $Executable) -cne
               $Inventory["replacementBinarySha256"]) {
           throw "The committed incompatible replacement runtime changed."
         }
@@ -974,21 +1475,83 @@ function Invoke-PendingIncompatibleRecovery(
   }
 
   if ($NeedsReset) {
-    $ExecutableRestore = Join-Path (
-      Split-Path -Parent $Executable
-    ) (".sana-mcp-recovery-" + [Guid]::NewGuid().ToString("N") + ".exe")
-    Copy-Item -LiteralPath $PreviousExecutable -Destination $ExecutableRestore
-    Move-Item -LiteralPath $ExecutableRestore -Destination $Executable -Force
-    if ($WasLegacy) {
-      if (Test-Path -LiteralPath $Receipt) {
-        Remove-Item -LiteralPath $Receipt -Force
+    $RecoveryCurrentUserPath =
+      [Environment]::GetEnvironmentVariable("Path", "User")
+    if ($Inventory["replacementPathManaged"] -ceq "true") {
+      if ($RecoveryCurrentUserPath -ceq
+          $RecoveryPreviousUserPath) {
+        # The PATH side of rollback was already completed.
+      } elseif ($RecoveryCurrentUserPath -ceq
+          $RecoveryPublishedUserPath) {
+        [Environment]::SetEnvironmentVariable(
+          "Path",
+          $RecoveryPreviousUserPath,
+          "User"
+        )
+        if ([Environment]::GetEnvironmentVariable("Path", "User") -cne
+            $RecoveryPreviousUserPath) {
+          throw "The previous User PATH could not be restored during incompatible recovery."
+        }
+      } else {
+        throw "The User PATH changed concurrently during incompatible recovery."
       }
+    } elseif ($RecoveryCurrentUserPath -cne
+        $RecoveryPreviousUserPath) {
+      throw "The unowned User PATH changed during incompatible recovery."
+    }
+    $CurrentBinaryHash = if (
+      Test-Path -LiteralPath $Executable -PathType Leaf
+    ) {
+      Get-Sha256 $Executable
     } else {
-      $ReceiptRestore = Join-Path (
-        Split-Path -Parent $Receipt
-      ) (".sana-mcp-receipt-recovery-" + [Guid]::NewGuid().ToString("N"))
-      Copy-Item -LiteralPath $PreviousReceipt -Destination $ReceiptRestore
-      Move-Item -LiteralPath $ReceiptRestore -Destination $Receipt -Force
+      $null
+    }
+    if ($null -ne $CurrentBinaryHash -and
+        $CurrentBinaryHash -cne $Inventory["previousBinarySha256"] -and
+        $CurrentBinaryHash -cne $Inventory["replacementBinarySha256"]) {
+      throw "The installed binary contains unexpected bytes; recovery files were retained."
+    }
+    if ($CurrentBinaryHash -ceq
+        $Inventory["replacementBinarySha256"]) {
+      Stop-CanonicalRuntimeProcesses $Executable
+    }
+    $RecoveryBinaryError = $null
+    $RecoveryReceiptError = $null
+    try {
+      Restore-InstallerFileState `
+        $Executable `
+        $PreviousExecutable `
+        $Inventory["previousBinarySha256"] `
+        $Inventory["replacementBinarySha256"] `
+        "installed binary"
+    } catch {
+      $RecoveryBinaryError = $_.Exception.Message
+    }
+    $ReplacementReceiptHash =
+      $RecoveryReplacementReceiptHash
+    $RecoveryPreviousReceipt = if ($WasLegacy) {
+      $null
+    } else {
+      $PreviousReceipt
+    }
+    $RecoveryPreviousReceiptHash = if ($WasLegacy) {
+      $null
+    } else {
+      $Inventory["previousReceiptSha256"]
+    }
+    try {
+      Restore-InstallerFileState `
+        $Receipt `
+        $RecoveryPreviousReceipt `
+        $RecoveryPreviousReceiptHash `
+        $ReplacementReceiptHash `
+        "installer receipt"
+    } catch {
+      $RecoveryReceiptError = $_.Exception.Message
+    }
+    if ($null -ne $RecoveryBinaryError -or
+        $null -ne $RecoveryReceiptError) {
+      throw "Could not reconcile the interrupted incompatible replacement: binary=$RecoveryBinaryError; receipt=$RecoveryReceiptError"
     }
     if ($Inventory["oldWasRunning"] -ceq "true") {
       if ($WasLegacy) {
@@ -1001,6 +1564,19 @@ function Invoke-PendingIncompatibleRecovery(
       }
     }
   }
+  $AuthorizedReplacementReceiptSha256 = if (
+    $HasReplacementReceiptAuthority -and
+    $Inventory.ContainsKey("replacementReceiptSha256")
+  ) {
+    $Inventory["replacementReceiptSha256"]
+  } else {
+    $null
+  }
+  Remove-OrphanRetiredInstallerFiles `
+    $Executable `
+    $Receipt `
+    $Inventory `
+    $AuthorizedReplacementReceiptSha256
   Remove-ResolvedIncompatibleRecovery $RecoveryDirectory
   return @{
     restoredPrevious = $NeedsReset
@@ -1249,6 +1825,7 @@ try {
       @(Get-LegacyDaemonProcesses $Destination).Count -gt 0
     $OldBinaryBackup = Join-Path $TempDir "previous-sana-mcp.exe"
     Copy-Item -LiteralPath $Destination -Destination $OldBinaryBackup
+    $OldBinaryDigest = $IncompatibleDigest
     Write-Host "Verified official pre-receipt sana-mcp $LegacyRelease."
   }
   if (-not $LegacyInstall -and $DestinationExists -ne $ReceiptExists) {
@@ -1319,6 +1896,49 @@ try {
     $OldReceiptBackup = Join-Path $TempDir "previous-receipt"
     Copy-Item -LiteralPath $Destination -Destination $OldBinaryBackup
     Copy-Item -LiteralPath $ReceiptPath -Destination $OldReceiptBackup
+    $OldBinaryDigest = $OldDigest
+    $OldReceiptDigest = Get-Sha256 $OldReceiptBackup
+  }
+
+  $OldUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  $UserEntries = if ([string]::IsNullOrEmpty($OldUserPath)) {
+    @()
+  } else {
+    @($OldUserPath -split ";" | Where-Object {
+      -not [string]::IsNullOrWhiteSpace($_)
+    })
+  }
+  $NormalizedInstallDir = Normalize-PathEntry $InstallDir
+  $MatchingEntries = @(
+    $UserEntries | Where-Object {
+      (Normalize-PathEntry $_) -eq $NormalizedInstallDir
+    }
+  )
+  if ($MatchingEntries.Count -gt 1) {
+    throw "The user PATH contains duplicate entries for $InstallDir; remove the duplicates before installing."
+  }
+  if ($OldPresent -and -not $LegacyInstall) {
+    if ($NewPathManaged -and $MatchingEntries.Count -ne 1) {
+      throw "The installer-owned PATH entry recorded by the receipt is missing."
+    }
+  } else {
+    $NewPathManaged = $MatchingEntries.Count -eq 0
+  }
+  $NewUserPath = if (
+    $NewPathManaged -and $MatchingEntries.Count -eq 0
+  ) {
+    if ([string]::IsNullOrEmpty($OldUserPath)) {
+      $InstallDir
+    } else {
+      "$OldUserPath;$InstallDir"
+    }
+  } else {
+    $null
+  }
+  $ExpectedCurrentUserPath = if ($null -ne $NewUserPath) {
+    $NewUserPath
+  } else {
+    $OldUserPath
   }
 
   if ($IncompatibleStateReset) {
@@ -1359,6 +1979,13 @@ try {
         "replacementVersion=$($Release["packageVersion"])"
         "replacementTarget=$($Release["target"])"
         "replacementStateCompatibility=$($Release["stateCompatibility"])"
+        "replacementSourceCommit=$($Release["sourceCommit"])"
+        "replacementInstallerProtocol=$($Release["installerProtocol"])"
+        "replacementLifecycleProtocol=$($Release["lifecycleProtocol"])"
+        "replacementInspectProtocol=$($Release["inspectProtocol"])"
+        "replacementPathManaged=$($NewPathManaged.ToString().ToLowerInvariant())"
+        "previousUserPath=$(ConvertTo-RecoveryPathValue $OldUserPath)"
+        "publishedUserPath=$(ConvertTo-RecoveryPathValue $ExpectedCurrentUserPath)"
       ) -join "`n"
       [IO.File]::WriteAllText(
         (Join-Path $RecoveryStage "installer.properties"),
@@ -1393,37 +2020,19 @@ try {
       }
     }
   }
+  if ($OldPresent) {
+    Stop-CanonicalRuntimeProcesses $Destination
+  }
 
-  Move-Item -LiteralPath $StagedBinary -Destination $Destination -Force
+  Publish-InstallerFile `
+    $StagedBinary `
+    $Destination `
+    $Release["sha256"] `
+    $OldBinaryDigest `
+    ([ref] $RetiredBinary)
   $StagedBinary = $null
 
-  $OldUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  $UserEntries = if ([string]::IsNullOrEmpty($OldUserPath)) {
-    @()
-  } else {
-    @($OldUserPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-  }
-  $NormalizedInstallDir = Normalize-PathEntry $InstallDir
-  $MatchingEntries = @(
-    $UserEntries | Where-Object { (Normalize-PathEntry $_) -eq $NormalizedInstallDir }
-  )
-  if ($MatchingEntries.Count -gt 1) {
-    throw "The user PATH contains duplicate entries for $InstallDir; remove the duplicates before installing."
-  }
-  if ($OldPresent -and -not $LegacyInstall) {
-    if ($NewPathManaged -and $MatchingEntries.Count -ne 1) {
-      throw "The installer-owned PATH entry recorded by the receipt is missing."
-    }
-  } else {
-    $NewPathManaged = $MatchingEntries.Count -eq 0
-  }
-
   if ($NewPathManaged -and $MatchingEntries.Count -eq 0) {
-    $NewUserPath = if ([string]::IsNullOrEmpty($OldUserPath)) {
-      $InstallDir
-    } else {
-      "$OldUserPath;$InstallDir"
-    }
     $PathBeforePublication = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($PathBeforePublication -cne $OldUserPath) {
       throw "The user PATH changed while the installer was preparing its update."
@@ -1442,11 +2051,6 @@ try {
     Write-Host "Verified $InstallDir is already on PATH for new shells."
   }
 
-  $ExpectedCurrentUserPath = if ($PathChanged) {
-    $WrittenUserPath
-  } else {
-    $OldUserPath
-  }
   if (
     [Environment]::GetEnvironmentVariable("Path", "User") -cne
       $ExpectedCurrentUserPath
@@ -1468,8 +2072,55 @@ try {
     "stateCompatibility=$($Release["stateCompatibility"])"
   ) -join "`n"
   [IO.File]::WriteAllText($StagedReceipt, "$ReceiptBody`n", [Text.Encoding]::ASCII)
-  Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force
+  $NewReceiptDigest = Get-Sha256 $StagedReceipt
+  Publish-InstallerFile `
+    $StagedReceipt `
+    $ReceiptPath `
+    $NewReceiptDigest `
+    $OldReceiptDigest `
+    ([ref] $RetiredReceipt)
   $StagedReceipt = $null
+
+  if ($IncompatibleStateReset) {
+    $RecoveryInventoryFile =
+      Join-Path $IncompatibleResetJournal "installer.properties"
+    $RecoveryInventoryText =
+      [IO.File]::ReadAllText($RecoveryInventoryFile)
+    if ($RecoveryInventoryText -match
+        '(?m)^replacementReceiptSha256=') {
+      throw "The incompatible recovery receipt digest was already recorded."
+    }
+    $RecoveryInventoryUpdate =
+      Join-Path $IncompatibleResetJournal (
+        ".installer-properties-update-" +
+        [Guid]::NewGuid().ToString("N")
+      )
+    $RecoveryInventoryBackup =
+      Join-Path $IncompatibleResetJournal "installer.properties.previous"
+    $UpdatedRecoveryInventoryText =
+      $RecoveryInventoryText.TrimEnd("`r", "`n") +
+      "`nreplacementReceiptSha256=$NewReceiptDigest`n"
+    [IO.File]::WriteAllText(
+      $RecoveryInventoryUpdate,
+      $UpdatedRecoveryInventoryText,
+      [Text.Encoding]::ASCII
+    )
+    $UpdatedRecoveryInventoryHash =
+      Get-Sha256 $RecoveryInventoryUpdate
+    [IO.File]::Replace(
+      $RecoveryInventoryUpdate,
+      $RecoveryInventoryFile,
+      $RecoveryInventoryBackup,
+      $true
+    )
+    if ((Get-Sha256 $RecoveryInventoryFile) -cne
+        $UpdatedRecoveryInventoryHash) {
+      throw "The incompatible recovery receipt authority was not published exactly."
+    }
+    if (Test-Path -LiteralPath $RecoveryInventoryBackup) {
+      Remove-Item -LiteralPath $RecoveryInventoryBackup -Force
+    }
+  }
 
   if ($IncompatibleStateReset) {
     $PreviousResetAuthority = $env:SANA_MCP_INCOMPATIBLE_RESET
@@ -1538,6 +2189,34 @@ try {
     throw "The user PATH changed before installation completed."
   }
 
+  if ($null -ne $RetiredBinary) {
+    if (-not (Test-Path -LiteralPath $RetiredBinary -PathType Leaf) -or
+        (Get-Sha256 $RetiredBinary) -cne $OldBinaryDigest -or
+        -not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
+        (Get-Sha256 $Destination) -cne $Release["sha256"]) {
+      throw "Published runtime retirement state changed before commit."
+    }
+    Stop-CanonicalRuntimeProcesses $Destination
+    Stop-CanonicalRuntimeProcesses $RetiredBinary
+    if ((Get-Sha256 $RetiredBinary) -cne $OldBinaryDigest -or
+        (Get-Sha256 $Destination) -cne $Release["sha256"]) {
+      throw "Published runtime retirement state changed during commit."
+    }
+  }
+  if ($null -ne $RetiredReceipt -and
+      (-not (Test-Path -LiteralPath $RetiredReceipt -PathType Leaf) -or
+       (Get-Sha256 $RetiredReceipt) -cne $OldReceiptDigest -or
+       -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf) -or
+       (Get-Sha256 $ReceiptPath) -cne $NewReceiptDigest)) {
+    throw "Published receipt retirement state changed before commit."
+  }
+  if ($OldPresent -and $OldWasRunning) {
+    $RestartedAfterRetirement = Invoke-Lifecycle $Destination "start"
+    if ($RestartedAfterRetirement["state"] -cne "running") {
+      throw "The upgraded sana-mcp daemon did not restart after runtime retirement."
+    }
+  }
+
   if ($IncompatibleResetPrepared) {
     $PreviousResetAuthority = $env:SANA_MCP_INCOMPATIBLE_RESET
     try {
@@ -1560,8 +2239,6 @@ try {
           $ResetCommit["quarantinePresent"] -cne "false") {
         throw "reset cleanup returned an invalid committed response"
       }
-      $Committed = $true
-      $TransactionActive = $false
     } finally {
       if ($null -eq $PreviousResetAuthority) {
         Remove-Item Env:SANA_MCP_INCOMPATIBLE_RESET -ErrorAction SilentlyContinue
@@ -1570,20 +2247,78 @@ try {
       }
     }
     $IncompatibleResetPrepared = $false
-    try {
-      Remove-ResolvedIncompatibleRecovery $IncompatibleResetJournal
-    } catch {
-      [Console]::Error.WriteLine(
-        "sana-mcp: installation succeeded, but committed recovery cleanup remains pending: $($_.Exception.Message)"
-      )
-      [Console]::Error.WriteLine(
-        "sana-mcp: reset recovery journal: $IncompatibleResetJournal"
-      )
-    }
   }
 
   $Committed = $true
   $TransactionActive = $false
+  if ($null -ne $RetiredBinary) {
+    try {
+      Stop-CanonicalRuntimeProcesses $RetiredBinary
+      Assert-NotReparse $RetiredBinary "Retired runtime"
+      if (-not (Test-Path -LiteralPath $RetiredBinary -PathType Leaf) -or
+          (Get-Sha256 $RetiredBinary) -cne $OldBinaryDigest) {
+        throw "retired runtime changed before post-commit deletion"
+      }
+      $RetiredBinarySafeToDelete = $true
+      Remove-Item -LiteralPath $RetiredBinary -Force
+      $RetiredBinary = $null
+    } catch {
+      [Console]::Error.WriteLine(
+        "sana-mcp: installation succeeded; deferred retired runtime cleanup remains at $RetiredBinary"
+      )
+    }
+  }
+  if ($null -ne $RetiredReceipt) {
+    try {
+      Assert-NotReparse $RetiredReceipt "Retired receipt"
+      if (-not (Test-Path -LiteralPath $RetiredReceipt -PathType Leaf) -or
+          (Get-Sha256 $RetiredReceipt) -cne $OldReceiptDigest) {
+        throw "retired receipt changed before post-commit deletion"
+      }
+      $RetiredReceiptSafeToDelete = $true
+      Remove-Item -LiteralPath $RetiredReceipt -Force
+      $RetiredReceipt = $null
+    } catch {
+      [Console]::Error.WriteLine(
+        "sana-mcp: installation succeeded; deferred retired receipt cleanup remains at $RetiredReceipt"
+      )
+    }
+  }
+  if ($IncompatibleStateReset) {
+    $RetiredBinaryRemains =
+      -not [string]::IsNullOrEmpty($RetiredBinary) -and
+      (Test-Path -LiteralPath $RetiredBinary -PathType Leaf)
+    $RetiredReceiptRemains =
+      -not [string]::IsNullOrEmpty($RetiredReceipt) -and
+      (Test-Path -LiteralPath $RetiredReceipt -PathType Leaf)
+    if (-not $RetiredBinaryRemains -and
+        -not $RetiredReceiptRemains) {
+      try {
+        Remove-ResolvedIncompatibleRecovery $IncompatibleResetJournal
+      } catch {
+        [Console]::Error.WriteLine(
+          "sana-mcp: installation succeeded, but committed recovery cleanup remains pending: $($_.Exception.Message)"
+        )
+        [Console]::Error.WriteLine(
+          "sana-mcp: deferred recovery path: $IncompatibleResetJournal"
+        )
+      }
+    } else {
+      if ($RetiredBinaryRemains) {
+        [Console]::Error.WriteLine(
+          "sana-mcp: deferred retired runtime cleanup remains at $RetiredBinary"
+        )
+      }
+      if ($RetiredReceiptRemains) {
+        [Console]::Error.WriteLine(
+          "sana-mcp: deferred retired receipt cleanup remains at $RetiredReceipt"
+        )
+      }
+      [Console]::Error.WriteLine(
+        "sana-mcp: deferred recovery path: $IncompatibleResetJournal"
+      )
+    }
+  }
   Write-Host "Installed $Destination"
   if (-not $NewPathManaged -and $MatchingEntries.Count -eq 0) {
     Write-Host "Add $InstallDir to PATH to run sana-mcp from new shells."
@@ -1659,40 +2394,40 @@ try {
       }
     }
     if ($CanRestoreFiles) {
+      $BinaryRestored = $false
+      $ReceiptRestored = $false
       try {
-        if ($OldPresent) {
-          if ($null -eq $OldBinaryBackup -or -not (Test-Path -LiteralPath $OldBinaryBackup -PathType Leaf)) {
-            throw "previous binary backup is unavailable"
-          }
-          $StagedBinary = Join-Path $InstallDir (".sana-mcp-rollback-" + [Guid]::NewGuid().ToString("N") + ".exe")
-          Copy-Item -LiteralPath $OldBinaryBackup -Destination $StagedBinary
-          Move-Item -LiteralPath $StagedBinary -Destination $Destination -Force
-          $StagedBinary = $null
-          if ($LegacyInstall) {
-            if (Test-Path -LiteralPath $ReceiptPath) {
-              Remove-Item -LiteralPath $ReceiptPath -Force
-            }
-          } else {
-            if ($null -eq $OldReceiptBackup -or -not (Test-Path -LiteralPath $OldReceiptBackup -PathType Leaf)) {
-              throw "previous receipt backup is unavailable"
-            }
-            $StagedReceipt = Join-Path $InstallDir (".sana-mcp-receipt-rollback-" + [Guid]::NewGuid().ToString("N"))
-            Copy-Item -LiteralPath $OldReceiptBackup -Destination $StagedReceipt
-            Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force
-            $StagedReceipt = $null
-          }
-        } else {
-          if ($null -ne $Destination -and (Test-Path -LiteralPath $Destination)) {
-            Remove-Item -LiteralPath $Destination -Force
-          }
-          if ($null -ne $ReceiptPath -and (Test-Path -LiteralPath $ReceiptPath)) {
-            Remove-Item -LiteralPath $ReceiptPath -Force
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+          $RollbackBinaryDigest = Get-Sha256 $Destination
+          if ($RollbackBinaryDigest -ceq $Release["sha256"] -and
+              $RollbackBinaryDigest -cne $OldBinaryDigest) {
+            Stop-CanonicalRuntimeProcesses $Destination
           }
         }
-        $FilesRestored = $true
+        Restore-InstallerFileState `
+          $Destination `
+          $OldBinaryBackup `
+          $OldBinaryDigest `
+          $Release["sha256"] `
+          "installed binary"
+        $BinaryRestored = $true
+        $RetiredBinarySafeToDelete = $true
       } catch {
-        $RollbackErrors += "could not restore installed files: $($_.Exception.Message)"
+        $RollbackErrors += "could not restore installed binary: $($_.Exception.Message)"
       }
+      try {
+        Restore-InstallerFileState `
+          $ReceiptPath `
+          $OldReceiptBackup `
+          $OldReceiptDigest `
+          $NewReceiptDigest `
+          "installer receipt"
+        $ReceiptRestored = $true
+        $RetiredReceiptSafeToDelete = $true
+      } catch {
+        $RollbackErrors += "could not restore installer receipt: $($_.Exception.Message)"
+      }
+      $FilesRestored = $BinaryRestored -and $ReceiptRestored
     }
     if ($CanRestoreFiles -and $PathChanged) {
       try {
@@ -1757,7 +2492,59 @@ try {
   }
   $InstallFailure = "sana-mcp: $InstallError"
 } finally {
-  $CleanupErrors = @(
+  foreach ($RetiredArtifact in @(
+      @{
+        path = $RetiredBinary
+        safe = $RetiredBinarySafeToDelete
+        kind = "runtime"
+        expectedSha256 = $OldBinaryDigest
+        executable = $true
+      },
+      @{
+        path = $RetiredReceipt
+        safe = $RetiredReceiptSafeToDelete
+        kind = "receipt"
+        expectedSha256 = $OldReceiptDigest
+        executable = $false
+      }
+    )) {
+    try {
+      if (-not [string]::IsNullOrEmpty($RetiredArtifact.path) -and
+          (Test-Path -LiteralPath $RetiredArtifact.path)) {
+        if ($RetiredArtifact.safe) {
+          if ($RetiredArtifact.executable) {
+            Stop-CanonicalRuntimeProcesses $RetiredArtifact.path
+          }
+          Assert-NotReparse `
+            $RetiredArtifact.path `
+            "Retired $($RetiredArtifact.kind)"
+          if (-not (Test-Path `
+                -LiteralPath $RetiredArtifact.path `
+                -PathType Leaf) -or
+              (Get-Sha256 $RetiredArtifact.path) -cne
+                $RetiredArtifact.expectedSha256) {
+            throw "retired $($RetiredArtifact.kind) changed before final deletion"
+          }
+          Remove-Item -LiteralPath $RetiredArtifact.path -Force
+        } else {
+          $PreserveTemp = $true
+          [Console]::Error.WriteLine(
+            "sana-mcp: retained authoritative retired file at $($RetiredArtifact.path)"
+          )
+        }
+      }
+    } catch {
+      if ($Committed) {
+        [Console]::Error.WriteLine(
+          "sana-mcp: deferred retired-file cleanup remains at $($RetiredArtifact.path): $($_.Exception.Message)"
+        )
+      } else {
+        $CleanupErrors +=
+          "could not remove safe retired installer artifact $($RetiredArtifact.path): $($_.Exception.Message)"
+      }
+    }
+  }
+  $CleanupErrors += @(
     Invoke-InstallerCleanup `
       $StagedBinary `
       $StagedReceipt `
