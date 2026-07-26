@@ -1847,6 +1847,8 @@ the required independent review rounds complete.
 | `/root/v045_absolute_zero` | normal post-commit/finally cleanup also relied on stale safe-to-delete state | every tracked retired runtime/receipt removal now immediately revalidates its type, reparse state, and authoritative digest after quiescence | correction required fresh adversarial review |
 | `/root/v045_done_review` | rollback helper cleanup still removed retired/replacement artifacts without the shared immediate revalidation and used an untracked `-remove-` name | both rollback branches now use standard retired names, quiesce executables, and immediately revalidate non-reparse leaf state plus authoritative digest before deletion | correction required fresh adversarial review |
 | `/root/v045_really_done` | none | n/a | CLEAN - zero findings |
+| `/root/v045_ci_path_review` | the Windows release-gate fixture used a non-canonical runner temp path, then the canonical-root correction populated real LocalApplicationData before entering guaranteed cleanup | selected the authoritative Windows LocalApplicationData known folder and moved every fixture-root mutation under the harness `try/finally` | correction required fresh review |
+| `/root/v045_ci_path_zero` | none | n/a | CLEAN - zero findings |
 
 Final validation evidence:
 
@@ -1858,3 +1860,5 @@ Final validation evidence:
   absent;
 - `bun run typecheck`, Windows PowerShell AST parsing, `sh -n install.sh`, and
   `git diff --check`: passed after the final production correction.
+- the canonical Windows runner-root correction passed `bun run typecheck` and
+  `git diff --check`; its fresh read-only review returned zero findings.

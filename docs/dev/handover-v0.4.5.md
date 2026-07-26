@@ -30,9 +30,9 @@ then launches the public configurer without opening separate test windows.
 - The old lifecycle protocol could also report stopped after clearing its
   database lease but before the daemon OS process had exited.
 
-## Current working-tree implementation
+## Implemented v0.4.5 scope
 
-The uncommitted v0.4.5 scope changes:
+The v0.4.5 scope changes:
 
 - `install.ps1`
   - verifies installer ownership, receipt, digest, target, and embedded identity
@@ -115,15 +115,22 @@ immediately before deletion, both in interrupted recovery and normal
 post-commit/finally cleanup. Rollback uses the same standard retired naming and
 revalidation, so a failed cleanup remains discoverable by recovery.
 
+The first GitHub release run built every platform but correctly stopped before
+publication when the Windows release gate supplied `$env:TEMP` as an installer
+destination and the installer rejected that non-canonical runner path. The gate
+now derives its isolated root from the authoritative Windows
+`LocalApplicationData` known folder. Every mutation under that real root is
+inside the test harness's guaranteed `try/finally`; a fresh independent review
+returned zero findings. This test-only correction passed typecheck and diff
+validation.
+
 ## Required completion sequence
 
-1. Obtain one fresh read-only zero-finding logic review of the final diff.
-2. Run one adversarial cross-cutting logic review; correct only concrete
-   findings.
-3. Commit, push `main`, wait for the automatic v0.4.5 release, and verify the
+1. Commit and push the canonical Windows gate correction to `main`.
+2. Wait for the automatic v0.4.5 release, and verify the
    published `install.ps1` SHA-256 matches the committed file.
-4. Test the published latest-download installer once in a hidden isolated
-   Windows profile before giving the user the production command.
+3. Give the user the production command only after the Windows gate and release
+   publication succeed.
 
 ## Safety constraints
 
