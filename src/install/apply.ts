@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { ClientDef } from "./clients.js";
 import type { ServerTarget } from "./server-target.js";
 import { validateServerName } from "./config-formats.js";
@@ -48,6 +49,18 @@ export type ApplyResult =
 
 export interface ApplyOptions {
   dryRun?: boolean;
+}
+
+export interface ClientChangeRequest {
+  client: ClientDef;
+  serverName: string;
+  target: ServerTarget;
+  desired: DesiredRegistration;
+}
+
+export interface ConfigPathIdentityOptions {
+  platform?: NodeJS.Platform;
+  cwd?: string;
 }
 
 export { validateServerName } from "./config-formats.js";
@@ -123,6 +136,7 @@ export async function planClientChange(
     target,
     operation: common.operation,
     build: install.build,
+    predecessors: install.predecessors,
   });
   const fileCommon = {
     ...common,
@@ -181,4 +195,108 @@ export async function applyClientChange(
     };
   if (result.state === "noop") return { ...common, state: "noop" };
   return { ...common, state: result.state, reason: result.reason };
+}
+
+/**
+ * Produce the deterministic identity used to reject aliases within one direct
+ * config batch. This is lexical by design: config publication performs the
+ * authoritative filesystem boundary checks.
+ */
+export function configPathIdentity(
+  file: string,
+  options: ConfigPathIdentityOptions = {},
+): string {
+  const platform = options.platform ?? process.platform;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const cwd = options.cwd ?? process.cwd();
+  const identity = pathApi.normalize(pathApi.resolve(cwd, file));
+  return platform === "win32" ? identity.toLowerCase() : identity;
+}
+
+function duplicatePathFailure(
+  change: ClientChange,
+  reason: string,
+): ClientChange {
+  const common = {
+    clientId: change.clientId,
+    clientName: change.clientName,
+    serverName: change.serverName,
+    desired: change.desired,
+    operation: change.operation,
+  };
+  return change.pathState === "known"
+    ? {
+        ...common,
+        pathState: "known",
+        file: change.file,
+        state: "unavailable",
+        reason,
+      }
+    : {
+        ...common,
+        pathState: "unavailable",
+        pathUnavailableReason: change.pathUnavailableReason,
+        state: "unavailable",
+        reason,
+      };
+}
+
+/**
+ * Plan every requested direct client change before any caller can apply one.
+ * The installer-only journaled transaction keeps its separate protocol.
+ */
+export async function planClientChanges(
+  requests: readonly ClientChangeRequest[],
+  identityOptions: ConfigPathIdentityOptions = {},
+): Promise<readonly ClientChange[]> {
+  const changes = await Promise.all(
+    requests.map(({ client, serverName, target, desired }) =>
+      planClientChange(client, serverName, target, desired)
+    ),
+  );
+  const indicesByIdentity = new Map<string, number[]>();
+  for (const [index, change] of changes.entries()) {
+    if (change.pathState !== "known") continue;
+    let identity: string;
+    try {
+      identity = configPathIdentity(change.file, identityOptions);
+    } catch (error) {
+      changes[index] = duplicatePathFailure(
+        change,
+        `client config path identity could not be determined: ${errorText(error)}`,
+      );
+      continue;
+    }
+    const indices = indicesByIdentity.get(identity);
+    if (indices) indices.push(index);
+    else indicesByIdentity.set(identity, [index]);
+  }
+  for (const indices of indicesByIdentity.values()) {
+    if (indices.length < 2) continue;
+    const clients = indices.map((index) => changes[index]!.clientName);
+    const reason = `multiple selected clients resolve to the same config path: ${clients.join(", ")}`;
+    for (const index of indices)
+      changes[index] = duplicatePathFailure(changes[index]!, reason);
+  }
+  return changes;
+}
+
+/**
+ * Apply a fully planned direct batch in request order. A known planning
+ * failure keeps the whole batch read-only. Apply-time races remain observable
+ * per client and may leave an earlier change applied; this is not a transaction.
+ */
+export async function applyPlannedClientChanges(
+  changes: readonly ClientChange[],
+  options: ApplyOptions = {},
+): Promise<readonly ApplyResult[]> {
+  const planningBlocked = changes.some(
+    (change) =>
+      change.state === "collision" || change.state === "unavailable",
+  );
+  const dryRun = options.dryRun === true || planningBlocked;
+  const results: ApplyResult[] = [];
+  for (const change of changes)
+    results.push(await applyClientChange(change, { dryRun }));
+  return results;
 }

@@ -40,7 +40,11 @@ mock.module("../../src/semantic/semantic.js", () => ({
   SemanticUnavailableError: TestSemanticUnavailableError,
 }));
 
-const { finalizeDaemonResources, syncOnce } = await import(
+const {
+  daemonSessionPreflight,
+  finalizeDaemonResources,
+  syncOnce,
+} = await import(
   "../../src/sync/daemon.js"
 );
 const {
@@ -411,6 +415,44 @@ test("daemon finalization preserves execution and cleanup errors", () => {
     clearError,
     closeError,
   ]);
+});
+
+test("daemon waits on a pending challenge without authentication or expiry effects", async () => {
+  let waitCalls = 0;
+  let needsLoginCalls = 0;
+  let authNetworkCalls = 0;
+  const result = await daemonSessionPreflight(
+    {
+      markNeedsLoginIfCurrent: () => {
+        needsLoginCalls++;
+        return "marked";
+      },
+    },
+    {
+      pendingSignInChallenge: () => ({
+        email: "person@example.test",
+      }),
+      hasAuthCookie: () => true,
+      sessionVersion: () => ({
+        generation: 1,
+        publicationToken:
+          "11111111-1111-4111-8111-111111111111",
+        userId: null,
+        workspaceId: null,
+      }),
+      me: async () => {
+        authNetworkCalls++;
+      },
+    },
+    async () => {
+      waitCalls++;
+    },
+  );
+
+  expect(result).toBe("wait");
+  expect(waitCalls).toBe(1);
+  expect(needsLoginCalls).toBe(0);
+  expect(authNetworkCalls).toBe(0);
 });
 
 test("SQLite lease preserves stale live owners and replaces proven dead owners", {

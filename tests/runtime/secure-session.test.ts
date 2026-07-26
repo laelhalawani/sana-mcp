@@ -67,6 +67,76 @@ describe("secure session persistence integration", () => {
     }
   });
 
+  test("accepted request-code session is durable but not authenticated-ready", {
+    timeout: 20_000,
+  }, () => {
+    const root = isolatedRoot();
+    const child = runIsolated(
+      root,
+      `
+        const { requestCode } = await import("./src/sana/auth.ts");
+        const { SanaClient } = await import("./src/sana/client.ts");
+        const { SanaStore } = await import("./src/store/db.ts");
+        const { inspectStableConfigurerAuthState } = await import(
+          "./src/install/install.ts"
+        );
+        let call = 0;
+        globalThis.fetch = async () => {
+          call++;
+          return call === 1
+            ? new Response(
+                JSON.stringify({ csrfToken: "csrf-authoritative" }),
+                {
+                  status: 200,
+                  headers: {
+                    "content-type": "application/json",
+                    "set-cookie":
+                      "sana-ai-session=request-session; Path=/; HttpOnly",
+                  },
+                },
+              )
+            : new Response(
+                JSON.stringify({
+                  result: { data: { accepted: true } },
+                }),
+                {
+                  status: 200,
+                  headers: { "content-type": "application/json" },
+                },
+              );
+        };
+        await requestCode(
+          new SanaClient(),
+          "person@example.test",
+        );
+        const store = new SanaStore();
+        try {
+          const inspected = inspectStableConfigurerAuthState(
+            store,
+            () => SanaClient.load(),
+          );
+          const saved = SanaClient.load();
+          const version = saved.sessionVersion();
+          if (
+            call !== 2 ||
+            !saved.hasAuthCookie() ||
+            version.generation !== 1 ||
+            version.userId !== null ||
+            version.workspaceId !== null ||
+            inspected.state.kind === "ready"
+          ) {
+            throw new Error(
+              "pending request-code session was exposed as authenticated-ready",
+            );
+          }
+        } finally {
+          store.close();
+        }
+      `,
+    );
+    expect(child.status, child.stderr).toBe(0);
+  });
+
   test("preserves and copies a corrupt session while failing visibly", {
     timeout: 20_000,
   }, () => {

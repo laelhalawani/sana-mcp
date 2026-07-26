@@ -27,6 +27,7 @@ import {
   SanaClient,
 } from "../sana/client.js";
 import {
+  CacheOperationChangedError,
   SanaStore,
   type CacheOperationGuard,
 } from "../store/db.js";
@@ -75,6 +76,9 @@ export class LocalAppRuntime implements AppRuntime {
   }
 
   private captureGuard(): CacheOperationGuard {
+    if (this.client.pendingSignInChallenge() !== null) {
+      throw new CacheOperationChangedError();
+    }
     const version = this.client.sessionVersion();
     if (
       version.publicationToken === null ||

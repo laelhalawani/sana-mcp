@@ -4,6 +4,7 @@ import {
   inspectAndRenderConfig,
   isOwnedConfigEntry,
 } from "../../src/install/config-formats.js";
+import { claudeCodePredecessorEntry } from "../../src/install/clients.js";
 
 const target = {
   command: "/opt/sana mcp",
@@ -31,6 +32,57 @@ test("full-entry ownership rejects unknown fields", () => {
     ),
     false
   );
+});
+
+test("client-scoped predecessor ownership is exact and remains a register no-op", () => {
+  const predecessor = {
+    type: "stdio",
+    command: target.command,
+    args: target.args,
+    env: target.env,
+  };
+  assert.equal(
+    isOwnedConfigEntry(
+      predecessor,
+      target,
+      undefined,
+      [claudeCodePredecessorEntry],
+    ),
+    true,
+  );
+  for (const nearMiss of [
+    { ...predecessor, type: "sse" },
+    { ...predecessor, args: [] },
+    { ...predecessor, extra: true },
+    { type: "stdio", command: target.command, args: target.args },
+  ]) {
+    assert.equal(
+      isOwnedConfigEntry(
+        nearMiss,
+        target,
+        undefined,
+        [claudeCodePredecessorEntry],
+      ),
+      false,
+    );
+  }
+
+  const raw = JSON.stringify({
+    mcpServers: { "sana-mcp": predecessor },
+  });
+  const result = inspectAndRenderConfig(
+    {
+      format: "json",
+      topKey: "mcpServers",
+      name: "sana-mcp",
+      target,
+      operation: "register",
+      predecessors: [claudeCodePredecessorEntry],
+    },
+    raw,
+  );
+  assert.equal(result.ownership.state, "owned");
+  assert.equal(result.after, undefined);
 });
 
 test("JSONC preserves comments, foreign keys, CRLF, and final newline count", () => {
