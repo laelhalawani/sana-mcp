@@ -348,7 +348,10 @@ export function publishConfigAtomic(
       };
     }
     if (!verification.ok) {
-      const durabilityWarning = operations.flushParent(parent);
+      const durabilityWarning =
+        operations.platform === "win32"
+          ? undefined
+          : operations.flushParent(parent);
       return {
         state: "ambiguous",
         reason: `sana-mcp published ${absolute}, but ownership could not be verified: ${
@@ -359,7 +362,10 @@ export function publishConfigAtomic(
       };
     }
 
-    const warning = operations.flushParent(parent);
+    const warning =
+      operations.platform === "win32"
+        ? undefined
+        : operations.flushParent(parent);
     return warning
       ? { state: "published", durability: "uncertain", warning }
       : { state: "published", durability: "verified" };
@@ -447,7 +453,10 @@ export function removeConfigAtomic(
         reason:
           "client config was removed, but another file appeared before verification",
       };
-    const warning = operations.flushParent(parent);
+    const warning =
+      operations.platform === "win32"
+        ? undefined
+        : operations.flushParent(parent);
     return warning
       ? { state: "removed", durability: "uncertain", warning }
       : { state: "removed", durability: "verified" };

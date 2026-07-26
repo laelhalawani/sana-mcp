@@ -36,6 +36,7 @@ export interface PlanFileChangeOptions {
   target: ServerTarget;
   operation: ConfigOperation;
   build?: EntryBuilder;
+  predecessors?: readonly EntryBuilder[];
 }
 
 export type FileChangePlan =
@@ -104,6 +105,9 @@ function formatOptions(options: PlanFileChangeOptions): FormatChangeOptions {
     target: options.target,
     operation: options.operation,
     ...(options.build ? { build: options.build } : {}),
+    ...(options.predecessors
+      ? { predecessors: options.predecessors }
+      : {}),
   };
 }
 
