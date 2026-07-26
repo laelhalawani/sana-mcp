@@ -1489,7 +1489,7 @@ test("PowerShell receiptless recognition accepts only published legacy digests",
   }
 });
 
-test("PowerShell legacy daemon handling targets only the exact executable and daemon mode", async () => {
+test("PowerShell retires an active exact-path runtime, publishes safely, and makes old-state rollback idempotent", { timeout: 30_000 }, async () => {
   const command =
     process.platform === "win32"
       ? "powershell.exe"
@@ -1503,11 +1503,23 @@ test("PowerShell legacy daemon handling targets only the exact executable and da
   if (command.length === 0) return;
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
-  const functionStart = installer.indexOf("function Get-LegacyDaemonProcesses");
-  const functionEnd = installer.indexOf("\nfunction Assert-NotReparse");
-  assert.notEqual(functionStart, -1);
-  assert.notEqual(functionEnd, -1);
-  const daemonFunctions = installer.slice(functionStart, functionEnd);
+  const fileFunctionStart = installer.indexOf("function Get-Sha256");
+  const fileFunctionEnd = installer.indexOf(
+    "\nfunction Get-VerifiedLegacyReleaseDigest",
+  );
+  const processFunctionStart = installer.indexOf(
+    "function Get-CanonicalRuntimeProcesses",
+  );
+  const processFunctionEnd = installer.indexOf("\nfunction Assert-NotReparse");
+  assert.notEqual(fileFunctionStart, -1);
+  assert.notEqual(fileFunctionEnd, -1);
+  assert.notEqual(processFunctionStart, -1);
+  assert.notEqual(processFunctionEnd, -1);
+  const fileFunctions = installer.slice(fileFunctionStart, fileFunctionEnd);
+  const processFunctions = installer.slice(
+    processFunctionStart,
+    processFunctionEnd,
+  );
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-daemon-"));
   try {
     const harnessPath = path.join(temporary, "daemon.ps1");
@@ -1526,39 +1538,60 @@ test("PowerShell legacy daemon handling targets only the exact executable and da
       harnessPath,
       [
         '$ErrorActionPreference = "Stop"',
-        daemonFunctions,
-        '$script:Mode = "daemon"',
-        '$script:Target = "C:\\Tools\\sana-mcp.exe"',
-        "function Get-CimInstance {",
-        "  param([string] $ClassName, [string] $Filter)",
-        '  if ($script:Mode -eq "stopped") { return @() }',
-        `  $Command = if ($script:Mode -eq "other") { '"C:\\Tools\\sana-mcp.exe" status' } else { '"C:\\Tools\\sana-mcp.exe" daemon' }`,
-        "  return @(",
-        `    [pscustomobject]@{ ExecutablePath = "C:\\Other\\sana-mcp.exe"; CommandLine = '"C:\\Other\\sana-mcp.exe" daemon'; ProcessId = 8 },`,
-        '    [pscustomobject]@{ ExecutablePath = $script:Target; CommandLine = $Command; ProcessId = 9 }',
-        "  )",
+        fileFunctions,
+        processFunctions,
+        '$Root = Join-Path $env:TEMP ("sana-installer-native-" + [Guid]::NewGuid().ToString("N"))',
+        '$Install = Join-Path $Root "installed"',
+        '$Other = Join-Path $Root "other"',
+        '[IO.Directory]::CreateDirectory($Install) | Out-Null',
+        '[IO.Directory]::CreateDirectory($Other) | Out-Null',
+        '$Target = Join-Path $Install "sana-mcp.exe"',
+        '$OtherTarget = Join-Path $Other "sana-mcp.exe"',
+        '$Previous = Join-Path $Root "previous-sana-mcp.exe"',
+        '$Stage = Join-Path $Install ".sana-mcp-stage.exe"',
+        '$TargetProcess = $null',
+        '$OtherProcess = $null',
+        '$PublishedProcess = $null',
+        '$RetiredProcess = $null',
+        "try {",
+        '  Copy-Item -LiteralPath (Join-Path $PSHOME "powershell.exe") -Destination $Target',
+        '  Copy-Item -LiteralPath $Target -Destination $OtherTarget',
+        '  Copy-Item -LiteralPath $Target -Destination $Previous',
+        '  $OldHash = Get-Sha256 $Target',
+        '  Copy-Item -LiteralPath (Join-Path $env:SystemRoot "System32\\cmd.exe") -Destination $Stage',
+        '  $NewHash = Get-Sha256 $Stage',
+        "  $TargetProcess = Start-Process -FilePath $Target -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru",
+        "  $OtherProcess = Start-Process -FilePath $OtherTarget -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru",
+        '  $Deadline = [DateTime]::UtcNow.AddSeconds(5)',
+        '  while (@(Get-CanonicalRuntimeProcesses $Target).Count -eq 0) {',
+        '    if ([DateTime]::UtcNow -ge $Deadline) { throw "target process was not observable" }',
+        '    Start-Sleep -Milliseconds 50',
+        "  }",
+        "  Stop-CanonicalRuntimeProcesses $Target",
+        '  if (-not $TargetProcess.WaitForExit(3000)) { throw "exact-path process survived" }',
+        '  if ($OtherProcess.HasExited) { throw "same-name other-path process was terminated" }',
+        '  $Retired = $null',
+        '  Publish-InstallerFile $Stage $Target $NewHash $OldHash ([ref] $Retired)',
+        '  if ((Get-Sha256 $Target) -cne $NewHash) { throw "replacement was not published" }',
+        "  $PublishedProcess = Start-Process -FilePath $Target -ArgumentList @('/c','ping -n 30 127.0.0.1 > nul') -WindowStyle Hidden -PassThru",
+        "  $RetiredProcess = Start-Process -FilePath $Retired -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru",
+        '  Stop-CanonicalRuntimeProcesses $Target',
+        '  Stop-CanonicalRuntimeProcesses $Retired',
+        '  if (-not $PublishedProcess.WaitForExit(3000) -or -not $RetiredProcess.WaitForExit(3000)) { throw "publication cleanup did not quiesce both paths" }',
+        '  Remove-Item -LiteralPath $Retired -Force',
+        '  Restore-InstallerFileState $Target $Previous $OldHash $NewHash "installed binary"',
+        '  if ((Get-Sha256 $Target) -cne $OldHash) { throw "old runtime was not restored" }',
+        '  $Before = (Get-Item -LiteralPath $Target).LastWriteTimeUtc.Ticks',
+        '  Restore-InstallerFileState $Target $Previous $OldHash $NewHash "installed binary"',
+        '  $After = (Get-Item -LiteralPath $Target).LastWriteTimeUtc.Ticks',
+        '  if ($After -ne $Before) { throw "already-old rollback was not a no-op" }',
+        "} finally {",
+        '  foreach ($ProcessToClean in @($TargetProcess, $OtherProcess, $PublishedProcess, $RetiredProcess)) {',
+        '    if ($null -eq $ProcessToClean) { continue }',
+        '    try { if (-not $ProcessToClean.HasExited) { $ProcessToClean.Kill() }; $ProcessToClean.WaitForExit(3000) | Out-Null } catch { }',
+        "  }",
+        '  if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue }',
         "}",
-        "function Invoke-CimMethod {",
-        "  param([object] $InputObject, [string] $MethodName)",
-        '  if ($InputObject.ProcessId -ne 9 -or $MethodName -cne "Terminate") { throw "wrong process was terminated" }',
-        '  $script:Mode = "stopped"',
-        "  return [pscustomobject]@{ ReturnValue = 0 }",
-        "}",
-        "function Start-Process {",
-        "  param([string] $FilePath, [object[]] $ArgumentList, [object] $WindowStyle)",
-        '  if ($FilePath -cne $script:Target -or $ArgumentList[0] -cne "daemon") { throw "legacy restart target changed" }',
-        '  $script:Mode = "daemon"',
-        "}",
-        '$Found = @(Get-LegacyDaemonProcesses $script:Target)',
-        'if ($Found.Count -ne 1 -or $Found[0].ProcessId -ne 9) { throw "exact daemon classification failed" }',
-        "Stop-LegacyDaemon $script:Target",
-        'if ($script:Mode -cne "stopped") { throw "exact daemon was not stopped" }',
-        "Start-LegacyDaemon $script:Target",
-        'if ($script:Mode -cne "daemon") { throw "legacy daemon was not restarted" }',
-        '$script:Mode = "other"',
-        "$Rejected = $false",
-        "try { Get-LegacyDaemonProcesses $script:Target | Out-Null } catch { $Rejected = $true }",
-        'if (-not $Rejected) { throw "exact non-daemon process was accepted" }',
         "",
       ].join("\n"),
     );
@@ -1573,8 +1606,331 @@ test("PowerShell legacy daemon handling targets only the exact executable and da
   }
 });
 
+test("Windows full installer replaces an active receipt-backed v0.4.4 mcp runtime", { timeout: 180_000 }, async () => {
+  const configuredCurrentBinary =
+    process.env.SANA_MCP_TEST_CURRENT_WINDOWS_BINARY;
+  const sourceCommit = process.env.SANA_MCP_TEST_SOURCE_COMMIT;
+  if (!configuredCurrentBinary || !sourceCommit) return;
+  assert.match(sourceCommit, /^[a-f0-9]{40}$/);
+
+  const powershell =
+    process.platform === "win32"
+      ? "powershell.exe"
+      : (
+          spawnSync(
+            "/bin/sh",
+            ["-c", "command -v powershell.exe"],
+            { encoding: "utf8" },
+          ).stdout.trim()
+        );
+  assert.notEqual(powershell, "");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-windows-e2e-"));
+  const fixture = path.join(temporary, "fixture");
+  await mkdir(fixture);
+  const download = async (name: string): Promise<string> => {
+    const response = await fetch(
+      `https://github.com/Lumen-AiApp/sana-ai-mcp/releases/download/v0.4.4/${name}`,
+    );
+    assert.equal(response.ok, true, `could not download official v0.4.4 ${name}`);
+    const destination = path.join(fixture, name);
+    await writeFile(destination, Buffer.from(await response.arrayBuffer()));
+    return destination;
+  };
+  const oldManifestPath = await download("manifest.json");
+  const oldManifestChecksumPath = await download("manifest.json.sha256");
+  const oldBinaryPath = await download("sana-mcp-windows-x64.exe");
+  const oldBinaryChecksumPath = await download(
+    "sana-mcp-windows-x64.exe.sha256",
+  );
+  const oldManifestBytes = await readFile(oldManifestPath);
+  const oldManifestHash = sha256(oldManifestBytes);
+  assert.equal(
+    (await readFile(oldManifestChecksumPath, "utf8")).trim(),
+    `${oldManifestHash}  manifest.json`,
+  );
+  const oldManifest = JSON.parse(oldManifestBytes.toString("utf8")) as {
+    packageVersion: string;
+    sourceCommit: string;
+    installerProtocol: number;
+    lifecycleProtocol: number;
+    inspectProtocol: number;
+    stateCompatibility: number;
+    semanticCapability: string;
+    assets: Array<{
+      target: string;
+      assetName: string;
+      checksumFileName: string;
+      sha256: string;
+    }>;
+  };
+  assert.equal(oldManifest.packageVersion, "0.4.4");
+  const oldAsset = oldManifest.assets.find(
+    (asset) => asset.target === "bun-windows-x64",
+  );
+  assert.ok(oldAsset);
+  const oldBinaryHash = sha256(await readFile(oldBinaryPath));
+  assert.equal(oldBinaryHash, oldAsset.sha256);
+  assert.equal(
+    (await readFile(oldBinaryChecksumPath, "utf8")).trim(),
+    `${oldBinaryHash}  sana-mcp-windows-x64.exe`,
+  );
+  await writeFile(
+    path.join(fixture, "v0.4.4-sana-mcp-windows-x64.exe"),
+    await readFile(oldBinaryPath),
+  );
+
+  let currentBinaryPath = path.resolve(configuredCurrentBinary);
+  if (process.platform === "linux") {
+    const converted = spawnSync("wslpath", ["-u", configuredCurrentBinary], {
+      encoding: "utf8",
+    });
+    if (converted.status === 0) currentBinaryPath = converted.stdout.trim();
+  }
+  const currentInspect = spawnSync(
+    currentBinaryPath,
+    ["__inspect", "--format", "json"],
+    { encoding: "utf8" },
+  );
+  assert.equal(currentInspect.status, 0, currentInspect.stderr);
+  const currentIdentity = JSON.parse(currentInspect.stdout) as {
+    version: string;
+    target: string;
+    installerProtocol: number;
+    lifecycleProtocol: number;
+    inspectProtocol: number;
+    stateCompatibility: number;
+    semanticCapability: string;
+  };
+  assert.equal(currentIdentity.version, "0.4.5");
+  assert.equal(currentIdentity.target, "bun-windows-x64");
+  const currentBinaryHash = sha256(await readFile(currentBinaryPath));
+  await writeFile(
+    path.join(fixture, "sana-mcp-windows-x64.exe"),
+    await readFile(currentBinaryPath),
+  );
+  await writeFile(
+    path.join(fixture, "sana-mcp-windows-x64.exe.sha256"),
+    `${currentBinaryHash}  sana-mcp-windows-x64.exe\n`,
+  );
+  const currentManifest = {
+    manifestVersion: 1,
+    packageVersion: currentIdentity.version,
+    releaseTag: `v${currentIdentity.version}`,
+    sourceCommit,
+    installerProtocol: currentIdentity.installerProtocol,
+    lifecycleProtocol: currentIdentity.lifecycleProtocol,
+    inspectProtocol: currentIdentity.inspectProtocol,
+    stateCompatibility: currentIdentity.stateCompatibility,
+    semanticCapability: currentIdentity.semanticCapability,
+    assets: [
+      {
+        target: currentIdentity.target,
+        assetName: "sana-mcp-windows-x64.exe",
+        checksumFileName: "sana-mcp-windows-x64.exe.sha256",
+        sha256: currentBinaryHash,
+      },
+    ],
+  };
+  const currentManifestText = `${JSON.stringify(currentManifest, null, 2)}\n`;
+  const currentManifestHash = sha256(currentManifestText);
+  await writeFile(path.join(fixture, "manifest.json"), currentManifestText);
+  await writeFile(
+    path.join(fixture, "manifest.json.sha256"),
+    `${currentManifestHash}  manifest.json\n`,
+  );
+  const metadataName = "manifest-bun-windows-x64.properties";
+  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  const metadata = [
+    "format=sana-mcp-release-v1",
+    "manifestVersion=1",
+    `manifestSha256=${currentManifestHash}`,
+    `packageVersion=${currentIdentity.version}`,
+    `releaseTag=v${currentIdentity.version}`,
+    `sourceCommit=${sourceCommit}`,
+    `installerProtocol=${currentIdentity.installerProtocol}`,
+    `lifecycleProtocol=${currentIdentity.lifecycleProtocol}`,
+    `inspectProtocol=${currentIdentity.inspectProtocol}`,
+    `stateCompatibility=${currentIdentity.stateCompatibility}`,
+    `semanticCapability=${currentIdentity.semanticCapability}`,
+    "installerAssetName=install.ps1",
+    `installerSha256=${sha256(installer)}`,
+    `target=${currentIdentity.target}`,
+    "assetName=sana-mcp-windows-x64.exe",
+    "checksumFileName=sana-mcp-windows-x64.exe.sha256",
+    `sha256=${currentBinaryHash}`,
+    "",
+  ].join("\n");
+  await writeFile(path.join(fixture, metadataName), metadata);
+  await writeFile(
+    path.join(fixture, `${metadataName}.sha256`),
+    `${sha256(metadata)}  ${metadataName}\n`,
+  );
+  const oldReceipt = [
+    "format=sana-mcp-install-v2",
+    `version=${oldManifest.packageVersion}`,
+    "target=bun-windows-x64",
+    `sourceCommit=${oldManifest.sourceCommit}`,
+    `binarySha256=${oldBinaryHash}`,
+    "pathManaged=false",
+    `installerProtocol=${oldManifest.installerProtocol}`,
+    `lifecycleProtocol=${oldManifest.lifecycleProtocol}`,
+    `inspectProtocol=${oldManifest.inspectProtocol}`,
+    `stateCompatibility=${oldManifest.stateCompatibility}`,
+    "",
+  ].join("\n");
+  await writeFile(path.join(fixture, "old-receipt"), oldReceipt);
+
+  const downloaderStart = installer.indexOf("function Download-Https(");
+  const downloaderEnd = installer.indexOf(
+    "\nfunction Format-DownloadProgress",
+    downloaderStart,
+  );
+  assert.ok(downloaderStart >= 0 && downloaderEnd > downloaderStart);
+  const fixtureDownloader = [
+    "function Download-Https(",
+    "  [string] $Source,",
+    "  [string] $Destination,",
+    "  [switch] $ShowProgress",
+    ") {",
+    "  $Name = [IO.Path]::GetFileName(([Uri] $Source).AbsolutePath)",
+    "  $FixtureFile = Join-Path $env:SANA_MCP_TEST_RELEASE_DIR $Name",
+    "  if (-not (Test-Path -LiteralPath $FixtureFile -PathType Leaf)) {",
+    '    throw "The isolated release fixture is missing $Name."',
+    "  }",
+    "  Copy-Item -LiteralPath $FixtureFile -Destination $Destination",
+    "}",
+    "",
+  ].join("\n");
+  const patchedInstaller =
+    installer.slice(0, downloaderStart) +
+    fixtureDownloader +
+    installer.slice(downloaderEnd);
+  const patchedInstallerPath = path.join(fixture, "install-e2e.ps1");
+  await writeFile(patchedInstallerPath, patchedInstaller);
+
+  const windowsPath = (file: string): string => {
+    if (process.platform === "win32") return file;
+    const converted = spawnSync("wslpath", ["-w", file], { encoding: "utf8" });
+    assert.equal(converted.status, 0, converted.stderr);
+    return converted.stdout.trim();
+  };
+  const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+  const harnessPath = path.join(temporary, "e2e.ps1");
+  await writeFile(
+    harnessPath,
+    [
+      '$ErrorActionPreference = "Stop"',
+      `$FixtureSource = ${quote(windowsPath(fixture))}`,
+      '$Root = Join-Path $env:TEMP ("sana-mcp-e2e-" + [Guid]::NewGuid().ToString("N"))',
+      '$Release = Join-Path $Root "release"',
+      '$Install = Join-Path $Root "install"',
+      '$Other = Join-Path $Root "other"',
+      '$Profile = Join-Path $Root "profile"',
+      '$LocalAppData = Join-Path $Profile "AppData\\Local"',
+      '$RoamingAppData = Join-Path $Profile "AppData\\Roaming"',
+      '$Data = Join-Path $Root "data"',
+      '$Transcripts = Join-Path $Root "transcripts"',
+      '$OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")',
+      '$KnownLocalAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)',
+      '$SerializationLock = Join-Path $KnownLocalAppData ".sana-mcp-installer-path.lock"',
+      'if (Test-Path -LiteralPath $SerializationLock) { throw "real known-folder serialization lock was present before isolated test: $SerializationLock" }',
+      '$IsolatedProcessPath = "$env:SystemRoot\\System32;$env:SystemRoot;$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0"',
+      'foreach ($Directory in @($Release,$Install,$Other,$Profile,$LocalAppData,$RoamingAppData,$Data,$Transcripts)) { [IO.Directory]::CreateDirectory($Directory) | Out-Null }',
+      '[IO.Directory]::CreateDirectory((Join-Path $Profile ".codex")) | Out-Null',
+      'Copy-Item -Path (Join-Path $FixtureSource "*") -Destination $Release -Force',
+      '$InstalledBinary = Join-Path $Install "sana-mcp.exe"',
+      '$OtherBinary = Join-Path $Other "sana-mcp.exe"',
+      'Copy-Item -LiteralPath (Join-Path $FixtureSource "v0.4.4-sana-mcp-windows-x64.exe") -Destination $InstalledBinary',
+      'Copy-Item -LiteralPath $InstalledBinary -Destination $OtherBinary',
+      'Copy-Item -LiteralPath (Join-Path $FixtureSource "old-receipt") -Destination (Join-Path $Install ".sana-mcp-install-v1")',
+      '$OldProcess = $null',
+      '$OtherProcess = $null',
+      '$InstallerProcess = $null',
+      '$PrimaryError = $null',
+      "function Start-IsolatedMcp([string] $Executable, [string] $ProcessData) {",
+      "  $Info = [Diagnostics.ProcessStartInfo]::new()",
+      "  $Info.FileName = $Executable",
+      '  $Info.Arguments = "mcp"',
+      "  $Info.UseShellExecute = $false",
+      "  $Info.CreateNoWindow = $true",
+      "  $Info.RedirectStandardInput = $true",
+      "  $Info.RedirectStandardOutput = $true",
+      "  $Info.RedirectStandardError = $true",
+      '  $Info.EnvironmentVariables["USERPROFILE"] = $Profile',
+      '  $Info.EnvironmentVariables["HOME"] = $Profile',
+      '  $Info.EnvironmentVariables["LOCALAPPDATA"] = $LocalAppData',
+      '  $Info.EnvironmentVariables["APPDATA"] = $RoamingAppData',
+      '  $Info.EnvironmentVariables["SANA_DATA_DIR"] = $ProcessData',
+      '  $Info.EnvironmentVariables["SANA_TRANSCRIPTS_DIR"] = $Transcripts',
+      '  $Info.EnvironmentVariables["PATH"] = $IsolatedProcessPath',
+      '  $Info.EnvironmentVariables["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"',
+      "  return [Diagnostics.Process]::Start($Info)",
+      "}",
+      "try {",
+      '  $OldProcess = Start-IsolatedMcp $InstalledBinary $Data',
+      '  $OtherData = Join-Path $Root "other-data"',
+      '  [IO.Directory]::CreateDirectory($OtherData) | Out-Null',
+      '  $OtherProcess = Start-IsolatedMcp $OtherBinary $OtherData',
+      '  Start-Sleep -Milliseconds 500',
+      '  if ($OldProcess.HasExited -or $OtherProcess.HasExited) { throw "fixture MCP process exited before installation" }',
+      '  $InstallerInfo = [Diagnostics.ProcessStartInfo]::new()',
+      '  $InstallerInfo.FileName = (Join-Path $PSHOME "powershell.exe")',
+      '  $InstallerInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"" + (Join-Path $Release "install-e2e.ps1") + "`""',
+      '  $InstallerInfo.UseShellExecute = $false',
+      '  $InstallerInfo.CreateNoWindow = $true',
+      '  $InstallerInfo.RedirectStandardOutput = $true',
+      '  $InstallerInfo.RedirectStandardError = $true',
+      '  foreach ($Pair in @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; SANA_DATA_DIR=$Data; SANA_TRANSCRIPTS_DIR=$Transcripts; SANA_MCP_INSTALL_DIR=$Install; SANA_MCP_VERSION="v0.4.5"; SANA_MCP_YES="1"; SANA_MCP_TEST_RELEASE_DIR=$Release; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD" }.GetEnumerator()) { $InstallerInfo.EnvironmentVariables[$Pair.Key] = $Pair.Value }',
+      '  $InstallerProcess = [Diagnostics.Process]::Start($InstallerInfo)',
+      '  $Stdout = $InstallerProcess.StandardOutput.ReadToEnd()',
+      '  $Stderr = $InstallerProcess.StandardError.ReadToEnd()',
+      '  if (-not $InstallerProcess.WaitForExit(60000)) { $InstallerProcess.Kill(); throw "installer timed out" }',
+      '  if ($InstallerProcess.ExitCode -ne 0) { throw "installer failed: $Stdout`n$Stderr" }',
+      '  if (-not $OldProcess.WaitForExit(5000)) { throw "active installed MCP process survived replacement" }',
+      '  if ($OtherProcess.HasExited) { throw "same-name other-path process was terminated" }',
+      '  if ($Stdout -cnotmatch "Installed .*sana-mcp.exe" -or $Stdout -cnotmatch "Registering sana-mcp with 1 detected client") { throw "successful install/configurer handoff was not reported: $Stdout" }',
+      '  if ($Stderr -match "could not start|exited with code") { throw "configurer launch warning was emitted: $Stderr" }',
+      `  if ((Get-FileHash -LiteralPath $InstalledBinary -Algorithm SHA256).Hash.ToLowerInvariant() -cne "${currentBinaryHash}") { throw "final binary digest mismatch" }`,
+      '  $Receipt = @{}; foreach ($Line in [IO.File]::ReadAllLines((Join-Path $Install ".sana-mcp-install-v1"))) { if ($Line) { $Index=$Line.IndexOf("="); $Receipt[$Line.Substring(0,$Index)]=$Line.Substring($Index+1) } }',
+      `  if ($Receipt["version"] -cne "0.4.5" -or $Receipt["binarySha256"] -cne "${currentBinaryHash}" -or $Receipt["sourceCommit"] -cne "${sourceCommit}") { throw "final receipt tuple mismatch" }`,
+      '  $Unexpected = @(Get-ChildItem -LiteralPath $Install -Force | Where-Object { $_.Name -notin @("sana-mcp.exe", ".sana-mcp-install-v1") })',
+      '  if ($Unexpected.Count -ne 0) { throw "installer artifacts remained: $($Unexpected.Name -join \', \')" }',
+      '  if ([Environment]::GetEnvironmentVariable("Path", "User") -cne $OriginalUserPath) { throw "installer changed the real User PATH" }',
+      '  if (Test-Path -LiteralPath $SerializationLock) { throw "installer left the real known-folder serialization lock: $SerializationLock" }',
+      "} catch {",
+      '  $PrimaryError = $_.Exception',
+      "} finally {",
+      '  $CleanupFailures = @()',
+      '  foreach ($ProcessToClean in @($OldProcess,$OtherProcess,$InstallerProcess)) {',
+      '    if ($null -eq $ProcessToClean) { continue }',
+      '    try {',
+      '      if (-not $ProcessToClean.HasExited) { $ProcessToClean.Kill() }',
+      '      if (-not $ProcessToClean.WaitForExit(3000)) { throw "PID $($ProcessToClean.Id) did not exit within cleanup deadline" }',
+      '    } catch { $CleanupFailures += $_.Exception.Message }',
+      "  }",
+      '  try { if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force }; if (Test-Path -LiteralPath $Root) { throw "isolated root still exists" } } catch { $CleanupFailures += "could not remove isolated root $Root`: $($_.Exception.Message)" }',
+      '  if (Test-Path -LiteralPath $SerializationLock) { $CleanupFailures += "real serialization lock remained at $SerializationLock" }',
+      "}",
+      'if ($null -ne $PrimaryError) { if ($CleanupFailures.Count -gt 0) { throw "$($PrimaryError.Message); cleanup failed: $($CleanupFailures -join \'; \')" }; throw $PrimaryError }',
+      'if ($CleanupFailures.Count -gt 0) { throw "cleanup failed: $($CleanupFailures -join \'; \')" }',
+      "",
+    ].join("\n"),
+  );
+  try {
+    const result = spawnSync(
+      powershell,
+      ["-NoProfile", "-NonInteractive", "-File", windowsPath(harnessPath)],
+      { encoding: "utf8", timeout: 120_000 },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("Windows confirms incompatible replacement before download and resets state transactionally", async () => {
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  const cli = await readFile(path.join(root, "src/cli.ts"), "utf8");
   assert.match(installer, /^# Install[\s\S]*\n& \{\n/u);
   assert.doesNotMatch(installer, /\$script:/u);
   const acquireSharedLock = installer.indexOf(
@@ -1614,7 +1970,7 @@ test("Windows confirms incompatible replacement before download and resets state
     /if \(\$FilesRestored -and \$OldPresent -and \$OldWasRunning\) \{\s+try \{\s+if \(\$null -eq \$Destination -or\s+-not \(Test-Path/u,
   );
   const receiptMove = installer.indexOf(
-    "Move-Item -LiteralPath $StagedReceipt -Destination $ReceiptPath -Force",
+    "Publish-InstallerFile `\n    $StagedReceipt `\n    $ReceiptPath",
   );
   const incompatibleConfirmation = installer.indexOf(
     "Confirm-IncompatibleReplacement $LegacyRelease",
@@ -1711,11 +2067,115 @@ test("Windows confirms incompatible replacement before download and resets state
   );
   assert.match(
     installer,
-    /if \(\$LegacyInstall\) \{\s+if \(Test-Path -LiteralPath \$ReceiptPath\) \{\s+Remove-Item -LiteralPath \$ReceiptPath -Force/u,
+    /Restore-InstallerFileState\s+`\s+\$ReceiptPath\s+`\s+\$OldReceiptBackup\s+`\s+\$OldReceiptDigest/u,
   );
   assert.match(
     installer,
     /if \(\$LegacyInstall\) \{\s+Start-LegacyDaemon \$Destination/u,
+  );
+  assert.match(
+    installer,
+    /function Get-ValidatedRecoveryReplacementReceiptHash[\s\S]*?\$ReplacementReceipt\["version"\][\s\S]*?\$Inventory\["replacementVersion"\][\s\S]*?\$ReplacementReceipt\["target"\][\s\S]*?\$Inventory\["replacementTarget"\][\s\S]*?\$ReplacementReceipt\["stateCompatibility"\][\s\S]*?\$Inventory\["replacementStateCompatibility"\]/u,
+  );
+  assert.match(
+    installer,
+    /replacementSourceCommit=\$\(\$Release\["sourceCommit"\]\)[\s\S]*?replacementInstallerProtocol=\$\(\$Release\["installerProtocol"\]\)[\s\S]*?replacementLifecycleProtocol=\$\(\$Release\["lifecycleProtocol"\]\)[\s\S]*?replacementInspectProtocol=\$\(\$Release\["inspectProtocol"\]\)/u,
+  );
+  assert.match(
+    installer,
+    /Publish-InstallerFile\s+`\s+\$StagedReceipt[\s\S]*?replacementReceiptSha256=\$NewReceiptDigest[\s\S]*?\[IO\.File\]::Replace\([\s\S]*?__reset-incompatible-state prepare/u,
+  );
+  assert.match(
+    installer,
+    /\$NeedsCommit[\s\S]*?\$Inventory\.ContainsKey\("replacementReceiptSha256"\)[\s\S]*?\$RecoveryReplacementReceiptHash -cne\s+\$Inventory\["replacementReceiptSha256"\]/u,
+  );
+  assert.match(
+    installer,
+    /function Get-ValidatedRecoveryReplacementReceiptHash[\s\S]*?\["sourceCommit"\][\s\S]*?\["replacementSourceCommit"\][\s\S]*?\["installerProtocol"\][\s\S]*?\["replacementInstallerProtocol"\][\s\S]*?\["lifecycleProtocol"\][\s\S]*?\["replacementLifecycleProtocol"\][\s\S]*?\["inspectProtocol"\][\s\S]*?\["replacementInspectProtocol"\]/u,
+  );
+  assert.match(
+    installer,
+    /function ConvertTo-RecoveryPathValue[\s\S]*?ToBase64String[\s\S]*?function ConvertFrom-RecoveryPathValue[\s\S]*?FromBase64String/u,
+  );
+  assert.match(
+    installer,
+    /\$OldUserPath = \[Environment\]::GetEnvironmentVariable\("Path", "User"\)[\s\S]*?\$ExpectedCurrentUserPath =[\s\S]*?replacementPathManaged=\$\(\$NewPathManaged[\s\S]*?previousUserPath=\$\(ConvertTo-RecoveryPathValue \$OldUserPath\)[\s\S]*?publishedUserPath=\$\(ConvertTo-RecoveryPathValue \$ExpectedCurrentUserPath\)[\s\S]*?\$TransactionActive = \$true/u,
+  );
+  assert.match(
+    installer,
+    /\$NeedsCommit[\s\S]*?GetEnvironmentVariable\("Path", "User"\) -cne\s+\$RecoveryPublishedUserPath[\s\S]*?committed incompatible replacement User PATH changed/u,
+  );
+  assert.match(
+    installer,
+    /if \(\$NeedsReset\) \{[\s\S]*?\$RecoveryCurrentUserPath[\s\S]*?replacementPathManaged"\] -ceq "true"[\s\S]*?\$RecoveryPreviousUserPath[\s\S]*?\$RecoveryPublishedUserPath[\s\S]*?SetEnvironmentVariable\([\s\S]*?"Path"[\s\S]*?\$RecoveryPreviousUserPath[\s\S]*?"User"[\s\S]*?User PATH changed concurrently/u,
+  );
+  assert.match(
+    installer,
+    /\$ReplacementReceipt\["pathManaged"\] -cne\s+\$Inventory\["replacementPathManaged"\]/u,
+  );
+  assert.match(
+    installer,
+    /function Get-RetiredInstallerFileName[\s\S]*?-retired-[\s\S]*?function Remove-OrphanRetiredInstallerFiles[\s\S]*?\[a-f0-9\]\{32\}[\s\S]*?\$Candidates\.Count -gt 64/u,
+  );
+  assert.match(
+    installer,
+    /Remove-OrphanRetiredInstallerFiles[\s\S]*?Assert-NotReparse \$Candidate\.FullName[\s\S]*?-PathType Leaf[\s\S]*?\$Inventory\["previousBinarySha256"\][\s\S]*?\$Inventory\["replacementBinarySha256"\][\s\S]*?Stop-CanonicalRuntimeProcesses \$Candidate\.FullName/u,
+  );
+  assert.match(
+    installer,
+    /Stop-CanonicalRuntimeProcesses \$Candidate\.FullName[\s\S]*?Assert-NotReparse \$Candidate\.FullName "Retired installer artifact"[\s\S]*?-PathType Leaf[\s\S]*?\(Get-Sha256 \$Candidate\.FullName\) -cne \$Digest[\s\S]*?Remove-Item -LiteralPath \$Candidate\.FullName/u,
+  );
+  assert.match(
+    installer,
+    /\$AllowedReceiptDigests[\s\S]*?\$Inventory\["previousReceiptSha256"\][\s\S]*?\$AuthorizedReplacementReceiptSha256[\s\S]*?unexpected or unprovable digest/u,
+  );
+  assert.match(
+    installer,
+    /Remove-OrphanRetiredInstallerFiles\s+`\s+\$Executable[\s\S]*?Remove-ResolvedIncompatibleRecovery \$RecoveryDirectory/u,
+  );
+  assert.match(
+    installer,
+    /function Get-CanonicalRuntimeProcesses[\s\S]*?\$ImageName = \[IO\.Path\]::GetFileName\(\$Resolved\)[\s\S]*?\^\[A-Za-z0-9\._-\]\+\$[\s\S]*?Get-CimInstance Win32_Process -Filter "Name = '\$ImageName'"/u,
+  );
+  assert.match(
+    installer,
+    /\$Committed = \$true\s+\$TransactionActive = \$false[\s\S]*?Remove-Item -LiteralPath \$RetiredBinary[\s\S]*?Remove-Item -LiteralPath \$RetiredReceipt[\s\S]*?\$RetiredBinaryRemains =[\s\S]*?\$RetiredReceiptRemains =[\s\S]*?if \(-not \$RetiredBinaryRemains -and\s+-not \$RetiredReceiptRemains\) \{[\s\S]*?Remove-ResolvedIncompatibleRecovery \$IncompatibleResetJournal/u,
+  );
+  assert.match(
+    installer,
+    /\} else \{[\s\S]*?deferred retired runtime cleanup remains at \$RetiredBinary[\s\S]*?deferred retired receipt cleanup remains at \$RetiredReceipt[\s\S]*?deferred recovery path: \$IncompatibleResetJournal/u,
+  );
+  assert.match(
+    installer,
+    /if \(\$null -ne \$RetiredBinary\) \{\s+try \{\s+Stop-CanonicalRuntimeProcesses \$RetiredBinary\s+Assert-NotReparse \$RetiredBinary "Retired runtime"[\s\S]*?\(Get-Sha256 \$RetiredBinary\) -cne \$OldBinaryDigest[\s\S]*?Remove-Item -LiteralPath \$RetiredBinary/u,
+  );
+  assert.match(
+    installer,
+    /if \(\$null -ne \$RetiredReceipt\) \{\s+try \{\s+Assert-NotReparse \$RetiredReceipt "Retired receipt"[\s\S]*?\(Get-Sha256 \$RetiredReceipt\) -cne \$OldReceiptDigest[\s\S]*?Remove-Item -LiteralPath \$RetiredReceipt/u,
+  );
+  assert.match(
+    installer,
+    /expectedSha256 = \$OldBinaryDigest[\s\S]*?expectedSha256 = \$OldReceiptDigest[\s\S]*?if \(\$RetiredArtifact\.safe\) \{[\s\S]*?Stop-CanonicalRuntimeProcesses \$RetiredArtifact\.path[\s\S]*?Assert-NotReparse[\s\S]*?\(Get-Sha256 \$RetiredArtifact\.path\) -cne\s+\$RetiredArtifact\.expectedSha256[\s\S]*?Remove-Item -LiteralPath \$RetiredArtifact\.path/u,
+  );
+  assert.match(
+    installer,
+    /function Restore-InstallerFileState[\s\S]*?Publish-InstallerFile[\s\S]*?Stop-CanonicalRuntimeProcesses \$Retired[\s\S]*?Assert-NotReparse \$Retired "Retired \$Label"[\s\S]*?\(Get-Sha256 \$Retired\) -cne \$CurrentSha256[\s\S]*?Remove-Item -LiteralPath \$Retired/u,
+  );
+  assert.match(
+    installer,
+    /Get-RetiredInstallerFileName\s+`\s+\$Destination[\s\S]*?Move-Item -LiteralPath \$Destination -Destination \$Retired[\s\S]*?Stop-CanonicalRuntimeProcesses \$Retired[\s\S]*?Assert-NotReparse \$Retired "Retired \$Label"[\s\S]*?\(Get-Sha256 \$Retired\) -cne \$ReplacementSha256[\s\S]*?Remove-Item -LiteralPath \$Retired/u,
+  );
+  assert.doesNotMatch(
+    installer,
+    /GetFileName\(\$Destination\) \+ "-remove-"/u,
+  );
+  assert.match(
+    installer,
+    /if \(\$RetiredArtifact\.safe\) \{[\s\S]*?Remove-Item[\s\S]*?\} else \{[\s\S]*?retained authoritative retired file at/u,
+  );
+  assert.match(
+    cli,
+    /let stoppedObservations = 0;[\s\S]*?while \(Date\.now\(\) < deadline\)[\s\S]*?stoppedObservations >= 3[\s\S]*?requestDaemonStop\(stoppedPid\)[\s\S]*?while \(pidAlive\(stoppedPid\)\)/u,
   );
 });
 

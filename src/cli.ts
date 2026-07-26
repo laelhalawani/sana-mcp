@@ -106,7 +106,7 @@ async function daemonLifecycle(
   operation: string,
 ): Promise<{ state: "running" | "stopped"; changed: boolean }> {
   const { SanaStore } = await import("./store/db.js");
-  const { daemonStateStatus } = await import("./sync/lock.js");
+  const { daemonStateStatus, pidAlive } = await import("./sync/lock.js");
   const inspect = (): { state: "running" | "stopped"; pid?: number } => {
     const store = new SanaStore();
     try {
@@ -135,20 +135,36 @@ async function daemonLifecycle(
     return { state: inspect().state, changed: true };
   }
   if (operation === "stop") {
-    const before = inspect();
-    if (before.state === "stopped") return { state: "stopped", changed: false };
     const { requestDaemonStop } = await import("./sync/control.js");
-    requestDaemonStop(before.pid!);
     const deadline = Date.now() + 10_000;
-    while (inspect().state === "running") {
-      if (Date.now() >= deadline) {
-        throw new Error(
-          "daemon did not acknowledge the stop request within 10000ms; stop it manually",
-        );
+    let changed = false;
+    let stoppedObservations = 0;
+    while (Date.now() < deadline) {
+      const before = inspect();
+      if (before.state === "stopped") {
+        stoppedObservations++;
+        if (stoppedObservations >= 3) {
+          return { state: "stopped", changed };
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        continue;
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      stoppedObservations = 0;
+      const stoppedPid = before.pid!;
+      requestDaemonStop(stoppedPid);
+      changed = true;
+      while (pidAlive(stoppedPid)) {
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `daemon process ${stoppedPid} did not exit within 10000ms; stop it manually`,
+          );
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
     }
-    return { state: "stopped", changed: true };
+    throw new Error(
+      "daemon state did not remain stopped within 10000ms; stop it manually",
+    );
   }
   throw new Error("__lifecycle operation must be health, stop, or start");
 }
