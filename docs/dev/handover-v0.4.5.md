@@ -132,13 +132,30 @@ sets it for the harness process, and passes it to the nested installer. A native
 non-interactive probe resolved `Get-FileHash`; typecheck and diff validation
 passed, and a fresh independent reviewer returned zero findings.
 
+The corrected Windows gate then passed in GitHub Actions. The first publication
+attempt successfully created the exact `v0.4.5` tag but observed a transient
+404 while immediately reading it back, so it stopped before creating a release.
+The idempotent rerun resolved the same immutable tag, rebuilt all targets,
+passed the Windows gate again, and published
+<https://github.com/Etals-AiApp/sana-ai-mcp/releases/tag/v0.4.5>. The published
+`install.ps1` SHA-256 is
+`e64ce62eeccbd1fd6acd068f3732f9f04bbbd2a680ae6a3f02512b926a1ee670`,
+exactly matching the tagged source.
+
+The post-publication workflow correction keeps ordinary tag verification
+fail-fast and retries only the read immediately following a successful tag
+creation. It makes at most ten probes one second apart, retries only a 404, and
+still fails immediately on API errors, malformed or non-commit objects, and SHA
+mismatches. Behavioral fake-API coverage checks transient and persistent 404s,
+the hard-error paths, sleep counts, lookup counts, and absence of release
+mutation.
+
 ## Required completion sequence
 
-1. Commit and push the canonical Windows gate correction to `main`.
-2. Wait for the automatic v0.4.5 release, and verify the
-   published `install.ps1` SHA-256 matches the committed file.
-3. Give the user the production command only after the Windows gate and release
-   publication succeed.
+1. Commit and push the bounded post-create tag-visibility correction.
+2. Confirm the main-push release workflow skips because `v0.4.5` is already
+   published.
+3. Give the user the production command.
 
 ## Safety constraints
 

@@ -443,6 +443,32 @@ jobs:
               { echo "Release tag moved after authorization" >&2; exit 1; }
           }
 
+          verify_created_release_tag() {
+            tag_probe=1
+            while :; do
+              if observed_tag_sha=$(
+                resolve_tag_commit "$RELEASE_TAG" "$tag_probe_error"
+              ); then
+                test "$observed_tag_sha" = "$SOURCE_SHA" ||
+                  { echo "Release tag moved after authorization" >&2; exit 1; }
+                return 0
+              else
+                tag_status=$?
+              fi
+              if [ "$tag_status" -ne 2 ] || [ "$tag_probe" -ge 10 ]; then
+                cat "$tag_probe_error" >&2
+                if [ "$tag_status" -eq 2 ]; then
+                  echo "Release tag $RELEASE_TAG did not become visible after creation." >&2
+                else
+                  echo "Could not resolve release tag $RELEASE_TAG after creation." >&2
+                fi
+                exit 1
+              fi
+              tag_probe=$((tag_probe + 1))
+              sleep 1
+            done
+          }
+
           if observed_tag_sha=$(
             resolve_tag_commit "$RELEASE_TAG" "$tag_probe_error"
           ); then
@@ -482,7 +508,7 @@ jobs:
                 exit 1
               fi
             else
-              verify_release_tag
+              verify_created_release_tag
             fi
           fi
           tag_without_build="${RELEASE_TAG%%+*}"
