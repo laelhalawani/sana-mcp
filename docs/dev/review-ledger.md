@@ -1876,3 +1876,178 @@ Final validation evidence:
 - the post-release main workflow authorized the existing `v0.4.5` and skipped
   every build/publication job successfully; final local cleanup reported zero
   isolated test roots and zero test Sana processes.
+
+## v0.4.6 targeted CLI and installer repair
+
+This stage starts from the clean `v0.4.5` release commit `31fafce`. The broader
+working-tree redesign is preserved outside this isolated worktree and is not
+part of this repair.
+
+### Prep and finalized ownership
+
+Read-only diagnosis was split between:
+
+- `/root/minimal_config_cli_trace`: PowerShell installer, client discovery,
+  ownership, planning, publication, uninstall, and directly matching tests;
+- `/root/minimal_auth_cli_trace`: sign-in request, cookie/session publication,
+  durable auth transition, retry, configurer inspection, and matching tests.
+
+The consolidated plan received two independent full-path reviews. Both found
+that the initial auth plan missed the deterministic `sana-ai-session` origin
+binding failure and that the speculative secure-session rename retry was not
+causal. Their remaining config and auth findings were incorporated. Each
+reviewer then re-read the corrected consolidated plan and returned a separate
+zero-finding approval.
+
+| Plan review / round | Findings | Resolution | Result |
+|---|---|---|---|
+| `/root/minimal_plan_review_1`, initial | missing request-code origin binding; unrelated auth issue could be overwritten; path aliases were not fully Windows-aware; Windows directory flush suppression omitted an ambiguous post-publication branch | added exact same-origin cookie provenance, request-code issue gating, resolved/case-folded Windows path identity, and every post-mutation Windows flush branch; deferred the non-causal secure-file retry | correction required |
+| `/root/minimal_plan_review_2`, initial | same deterministic origin failure; future request-code failures should not manufacture a cache block; speculative rename retry was non-causal; absent-client interactive discovery had to retain the existing nonblocking UX | added pid-less request-code recovery plus exact v0.4.5 poison compatibility, preserved unrelated issues, retained the established interactive/uninstall policy, and deferred the non-causal secure-file retry | correction required |
+| `/root/minimal_plan_review_1`, corrected plan | none | n/a | APPROVED - zero findings |
+| `/root/minimal_plan_review_2`, corrected plan | none | n/a | APPROVED - zero findings |
+
+Development scope `V046-CONFIG` exclusively owns:
+
+- `src/install/clients.ts`
+- `src/install/config-formats.ts`
+- `src/install/writers.ts`
+- `src/install/apply.ts`
+- `src/install/install.ts`
+- `src/install/status.ts`
+- `src/install/atomic-config.ts`
+- directly matching tests under `tests/install/`
+
+Development scope `V046-AUTH` initially owned:
+
+- `src/sana/client.ts`
+- `src/store/db.ts`
+- `tests/sana/client.test.ts`
+- `tests/sana/auth-request.test.ts`
+- `tests/sana/auth.test.ts`
+- `tests/sana/session-publication.test.ts`
+- `tests/runtime/secure-session.test.ts`
+- `tests/runtime/secure-store.test.ts`
+
+Reviewed correction rounds explicitly extended `V046-AUTH` ownership to:
+
+- `src/core/status.ts`
+- the auth/configurer portions of `src/install/install.ts`, owned sequentially
+  only after `V046-CONFIG` finished its whole-file work and review
+- `src/sync/daemon.ts`
+- `src/tools/dispatch.ts`
+- `src/app/runtime.ts`
+- `tests/core/status-auth.test.ts`
+- the auth/configurer portions of `tests/install/configurer-flow.test.ts`,
+  owned sequentially only after `V046-CONFIG`
+- `tests/sync/daemon.test.ts`
+- `tests/tools/dispatch-auth.test.ts`
+- `tests/app/runtime.test.ts`
+- the pending-challenge contract-double changes in
+  `tests/fixtures/contracts/auth-client.ts` and
+  `tests/fixtures/contracts/semantic-client.ts`
+
+`V046-AUTH` does not own `src/runtime/secure-files.ts`; the unproven rename
+hardening is explicitly deferred. Installer scripts, CLI routing, transaction
+protocol/schema, cookies, the state epoch, update/reset, daemon behavior,
+direct AppRuntime cache gating, and agent-facing dispatch output were initially
+outside the auth scope. The review findings made the daemon, cache
+authorization, AppRuntime, configurer-auth, and dispatch gates explicit,
+sequentially owned correction work. Meeting/cache contents and schemas remained
+out of scope. Agent-facing byte contracts were preserved: no public wording or
+output fixture changed, and the contract fixture edits only added the explicit
+nonpending client method required by the production interface.
+
+Baseline evidence before development: 74 targeted config, atomic publication,
+secure-session, auth-request, and session-publication tests passed; no tracked
+source file differed from `31fafce`.
+
+### Development and scope-review lineage
+
+| Scope / round | Development | Review | Findings | Resolution / next gate |
+|---|---|---|---|---|
+| `V046-CONFIG` initial | `/root/v046_config_dev` | `/root/v046_config_review_1` | none | CLEAN - zero findings; reviewer read the complete owned production/test scope plus CLI and hidden transaction callers; 88 targeted and 125 caller/transaction tests, typecheck, and diff-check passed |
+| `V046-AUTH` initial | `/root/v046_auth_dev` | `/root/v046_auth_review_1` | request-stage `sana-ai-session` remained indistinguishable from verified login readiness in core status/cache, restarted configurer, and daemon paths; an origin-change request could expose an old unblocked cache before code verification | correction round assigned to `/root/v046_auth_dev`; pending challenge will become explicit read-only client state consumed by all readiness gates, configurer retry, and daemon waiting; requires a fresh reviewer |
+| `V046-AUTH` correction 1 | `/root/v046_auth_dev` | `/root/v046_auth_review_2` | a confirmed request-code challenge blocked status/tool paths but did not durably set the store cache block, allowing direct app-runtime access to an old matching cache; tool dispatch also mislabeled pending as expired | correction round 2 assigned to `/root/v046_auth_dev`: request-code confirmation/target recovery will set the durable block while source abort preserves its pre-publication value, and dispatch will route pending to existing signed-out guidance; requires store/AppRuntime/dispatch regressions and another fresh reviewer |
+| `V046-AUTH` correction 2 | `/root/v046_auth_dev` | `/root/v046_auth_review_3` | if a challenge became pending after dispatch's initial check but before daemon startup, the status-only path safely hid metrics but rendered sync-in-progress rather than signed-out guidance | correction round 3 assigned to `/root/v046_auth_dev`: recheck the stable pre-daemon client for a pending challenge and return the existing byte-exact signed-out guidance before daemon startup/status rendering; requires deterministic race regression and another fresh reviewer |
+| `V046-AUTH` correction 3 | `/root/v046_auth_dev` | `/root/v046_auth_review_4` | none | CLEAN - zero findings; fresh reviewer traced the complete auth scope plus publication/login callers and verified pending publication, durable blocking, recovery, configurer, daemon, dispatch races, status, and direct runtime; 112 focused tests, typecheck, and diff-check passed |
+
+### Cross-cutting stage review
+
+| Round | Review | Findings | Resolution / next gate |
+|---|---|---|---|
+| cross-cutting 1 | `/root/v046_crosscut_review_1` | an in-memory pending challenge could precede publication of the durable store block, while an existing `LocalAppRuntime` authorized only against the still-ready store | correction assigned to `/root/v046_auth_dev`: `LocalAppRuntime` will reject pending client state before its store guard, with separate pre-publication and confirmed-block coverage across all cache-backed methods; requires a fresh adversarial stage reviewer |
+| cross-cutting correction 1 | `/root/v046_crosscut_review_2` | none | CLEAN - zero findings; fresh reviewer traced both transcripts through unchanged installer/CLI/hidden transaction/release callers and the complete config/auth/runtime diff; 168 focused tests, typecheck, and diff-check passed |
+
+### Deployment prep and release-quality boundary
+
+Read-only trace evidence was supplied by:
+
+- `/root/minimal_config_cli_trace` for client detection, ownership, planning,
+  atomic config publication, uninstall, and the Windows installer handoff;
+- `/root/minimal_auth_cli_trace` for request-code acceptance, session and store
+  publication, pending challenge recovery, configurer inspection, and retry;
+- `/root/v046_auth_dev` for the final local Git boundary and public GitHub
+  branch, workflow, check, tag, release, and asset-readiness audit.
+
+The two initial plan reviews, their complete findings and resolutions, and the
+two corrected-plan zero approvals are recorded in the Prep table above. Remote
+deployment preparation found no enforced branch protection, ruleset, required
+status check, or pull-request workflow. The active release workflow publishes
+from `main` only when the package-matching tag is absent, so implementation
+merge and release publication must remain separate:
+
+1. Repair PR: merge the reviewed implementation, tests, and this ledger while
+   the package remains `0.4.5`; the existing-tag authorization path must
+   succeed and skip publication.
+2. Release-quality PR: project the exact `0.4.6` version through package,
+   documentation, manifest fixtures, native Windows upgrade coverage, and
+   release workflow expectations; merging this PR is the publication trigger.
+
+The `0.4.6` release retains positive state compatibility epoch `1`. This repair
+changes no state schema or incompatible replacement boundary, so inventing a
+new epoch would force an unnecessary destructive replacement.
+
+Exact merge and publication evidence is intentionally pending rather than
+fabricated:
+
+- repair PR number: **TBD after creation**
+- repair head commit: **TBD after commit**
+- repair merge commit: **TBD after merge**
+- existing-tag authorization run: **TBD after merge**
+- release-quality PR number: **TBD after creation**
+- release head commit: **TBD after commit**
+- release merge and `v0.4.6` tag commit: **TBD after publication**
+- full release workflow run and asset verification: **TBD after publication**
+
+The later release-quality scope owns the version projection and release gates,
+including `package.json`, version-bound documentation and installer examples,
+manifest fixtures and assertions, the native Windows installer release test,
+`.github/workflows/release.yml`, and
+`tests/contracts/mcp-stdio.test.ts`. The latter scope must correct the clean
+worktree's absent live-data-alias harness condition and obtain a fresh review;
+it must not weaken the production live-data isolation guard.
+
+Final validation evidence:
+
+- main exact applied changed-scope and transitive suite: 327 passed, 0 failed;
+- the separate full clean-worktree suite encountered the known absent
+  live-data-alias condition in `tests/contracts/mcp-stdio.test.ts`; correction
+  belongs only to the later release-quality scope identified above and is not
+  represented here as a green full-suite result;
+- `bun run typecheck` and `git diff --check`: passed;
+- native Windows Bun config/auth/runtime coverage: 114 effective auth,
+  configurer, store, status, daemon, dispatch, and AppRuntime tests passed after
+  applying a longer timeout to one UNC-hosted child-process test;
+- native Windows config coverage exercised actual atomic publication, exact
+  predecessor ownership, alias rejection, full-set preplanning, and zero
+  directory-flush calls; one POSIX-only injected durability test is not
+  portable to a Windows filesystem and is not product-path evidence;
+- a natively built Windows standalone passed inspect/help and an isolated
+  end-to-end config scenario: the exact historical Claude entry stayed
+  byte-for-byte unchanged, a later foreign Gemini entry caused zero writes,
+  clean retry registered Cursor without EPERM/durability warnings, uninstall
+  removed both managed registrations, and no temporary config artifact
+  remained;
+- validation used only isolated temporary Windows/WSL roots and mocked auth
+  network paths. It did not touch the live installation, live client configs,
+  live Sana state, or send a real sign-in code.

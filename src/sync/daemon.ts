@@ -69,13 +69,40 @@ async function heartbeatSleep(
 }
 
 function markNeedsLogin(
-  store: SanaStore,
+  store: Pick<SanaStore, "markNeedsLoginIfCurrent">,
   client: Pick<SanaClient, "sessionVersion">,
 ): "marked" | "stale" {
   return store.markNeedsLoginIfCurrent(
     client.sessionVersion(),
     "Not logged in. Run meeting_transcripts(\"login\", {email}).",
   );
+}
+
+/**
+ * Resolve the local-only daemon gate before any authentication request.
+ * A pending challenge is intentionally left resumable for the interactive
+ * login flow; the daemon only keeps its lease alive until that state changes.
+ *
+ * @internal Exported for side-effect boundary tests.
+ */
+export async function daemonSessionPreflight(
+  store: Pick<SanaStore, "markNeedsLoginIfCurrent">,
+  client: Pick<
+    SanaClient,
+    "hasAuthCookie" | "pendingSignInChallenge" | "sessionVersion"
+  >,
+  wait: () => Promise<void>,
+): Promise<"wait" | "authenticate"> {
+  if (client.pendingSignInChallenge() !== null) {
+    await wait();
+    return "wait";
+  }
+  if (!client.hasAuthCookie()) {
+    markNeedsLogin(store, client);
+    await wait();
+    return "wait";
+  }
+  return "authenticate";
 }
 
 /** One sync cycle: refresh the meeting list, then download missing transcripts. */
@@ -353,9 +380,13 @@ export async function runDaemon(): Promise<void> {
         break;
       }
       const client = SanaClient.load();
-      if (!client.hasAuthCookie()) {
-        markNeedsLogin(store, client);
-        await heartbeatSleep(store, 15_000, stop, activeControl);
+      const preflight = await daemonSessionPreflight(
+        store,
+        client,
+        async () =>
+          await heartbeatSleep(store, 15_000, stop, activeControl),
+      );
+      if (preflight === "wait") {
         if (daemonStopRequested(activeControl.instanceId)) stopping = true;
         continue;
       }
