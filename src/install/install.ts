@@ -2388,16 +2388,15 @@ export async function runUninstall(
     entry,
   );
 
-  if (discovered.discoveryIssues.length > 0) {
-    presentation.print(
-      "Managed registration state could not be determined for every client.",
-    );
-    stopForIncompleteConfiguration(presentation, [
-      ...new Set(discovered.discoveryIssues),
-    ]);
-  }
-
   if (discovered.candidates.length === 0) {
+    if (discovered.discoveryIssues.length > 0) {
+      presentation.print(
+        "Managed registration state could not be determined for every client.",
+      );
+      stopForIncompleteConfiguration(presentation, [
+        ...new Set(discovered.discoveryIssues),
+      ]);
+    }
     presentation.print("No managed client registrations were found.");
     return { disposition: "no-registrations", selectedCount: 0 };
   }
@@ -2407,6 +2406,15 @@ export async function runUninstall(
       "An interactive terminal is required to choose clients. Use sana-mcp uninstall --yes to remove every detected or proven-managed registration.",
     );
     return { disposition: "interaction-unavailable", selectedCount: 0 };
+  }
+
+  if (discovered.discoveryIssues.length > 0) {
+    presentation.print(
+      "Managed registration state could not be determined for every client.",
+    );
+    stopForIncompleteConfiguration(presentation, [
+      ...new Set(discovered.discoveryIssues),
+    ]);
   }
 
   let ids: readonly string[];
