@@ -124,6 +124,14 @@ inside the test harness's guaranteed `try/finally`; a fresh independent review
 returned zero findings. This test-only correction passed typecheck and diff
 validation.
 
+The next Windows gate reached the installer but inherited pwsh 7's
+`PSModulePath` in its nested Windows PowerShell 5.1 process, so the native
+`Get-FileHash` command could not autoload. The isolated harness now reads the
+authoritative machine-scoped module path, fails explicitly if it is unavailable,
+sets it for the harness process, and passes it to the nested installer. A native
+non-interactive probe resolved `Get-FileHash`; typecheck and diff validation
+passed, and a fresh independent reviewer returned zero findings.
+
 ## Required completion sequence
 
 1. Commit and push the canonical Windows gate correction to `main`.
