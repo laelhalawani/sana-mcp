@@ -1750,3 +1750,111 @@ Validation evidence:
 - POSIX `sh -n`: passed;
 - `git diff --check`: clean;
 - tests used isolated state and did not open the live Sana data tree.
+
+## Windows active-runtime replacement correction (`v0.4.5`)
+
+Development scope `/root/v045_single_dev` owns `install.ps1`, `src/cli.ts`,
+the directly related installer regression, the Windows release gate, and the
+`v0.4.5` projections. The correction retires every process executing from the
+verified canonical installed path after cooperative daemon stop, revalidates
+PID, creation time, and executable path immediately before termination, and
+requires a bounded stable-clear barrier. Publication now uses an explicit
+same-directory retire/publish operation with digest verification. Rollback and
+interrupted incompatible recovery reconcile binary and receipt independently;
+an already-restored old digest is a no-op, while unexpected bytes stop recovery.
+The lifecycle stop protocol now waits for the captured daemon PID to exit.
+
+The native Windows regression runs an active canonical `sana-mcp.exe` and a
+same-name executable from another path, proves that only the canonical process
+is stopped, publishes the replacement, restores the previous bytes, and proves
+that a repeated already-old rollback is non-mutating. The Windows release job
+runs a stronger end-to-end regression against the complete installer after
+building the release artifact. That gate verifies the official `v0.4.4`
+manifest, checksums, and Windows binary, holds a real receipt-backed `mcp`
+process open through redirected stdin, and proves the isolated `v0.4.5`
+transaction terminates only the installed-path process, publishes the exact
+binary and receipt, launches the public configurer, and leaves no transaction
+artifacts. This replaced the helper-only release gate after fresh review found
+that it could not prove the complete installer path.
+
+Final recovery review found that a commit-state journal authenticated the
+replacement binary and receipt fields but did not bind the complete receipt
+bytes. The recovery inventory now records the release source/protocol authority
+before publication and atomically adds the exact published receipt SHA-256
+before reset preparation. Commit recovery requires that digest and the complete
+semantic tuple; a pre-digest crash may roll back only after validating every
+available authoritative receipt field, while older incomplete journals fail
+safely if they contain an unprovable replacement receipt.
+
+The final recovery review also found that interrupted incompatible replacement
+did not journal the Windows User PATH transition. PATH intent is now computed
+before recovery publication and mutation, then stored with explicit
+null/empty-preserving canonical base64url values plus replacement ownership.
+Commit recovery requires the current PATH and receipt ownership to match that
+authority. Reset recovery either no-ops on the exact previous value or restores
+the exact published value; concurrent or unowned changes fail safely without
+being overwritten.
+
+Cross-cut recovery review identified same-directory retired files that can
+survive a hard interruption between retirement and transaction cleanup.
+Pending recovery now performs a bounded scan for only the two exact
+helper-generated sibling-name forms. It rejects directories and reparse points,
+authenticates every candidate against the journaled previous/replacement digest
+(requiring recorded replacement-receipt authority), quiesces an exact retired
+executable path, and deletes the artifacts only after canonical runtime,
+receipt, PATH, and reset reconciliation succeeds and before retiring the
+recovery inventory. Unknown names remain untouched and matching names with
+unprovable bytes retain recovery.
+
+The final ordering review retained incompatible recovery authority through
+post-commit retired-file cleanup. The installer now marks the runtime
+transaction committed, attempts both authenticated retired-file removals, and
+retires the recovery journal only after both exact paths are absent. A failed
+removal or journal deletion reports the exact deferred recovery path; a later
+run can authenticate and remove the orphan before closing the journal.
+
+Immediately before deleting each recovered retired artifact, recovery now
+rechecks that the exact path is still a non-reparse leaf and that its digest is
+the same already-authorized digest observed before process quiescence. Any race
+retains the journal and artifact instead of deleting changed bytes.
+
+The same immediate revalidation now covers every post-commit and final-cleanup
+deletion of the transaction's tracked retired binary and receipt. Final cleanup
+carries the artifact kind and authoritative old digest rather than trusting a
+stale safe-to-delete flag; it quiesces the exact executable path, rechecks leaf,
+reparse, and digest state, and preserves and reports anything changed.
+
+Rollback's shared file-restoration helper now applies the same rule to its own
+retired current file: after publication it quiesces an executable retirement,
+then immediately revalidates leaf, reparse, and the authoritative current
+digest before deletion. Restoring an originally absent file now uses the
+standard retired-name generator and validates the replacement digest, so a
+failed cleanup remains discoverable and authenticatable by pending recovery.
+
+Review assignments and findings are recorded by the coordinating agent after
+the required independent review rounds complete.
+
+| Review | Findings | Resolution | Fresh result |
+|---|---|---|---|
+| `/root/v045_code_review_1` | successor-daemon stop race; partial interrupted-recovery receipt validation; unsafe unconditional retired-copy cleanup | repeated bounded lifecycle stop, full recovery tuple validation, and preservation of unresolved authoritative retired files | correction required fresh review |
+| `/root/v045_plan_review_fast` | helper-only release gate and visible Windows fixture processes | added a complete hidden native Windows installer gate and hidden all fixture processes | correction required fresh review |
+| `/root/v045_final_logic_review` | commit ordering could leave an upgraded runtime stopped; E2E PATH/known-folder isolation and teardown were incomplete | kept rollback active through daemon restoration, made retired deletion post-commit best effort, isolated process PATH/profile state, asserted User PATH and serialization-lock cleanup, and made teardown failures observable | correction required fresh review |
+| `/root/v045_zero_review` | recovery did not authenticate the complete replacement receipt before journal deletion | journaled full receipt authority and the exact published replacement-receipt digest before reset preparation; commit recovery now requires an exact digest match | correction required fresh review |
+| `/root/v045_final_zero_2` | interrupted incompatible rollback could restore files without restoring installer-owned User PATH state | computed PATH ownership before mutation, journaled exact previous/published values with explicit null/empty representation, restored only an exact installer mutation, and bound receipt `pathManaged` to recovery authority | correction required fresh review |
+| `/root/v045_crosscut_zero` | a hard interruption could strand randomized retired binary/receipt siblings outside the persistent recovery inventory | recovery now performs a bounded exact-name scan, validates every candidate against authoritative binary/receipt digests, quiesces exact retired executables, and removes verified artifacts before deleting recovery authority | correction required fresh adversarial review |
+| `/root/v045_crosscut_final` | the happy path removed incompatible recovery authority immediately before retired-artifact cleanup, leaving a hard-interruption window | recovery journal deletion now occurs only after both authenticated retired artifacts are absent; deferred cleanup retains and reports the exact recovery path | correction required fresh adversarial review |
+| `/root/v045_crosscut_absolute` | orphan cleanup authenticated a retired file before process quiescence but did not revalidate immediately before deletion | cleanup now rechecks non-reparse leaf state and the exact authorized digest immediately before removal | correction required fresh adversarial review |
+| `/root/v045_absolute_zero` | normal post-commit/finally cleanup also relied on stale safe-to-delete state | every tracked retired runtime/receipt removal now immediately revalidates its type, reparse state, and authoritative digest after quiescence | correction required fresh adversarial review |
+| `/root/v045_done_review` | rollback helper cleanup still removed retired/replacement artifacts without the shared immediate revalidation and used an untracked `-remove-` name | both rollback branches now use standard retired names, quiesce executables, and immediately revalidate non-reparse leaf state plus authoritative digest before deletion | correction required fresh adversarial review |
+| `/root/v045_really_done` | none | n/a | CLEAN - zero findings |
+
+Final validation evidence:
+
+- hidden native Windows full installer replacement: 1 passed, 0 failed;
+- real official `v0.4.4` binary remained active in `mcp` mode until the
+  installer terminated only that exact installed-path process;
+- the native `v0.4.5` binary and complete receipt were published, the public
+  configurer configured one isolated client, and transaction artifacts were
+  absent;
+- `bun run typecheck`, Windows PowerShell AST parsing, `sh -n install.sh`, and
+  `git diff --check`: passed after the final production correction.
