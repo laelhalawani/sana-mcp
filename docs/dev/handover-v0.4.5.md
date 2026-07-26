@@ -150,12 +150,25 @@ mismatches. Behavioral fake-API coverage checks transient and persistent 404s,
 the hard-error paths, sleep counts, lookup counts, and absence of release
 mutation.
 
-## Required completion sequence
+## Completion state
 
-1. Commit and push the bounded post-create tag-visibility correction.
-2. Confirm the main-push release workflow skips because `v0.4.5` is already
-   published.
-3. Give the user the production command.
+- `v0.4.5` is published from
+  `032a470ca8a185ccf5b0597591042c9c969b97b5`.
+- The bounded post-create tag-visibility correction is pushed as
+  `bfbfbb697c6f4b55e64dec52d9f451987c18453c`.
+- Its automatic main-push workflow completed successfully after authorizing the
+  existing version and skipping every build and publication job.
+- The repository worktree was clean after the push.
+- A final local check found zero isolated `sana-mcp-e2e-*` roots, zero test Sana
+  processes, and removed the coordinator's stale GitHub Actions watcher.
+- No live user Sana runtime or data was terminated, migrated, or modified by
+  final validation.
+
+The production Windows command is:
+
+```powershell
+irm https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
+```
 
 ## Safety constraints
 
