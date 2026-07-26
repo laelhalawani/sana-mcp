@@ -1851,6 +1851,9 @@ the required independent review rounds complete.
 | `/root/v045_ci_path_zero` | none | n/a | CLEAN - zero findings |
 | `/root/v045_ci_module_review` | the pwsh 7 GitHub runner supplied its module path to the nested Windows PowerShell 5.1 test process, preventing the built-in `Get-FileHash` command from loading | the isolated harness now takes `PSModulePath` from the authoritative machine environment, fails if unavailable, and passes it explicitly to the nested installer process | correction required fresh review |
 | `/root/v045_ci_module_zero` | none | n/a | CLEAN - zero findings |
+| `/root/v045_publish_race_review` | immediate read-after-create tag visibility had no bounded retry | recommended a retry only for transient post-create 404s while preserving immutable tag validation | correction required fresh review |
+| `/root/v045_publish_race_zero` | the first correction retried every later tag verification and had only regex coverage | restored fail-fast ordinary verification, isolated the bounded retry to a successful creation POST, and added behavioral fake-API/error/count/mutation coverage | correction required fresh review |
+| `/root/v045_publish_race_final` | none | n/a | CLEAN - zero findings |
 
 Final validation evidence:
 
@@ -1867,3 +1870,6 @@ Final validation evidence:
 - the Windows PowerShell module-path correction resolved `Get-FileHash` in a
   native non-interactive process, passed typecheck/diff validation, and received
   a fresh zero-finding review.
+- the final bounded tag-visibility correction passed its workflow contract test,
+  behavioral publication test, typecheck, and diff validation; a fresh reviewer
+  returned zero findings.

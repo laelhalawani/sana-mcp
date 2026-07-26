@@ -344,6 +344,14 @@ test("release workflow binds every build and publish step to the authorized comm
     workflow,
     /verify_release_tag\(\)[\s\S]*resolve_tag_commit "\$RELEASE_TAG" "\$tag_probe_error"/,
   );
+  assert.match(
+    workflow,
+    /verify_created_release_tag\(\)[\s\S]*tag_probe=1[\s\S]*"\$tag_status" -ne 2[\s\S]*"\$tag_probe" -ge 10[\s\S]*sleep 1/,
+  );
+  assert.doesNotMatch(
+    workflow.match(/verify_release_tag\(\) \{[\s\S]*?\n\s+\}/)?.[0] ?? "",
+    /sleep/,
+  );
   assert.doesNotMatch(workflow, /repos\/\$GITHUB_REPOSITORY\/commits\/\$(?:release_tag|RELEASE_TAG)/);
   assert.match(
     workflow,
@@ -737,7 +745,10 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "  const requestedSha = args[args.indexOf('-f', args.indexOf('-f') + 1) + 1].slice('sha='.length);",
         "  if (process.env.FAKE_TAG_CREATE_FAIL === '1') { console.error('synthetic tag creation failure'); process.exit(1); }",
         "  const raceSha = process.env.FAKE_TAG_RACE_SHA;",
-        "  state.tagExists = true; state.tagSha = raceSha || requestedSha;",
+        "  state.tagExists = true; state.tagCreated = true;",
+        "  state.tagSha = raceSha || process.env.FAKE_CREATED_TAG_SHA || requestedSha;",
+        "  state.tagKind = process.env.FAKE_CREATED_TAG_KIND || 'commit';",
+        "  state.tagVisibilityMisses = Number(process.env.FAKE_TAG_VISIBILITY_MISSES ?? '0');",
         "  save(state);",
         "  if (raceSha) { console.error('synthetic concurrent tag creation'); process.exit(1); }",
         "  process.stdout.write('{}'); process.exit(0);",
@@ -745,9 +756,12 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         "if (args[0] === 'api' && args[1]?.includes('/git/ref/tags/')) {",
         "  if (process.env.FAKE_TAG_LOOKUP_ERROR === '1') { console.error('synthetic tag lookup failure'); process.exit(1); }",
         "  const state = load();",
+        "  state.tagLookups = (state.tagLookups ?? 0) + 1; save(state);",
+        "  if (state.tagCreated && process.env.FAKE_POST_CREATE_TAG_LOOKUP_ERROR === '1') { console.error('synthetic post-create tag lookup failure'); process.exit(1); }",
+        "  if ((state.tagVisibilityMisses ?? 0) > 0) { state.tagVisibilityMisses -= 1; save(state); console.error('HTTP 404: Not Found'); process.exit(1); }",
         "  if (state.tagExists === false) { console.error('HTTP 404: Not Found'); process.exit(1); }",
         "  if (state.tagKind === 'tag') process.stdout.write(`tag ${state.tagObjectSha}\\n`);",
-        "  else process.stdout.write(`commit ${state.tagSha ?? process.env.SOURCE_SHA}\\n`);",
+        "  else process.stdout.write(`${state.tagKind ?? 'commit'} ${state.tagSha ?? process.env.SOURCE_SHA}\\n`);",
         "  process.exit(0);",
         "}",
         "if (args[0] === 'api' && args[1]?.includes('/git/tags/')) {",
@@ -839,6 +853,10 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
         releaseLookupFailureAt?: number,
         releaseMalformedAt?: number,
         releaseDuplicateAt?: number,
+        tagVisibilityMisses = 0,
+        postCreateTagLookupFails = false,
+        createdTagSha?: string,
+        createdTagKind?: string,
       ) =>
         spawnSync("/bin/bash", ["-c", publishScript], {
           cwd: temporary,
@@ -854,6 +872,16 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
               : { FAKE_TAG_RACE_SHA: tagRaceSha }),
             ...(tagCreateFails ? { FAKE_TAG_CREATE_FAIL: "1" } : {}),
             ...(tagLookupFails ? { FAKE_TAG_LOOKUP_ERROR: "1" } : {}),
+            FAKE_TAG_VISIBILITY_MISSES: String(tagVisibilityMisses),
+            ...(postCreateTagLookupFails
+              ? { FAKE_POST_CREATE_TAG_LOOKUP_ERROR: "1" }
+              : {}),
+            ...(createdTagSha === undefined
+              ? {}
+              : { FAKE_CREATED_TAG_SHA: createdTagSha }),
+            ...(createdTagKind === undefined
+              ? {}
+              : { FAKE_CREATED_TAG_KIND: createdTagKind }),
             ...(tagObjectLookupFails
               ? { FAKE_TAG_OBJECT_LOOKUP_ERROR: "1" }
               : {}),
@@ -1047,6 +1075,135 @@ linuxOnlyTest("release publication resumes only a matching draft and re-verifies
             }),
           );
         };
+
+        await resetAbsentRelease();
+        const transientlyHiddenCreatedTag = execute(
+          `v${packageMetadata.version}`,
+          true,
+          undefined,
+          false,
+          false,
+          undefined,
+          undefined,
+          false,
+          undefined,
+          0,
+          undefined,
+          undefined,
+          undefined,
+          2,
+        );
+        assert.equal(
+          transientlyHiddenCreatedTag.status,
+          0,
+          transientlyHiddenCreatedTag.stderr,
+        );
+        const transientTagState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as {
+          draft: boolean;
+          sleepCalls: string[];
+          tagLookups: number;
+        };
+        assert.equal(transientTagState.draft, false);
+        assert.deepEqual(transientTagState.sleepCalls, ["1", "1"]);
+        assert.ok(transientTagState.tagLookups > 3);
+
+        await resetAbsentRelease();
+        const persistentlyHiddenCreatedTag = execute(
+          `v${packageMetadata.version}`,
+          true,
+          undefined,
+          false,
+          false,
+          undefined,
+          undefined,
+          false,
+          undefined,
+          0,
+          undefined,
+          undefined,
+          undefined,
+          10,
+        );
+        assert.notEqual(persistentlyHiddenCreatedTag.status, 0);
+        assert.match(
+          persistentlyHiddenCreatedTag.stderr,
+          /did not become visible after creation/,
+        );
+        const persistentTagState = JSON.parse(
+          await readFile(stateFile, "utf8"),
+        ) as {
+          exists: boolean;
+          sleepCalls: string[];
+          tagLookups: number;
+        };
+        assert.equal(persistentTagState.exists, false);
+        assert.equal(persistentTagState.tagLookups, 11);
+        assert.deepEqual(persistentTagState.sleepCalls, Array(9).fill("1"));
+        assert.deepEqual(await readdir(remoteAssets), []);
+
+        const assertHardPostCreateTagFailure = async (
+          expectedError: RegExp,
+          postCreateLookupFailure: boolean,
+          createdTagSha?: string,
+          createdTagKind?: string,
+        ) => {
+          await resetAbsentRelease();
+          const failure = execute(
+            `v${packageMetadata.version}`,
+            true,
+            undefined,
+            false,
+            false,
+            undefined,
+            undefined,
+            false,
+            undefined,
+            0,
+            undefined,
+            undefined,
+            undefined,
+            0,
+            postCreateLookupFailure,
+            createdTagSha,
+            createdTagKind,
+          );
+          assert.notEqual(failure.status, 0);
+          assert.match(failure.stderr, expectedError);
+          const failureState = JSON.parse(
+            await readFile(stateFile, "utf8"),
+          ) as {
+            exists: boolean;
+            sleepCalls?: string[];
+            tagLookups: number;
+          };
+          assert.equal(failureState.exists, false);
+          assert.equal(failureState.tagLookups, 2);
+          assert.deepEqual(failureState.sleepCalls ?? [], []);
+          assert.deepEqual(await readdir(remoteAssets), []);
+        };
+
+        await assertHardPostCreateTagFailure(
+          /Could not resolve release tag .* after creation/,
+          true,
+        );
+        await assertHardPostCreateTagFailure(
+          /invalid commit SHA/,
+          false,
+          "short",
+        );
+        await assertHardPostCreateTagFailure(
+          /does not resolve directly to a commit/,
+          false,
+          sourceCommit,
+          "blob",
+        );
+        await assertHardPostCreateTagFailure(
+          /Release tag moved after authorization/,
+          false,
+          "3333333333333333333333333333333333333333",
+        );
 
         await resetAbsentRelease();
         const transientlyHiddenRelease = execute(
