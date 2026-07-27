@@ -1106,6 +1106,16 @@ function isInteractive(
 async function showSyncProgress(
   presentation: ConfigurerPresentation,
 ): Promise<void> {
+  // The progress display is purely a nicety for interactive terminal users.
+  // It opens the local runtime (SQLite) and polls for up to ~12 seconds, which
+  // is unacceptable in non-interactive contexts (tests, CI, piped output) where
+  // it would block exit. Guard conservatively: require a real interactive
+  // terminal on BOTH stdout and stderr, and bail on any CI environment (where
+  // PTY allocation can make isTTY misleading). An explicit opt-out is also
+  // honored.
+  if (!process.stderr.isTTY || process.stdout.isTTY !== true) return;
+  if (process.env.CI === "true" || process.env.CI === "1") return;
+  if (process.env.SANA_MCP_NO_SYNC_DISPLAY === "1") return;
   const ui = presentation.ui;
   const stream = process.stderr;
   const maxWaitMs = 12_000;

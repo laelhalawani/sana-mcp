@@ -219,7 +219,7 @@ const meetingMetadataSchema = z
 const participantSchema = z
   .object({
     id: authoritativeIdSchema.optional(),
-    email: z.string().email(),
+    email: z.string().email().nullish(),
     displayName: z
       .string()
       .min(1)
@@ -875,7 +875,7 @@ export class SanaClient {
   }
 
   async getMeetingParticipants(assetId: string): Promise<
-    { id?: string; email: string; displayName: string; isHost: boolean }[]
+    { id?: string; email?: string | null; displayName: string; isHost: boolean }[]
   > {
     return this.trpcQuery(
       "meeting.getMeetingParticipants",

@@ -3168,7 +3168,7 @@ test("PowerShell deferred-install command quotes the executable and invokes it",
           ["-c", "command -v pwsh || command -v powershell.exe"],
           { encoding: "utf8" },
         ).stdout.trim();
-  if (!powershell) return;
+  if (process.platform !== "win32" || !powershell) return;
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const start = installer.indexOf("function Format-ExecutableCommand");
