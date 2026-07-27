@@ -12,6 +12,14 @@ not. If a task seems to require changing `.env`, stop and ask the user first and
 do not act until they confirm. There is no fallback or "cleanup" path that
 justifies touching `.env` without this confirmation.
 
+## Store credentials when explicitly requested
+
+When the user provides a credential and explicitly asks to store it, save it in
+`.env` under the requested environment-variable name. If the variable name is
+not clear, ask one short clarification question before writing it. Never print
+the credential, commit `.env`, or move it into Git configuration, credential
+helpers, source files, logs, or test fixtures.
+
 ## Required delivery workflow
 
 1. Read the affected code and understand the behavior before editing.
