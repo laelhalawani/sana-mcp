@@ -252,9 +252,9 @@ jobs:
                 "$1" __inspect --format json
               ' _ /execution/artifact > "inspect-$TARGET.json"
           else
-            [ "$("$ASSET" --version)" = "$PACKAGE_VERSION" ]
-            "$ASSET" --help >/dev/null
-            "$ASSET" __inspect --format json > "inspect-$TARGET.json"
+            [ "$("./$ASSET" --version)" = "$PACKAGE_VERSION" ]
+            "./$ASSET" --help >/dev/null
+            "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
           fi
           [ "$(sha256sum "$ASSET" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
           bun scripts/release.ts attest \
@@ -312,9 +312,9 @@ jobs:
           chmod +x "$ASSET"
           PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
           EXECUTED_SHA256="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
-          [ "$("$ASSET" --version)" = "$PACKAGE_VERSION" ]
-          "$ASSET" --help >/dev/null
-          "$ASSET" __inspect --format json > "inspect-$TARGET.json"
+          [ "$("./$ASSET" --version)" = "$PACKAGE_VERSION" ]
+          "./$ASSET" --help >/dev/null
+          "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
           [ "$(shasum -a 256 "$ASSET" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
           bun scripts/release.ts attest \
             --target "$TARGET" \
