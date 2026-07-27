@@ -57,6 +57,7 @@ function state(patch: Partial<SyncState> = {}): SyncState {
 test("post-start authorization uses refreshed session and sync state", () => {
   const staleClient = {
     hasAuthCookie: () => true,
+    pendingSignInChallenge: () => null,
     sessionVersion: () => ({
       generation: 0,
       publicationToken: null,
@@ -70,6 +71,7 @@ test("post-start authorization uses refreshed session and sync state", () => {
 
   const refreshedClient = {
     hasAuthCookie: () => true,
+    pendingSignInChallenge: () => null,
     sessionVersion: () => ({
       generation: 0,
       publicationToken: null,
@@ -96,11 +98,46 @@ test("post-start authorization rejects a newly removed session", () => {
     () =>
       ({
         hasAuthCookie: () => false,
+        pendingSignInChallenge: () => null,
         sessionVersion: () => ({
           generation: 0,
           publicationToken: null,
           userId: null,
           workspaceId: null,
+        }),
+      }) as SanaClient,
+  );
+  expect(refreshed).toEqual({ kind: "signed-out" });
+});
+
+test("post-start authorization treats a pending sign-in challenge as signed out", () => {
+  const refreshed = refreshedAuthorization(
+    {
+      getSyncState: () =>
+        state({
+          phase: "synced",
+          auth_generation: 2,
+          auth_publication_token:
+            "22222222-2222-4222-8222-222222222222",
+          auth_user_id: "user-a",
+          auth_workspace_id: "workspace-a",
+          cache_user_id: "user-a",
+          cache_workspace_id: "workspace-a",
+        }),
+      reconcileAuthState: () => ({ kind: "current", generation: 2 }),
+    },
+    () =>
+      ({
+        hasAuthCookie: () => true,
+        pendingSignInChallenge: () => ({
+          email: "pending@example.test",
+        }),
+        sessionVersion: () => ({
+          generation: 2,
+          publicationToken:
+            "22222222-2222-4222-8222-222222222222",
+          userId: "user-a",
+          workspaceId: "workspace-a",
         }),
       }) as SanaClient,
   );
@@ -115,6 +152,7 @@ test("post-start authorization retries a racing persisted session snapshot", () 
   const client = (nextGeneration: number, token: string) =>
     ({
       hasAuthCookie: () => true,
+      pendingSignInChallenge: () => null,
       sessionVersion: () => ({
         generation: nextGeneration,
         publicationToken: token,
@@ -160,6 +198,7 @@ test("post-start authorization blocks an active publication instead of confirmin
   const token = "11111111-1111-4111-8111-111111111111";
   const pendingClient = {
     hasAuthCookie: () => true,
+    pendingSignInChallenge: () => null,
     sessionVersion: () => ({
       generation: 1,
       publicationToken: token,
@@ -351,6 +390,203 @@ test("help preserves a healthy paired authentication issue", () => {
           SANA_DATA_DIR: root,
           SANA_TRANSCRIPTS_DIR: path.join(root, "transcripts"),
           SANA_BASE_URL: "https://help-auth-issue.example.test",
+          SANA_SEMANTIC: "0",
+        },
+      },
+    );
+    expect(child.status, child.stderr).toBe(0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("public data dispatch renders existing signed-out guidance for a pending challenge", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-dispatch-pending-"));
+  try {
+    const child = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `
+          const fs = await import("node:fs");
+          const path = await import("node:path");
+          const dataDir = process.env.SANA_DATA_DIR;
+          if (!dataDir) throw new Error("missing isolated data directory");
+          fs.writeFileSync(
+            path.join(dataDir, "session.json"),
+            JSON.stringify({
+              cookies: { "sana-ai-session": "old-session-cookie" },
+              userId: "user-old",
+              workspaceId: "workspace-old",
+              email: "old@example.test",
+              authenticatedOrigin: process.env.SANA_BASE_URL,
+              pendingLogin: {
+                email: "pending@example.test",
+                csrfToken: "private-pending-token",
+              },
+              generation: 2,
+              publicationToken:
+                "22222222-2222-4222-8222-222222222222",
+            }),
+            { mode: 0o600 },
+          );
+          const { SanaStore } = await import("./src/store/db.ts");
+          const store = new SanaStore();
+          store.updateSyncState({
+            phase: "synced",
+            blocking: 0,
+            auth_pending: 0,
+            auth_generation: 2,
+            auth_publication_token:
+              "22222222-2222-4222-8222-222222222222",
+            auth_user_id: "user-old",
+            auth_workspace_id: "workspace-old",
+            cache_user_id: "user-old",
+            cache_workspace_id: "workspace-old",
+          });
+          store.upsertMeeting({
+            id: "old-private-meeting",
+            name: "Old private meeting",
+            source: "sana-ai:meeting",
+            created_at_ms: 1,
+          });
+          store.close();
+
+          const { sana } = await import("./src/tools/dispatch.ts");
+          const output = await sana("list");
+          const expected =
+            'You are not logged in. Run meeting_transcripts("login", {"email":"you@example.com"}) to sign in.';
+          if (output !== expected || output.includes("Old private meeting")) {
+            throw new Error("pending challenge exposed data or rendered expiry");
+          }
+        `,
+      ],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SANA_DATA_DIR: root,
+          SANA_TRANSCRIPTS_DIR: path.join(root, "transcripts"),
+          SANA_BASE_URL: "https://dispatch-pending.example.test",
+          SANA_SEMANTIC: "0",
+        },
+      },
+    );
+    expect(child.status, child.stderr).toBe(0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("status rejects a pending challenge introduced by its stable pre-daemon snapshot", () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-status-pending-race-"),
+  );
+  try {
+    const child = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `
+          const token =
+            "11111111-1111-4111-8111-111111111111";
+          const instanceId =
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+          const origin = process.env.SANA_BASE_URL;
+          if (!origin) throw new Error("missing isolated Sana origin");
+
+          const { SanaStore } = await import("./src/store/db.ts");
+          const store = new SanaStore();
+          store.updateSyncState({
+            phase: "downloading",
+            message: "old cache sync in progress",
+            meetings_total: 1,
+            transcripts_total: 1,
+            transcripts_done: 0,
+            blocking: 1,
+            auth_pending: 0,
+            auth_generation: 1,
+            auth_publication_token: token,
+            auth_user_id: "user-race",
+            auth_workspace_id: "workspace-race",
+            cache_user_id: "user-race",
+            cache_workspace_id: "workspace-race",
+            sync_issue_code: "SYNC_SENTINEL",
+            sync_issue_cause: "TEST_SENTINEL",
+            sync_issue_message:
+              "daemon startup must not clear this sentinel",
+            daemon_pid: process.pid,
+            daemon_heartbeat_ms: Date.now(),
+            daemon_instance_id: instanceId,
+          });
+          store.close();
+
+          const { publishDaemonControl } = await import(
+            "./src/sync/control.ts"
+          );
+          publishDaemonControl(process.pid, { instanceId });
+
+          const { SanaClient } = await import("./src/sana/client.ts");
+          const session = {
+            cookies: { "sana-ai-session": "old-session-cookie" },
+            userId: "user-race",
+            workspaceId: "workspace-race",
+            email: "old@example.test",
+            authenticatedOrigin: origin,
+            generation: 1,
+            publicationToken: token,
+          };
+          const initial = new SanaClient({
+            ...session,
+            pendingLogin: null,
+          });
+          const pending = new SanaClient({
+            ...session,
+            pendingLogin: {
+              email: "pending@example.test",
+              csrfToken: "private-pending-token",
+            },
+          });
+          let loadCalls = 0;
+          SanaClient.load = () => {
+            loadCalls++;
+            return loadCalls === 1 ? initial : pending;
+          };
+
+          const { sana } = await import("./src/tools/dispatch.ts");
+          const output = await sana("status");
+          const expected =
+            'You are not logged in. Run meeting_transcripts("login", {"email":"you@example.com"}) to sign in.';
+          if (output !== expected || loadCalls !== 3) {
+            throw new Error(
+              "status did not authorize from the pending stable snapshot",
+            );
+          }
+
+          const verified = new SanaStore();
+          const verifiedState = verified.getSyncState();
+          verified.close();
+          if (
+            verifiedState.sync_issue_code !== "SYNC_SENTINEL" ||
+            verifiedState.sync_issue_cause !== "TEST_SENTINEL" ||
+            verifiedState.sync_issue_message !==
+              "daemon startup must not clear this sentinel"
+          ) {
+            throw new Error(
+              "status reached daemon startup before rejecting pending auth",
+            );
+          }
+        `,
+      ],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SANA_DATA_DIR: root,
+          SANA_TRANSCRIPTS_DIR: path.join(root, "transcripts"),
+          SANA_BASE_URL: "https://status-pending-race.example.test",
           SANA_SEMANTIC: "0",
         },
       },

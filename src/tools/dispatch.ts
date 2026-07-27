@@ -174,6 +174,9 @@ export function refreshedAuthorization(
     };
   }
   const { client, state } = snapshot;
+  if (client.pendingSignInChallenge() !== null) {
+    return { kind: "signed-out" };
+  }
   const session = sessionInfo(client, state);
   if (!session.hasCookie) return { kind: "signed-out" };
   if (!session.loggedIn) return { kind: "expired" };
@@ -1069,6 +1072,9 @@ export async function sana(tool: string, args: Record<string, unknown> = {}): Pr
   try {
     let s = store.getSyncState();
     let sess = sessionInfo(client, s);
+    if (client.pendingSignInChallenge() !== null) {
+      return `You are not logged in. ${LOGIN_HINT}`;
+    }
     if (!sess.hasCookie) {
       return `You are not logged in. ${LOGIN_HINT}`;
     }
@@ -1081,6 +1087,9 @@ export async function sana(tool: string, args: Record<string, unknown> = {}): Pr
         return `Authentication is incomplete (${beforeStart.code}): ${asSentence(beforeStart.message)} Meeting tools remain blocked.`;
     }
     client = beforeStart.client;
+    if (client.pendingSignInChallenge() !== null) {
+      return `You are not logged in. ${LOGIN_HINT}`;
+    }
     const beforeVersion = beforeStart.client.sessionVersion();
     if (
       beforeVersion.publicationToken === null ||

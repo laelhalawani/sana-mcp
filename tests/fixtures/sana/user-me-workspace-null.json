@@ -1,0 +1,21 @@
+{
+  "provenance": {
+    "classification": "observed-shape regression fixture",
+    "observedAt": "2026-07-26",
+    "evidence": "A user-provided live candidate run proved that user.me returned workspace as null through the exact response-validation error.",
+    "limitations": "No raw user.me response was captured. The tRPC envelope and every identity value below are reconstructed and synthetic."
+  },
+  "response": {
+    "result": {
+      "data": {
+        "user": {
+          "id": "synthetic-user",
+          "email": "synthetic@example.test",
+          "displayName": "Synthetic User",
+          "lastUsedWorkspaceId": "synthetic-workspace"
+        },
+        "workspace": null
+      }
+    }
+  }
+}

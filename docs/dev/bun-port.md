@@ -1,18 +1,19 @@
 ---
 status: research
 scope: non-binding Bun executable feasibility study
-last_verified: 2026-07-24
+last_verified: 2026-07-26
 authority: revalidate before use; remediation-plan.md controls implementation
 ---
 
 # sana-mcp Bun Port - Technical Feasibility Study
 
-Status: July 2026. All runtime versions, target lists, and behavior claims
+Status: July 2026. Runtime versions, target lists, and upstream behavior claims
 were web-verified this month against bun.com/docs, the Bun GitHub releases
-and issues, and the transformers.js / sqlite-vec upstream sources. Nothing
-here is taken from memory - Bun moves fast and several old caveats
-(macOS loadExtension segfault, no cross-compile, no .node embedding) have
-since been fixed.
+and issues, and the transformers.js / sqlite-vec upstream sources. The
+Windows x64 build-host constraint is instead based on the local execution
+evidence stated in section 1.2. Nothing here is taken from memory - Bun moves
+fast and several old caveats (macOS loadExtension segfault, no cross-compile,
+no .node embedding) have since been fixed.
 
 Goal: same as the Go and Rust studies - replace the
 `git clone && npm install && npm run build && node dist/mcp.js` flow with a
@@ -20,7 +21,7 @@ single self-contained binary installed by `curl <url> | sh` (Linux/macOS)
 and `irm <url> | iex` (Windows). The appeal of Bun specifically: **keep the
 existing TypeScript codebase** and compile it, instead of rewriting in Go or
 Rust. This study evaluates whether that low-effort path actually reaches the
-one-binary, all-six-targets goal, and how it compares to the Go baseline
+one-binary, seven-published-target goal, and how it compares to the Go baseline
 (documented in `go-port.md`, ~10-18 MB binary, recommended) and the Rust
 baseline (`rust-port.md`, ~8-15 MB).
 
@@ -29,11 +30,13 @@ baseline (`rust-port.md`, ~8-15 MB).
 ## TL;DR / verdict
 
 **CONDITIONAL GO - the lowest-effort path, at the cost of binary size.**
-Bun can ship sana-mcp as a single `curl | sh`-installed binary across all
-six OS/arch targets from one free GitHub Actions Linux runner, with **no
-rewrite** - only a mechanical swap of `better-sqlite3` for the built-in
-`bun:sqlite` and dropping the dead `playwright` dependency. That is days of
-work, versus weeks for the Go/Rust ports.
+Bun can ship sana-mcp as a single `curl | sh`-installed binary across the
+current seven-target release contract with **no rewrite**. The implemented
+runtime already uses built-in `bun:sqlite`; the former browser module,
+Playwright dependency, and browser investigation scripts are no longer in the
+repository. Builds are split across native Linux, macOS, and
+Windows runners; the Windows x64 artifact is not produced safely by the Linux
+runner. That is days of work, versus weeks for the Go/Rust ports.
 
 The catch is size: a compiled Bun binary is **~55-95 MB** (the whole Bun
 runtime is embedded), roughly **4-6x larger than Go** (~10-18 MB) and
@@ -42,11 +45,11 @@ that is a real but not disqualifying cost - many popular CLIs ship in this
 range. Runtime idle RSS (~30-60 MB) beats Node (~50-90 MB) but loses to Go
 (~15-30 MB).
 
-The base app (MCP/stdio + SQLite + FTS5 + Sana HTTP client + CLI + daemon)
-compiles with **zero native dependencies**. The two optional features
-(sqlite-vec vectors and on-device MiniLM embeddings) need the same
-opt-in sidecar treatment the Go study recommends - they do not block the
-default install.
+The standalone app (MCP/stdio + SQLite + FTS5 + Sana HTTP client + CLI +
+daemon) compiles with **zero native dependencies** and intentionally advertises
+keyword search only. Source runs may install the optional `sqlite-vec` and
+Transformers.js dependencies for semantic search; those packages and that
+capability are not bundled into the current standalone release.
 
 If minimizing effort is the top priority, Bun wins. If minimizing binary
 size / footprint is the top priority, Go remains the recommendation.
@@ -73,9 +76,11 @@ size / footprint is the top priority, Go remains the recommendation.
   and surfaced via `Bun.file()` / Node `fs` APIs. `.node` native addons can
   also be embedded (see section 3).
 
-### 1.1 Cross-compile targets (verified from bun.com/docs/bundler/executables)
+### 1.1 Compile targets (verified from bun.com/docs/bundler/executables)
 
-All six sana-mcp targets have a `--target` string:
+Bun documents the following `--target` strings. The current sana-mcp release
+contract publishes seven of them: four Linux targets, two macOS targets, and
+`bun-windows-x64`. Windows ARM64 remains outside the verified release matrix.
 
 | Target string | OS | Arch | Libc | Notes |
 |---|---|---|---|---|
@@ -95,22 +100,46 @@ baseline/modern distinction.)
 **Target segments can appear in any order** as long as they are `-`-
 delimited, so `bun-linux-x64`, `bun-x64-linux`, etc. are all accepted.
 
-### 1.2 The one target to verify in CI: `bun-windows-arm64`
+### 1.2 Proven Windows x64 build-host constraint
 
-`bun-windows-arm64` **is listed in the official target table** and there are
-real GitHub Actions workflows that produce Windows ARM64 executables with
-it (e.g. the `plannotator` repo). However it is the least battle-tested
-target: Bun issue #25346 tracks cross-compile cache bugs specifically
-affecting `--target=bun-windows-arm64`, and several community compatibility
-matrices mark it as a known gap with workarounds like "use an x64 Windows
-runner". None of Linux-x64, Linux-arm64, macOS-x64, macOS-arm64, or
-Windows-x64 have this cloud over them.
+Standalone builds retain `bytecode: true`. With the pinned Bun 1.3.14, an
+observed bytecode Windows PE compiled under WSL using Linux Bun exited with
+code 3 on Windows after Bun reported `Segmentation fault at address 0xDA0`;
+`0xDA0` is the reported fault address, not the process exit status. The same
+source and build configuration, compiled separately by native Windows x64 Bun,
+exited with code 0 and printed the version. These observations came from
+separate builds; they do not establish byte-identical artifacts. This local
+execution evidence supports a narrow release rule: canonical
+`bun-windows-x64` builds require `process.platform === "win32"` and
+`process.arch === "x64"` and a source checkout on a native Windows filesystem.
+In a later end-to-end reproduction, native Windows Bun invoked from the
+repository's `\\wsl.localhost\...` UNC path emitted a valid-looking binary
+whose compatible-update lifecycle repeatedly failed with a SQLite disk I/O
+error. Copying the same source to NTFS, installing the frozen dependencies, and
+building with the same native Bun and configuration passed that lifecycle.
 
-**Action:** emit `bun-windows-arm64` from the Linux runner like the others,
-but add a native windows-arm64 GitHub Actions runner as a fallback that
-builds without `--target` (compiling on-host) if the cross-compiled artifact
-is buggy. Windows ARM64 is a small minority of installs, so a best-effort
-target plus a fallback is acceptable.
+Both canonical build entrypoints enforce that rule before creating an output
+artifact or its parent directory. There is no environment or CLI override.
+Developers building `bun-windows-x64` must invoke the build from native
+PowerShell with native x64 Windows Bun from an NTFS checkout; Linux Bun, WSL
+Bun, and Windows Bun invoked through a UNC path, mapped network drive,
+`SUBST` drive, junction, symlink, or other reparse-backed source alias fail
+closed. The native guard resolves the directory by handle, rejects reparse
+points in the lexical path, verifies both lexical and resolved DOS devices,
+and requires a fixed NTFS volume. It obtains the Windows directory from
+`GetSystemWindowsDirectoryW`, verifies the canonical non-reparse PowerShell
+helper, removes case-insensitive reserved environment collisions, and binds
+the helper's returned handle path to the requested source root. Ordinary
+extended DOS paths remain valid when they prove that backing. This evidence
+does not establish a general
+prohibition on Bun cross-compilation, so the supported non-Windows targets
+retain their existing behavior.
+
+`bun-windows-arm64` is documented by Bun, but it is not part of sana-mcp's
+current seven-target release contract. Bun issue #25346 also records
+cross-compile cache problems for that target. The Windows x64 result above is
+not evidence for an ARM64 build policy; Windows ARM64 must be separately
+validated before it is added to the release matrix.
 
 ### 1.3 Binary size - the headline cost
 
@@ -138,9 +167,10 @@ alternative.
 ## 2. Native dependencies under `--compile` - the crux
 
 This is what determines whether the "keep the TS code" pitch holds. sana-mcp
-has four native-ish dependencies today: `better-sqlite3`, `sqlite-vec`,
-`@huggingface/transformers` (ONNX Runtime), and `playwright`. They sort
-cleanly into "drop", "swap for built-in", and "ship alongside".
+originally had four native-ish dependency concerns: `better-sqlite3`,
+`sqlite-vec`, `@huggingface/transformers` (ONNX Runtime), and `playwright`.
+The first and last have already been removed; the semantic packages are
+optional source-only dependencies.
 
 ### 2.1 `better-sqlite3` -> `bun:sqlite` (SWAP, mechanical) - the win
 
@@ -253,16 +283,12 @@ you include the embeddings code path. Because the model weights themselves
 are **downloaded lazily to `data/models/`** (see section 4), they do not
 bloat the binary.
 
-### 2.4 `playwright` - DROP (confirmed dead code)
+### 2.4 `playwright` - removed
 
-`grep` confirms `playwright` is imported only in `src/browser.ts`, and
-**nothing in `src/` imports `browser.ts`**. Its only callers are dev
-scripts under `scripts/` (`investigate.mjs`, `record.mjs`, `validate.mjs`,
-`bootstrap-session.mjs`, `paginate.mjs`). The live login path does not use
-it. Remove `playwright` from `dependencies` (keep it as a devDependency or
-in a separate `package.json` for the dev scripts). This removes a large,
-browser-binary-heavy dependency that would otherwise severely complicate
-`--compile`.
+The implemented repository has no `src/browser.ts`, no Playwright package,
+and no browser investigation/recording scripts. `scripts/` contains only the
+release builder. Login uses the Sana HTTP client directly; Playwright is
+neither a runtime nor a development dependency.
 
 ---
 
@@ -334,52 +360,58 @@ clear win over the status quo; Go is a further win over Bun.
 |---|---|
 | `src/store/db.ts` | Swap `better-sqlite3` import for `bun:sqlite`; `.pragma()` -> `db.run("PRAGMA ...")`; `Database.Database` type -> `Database`; audit `.get()` null vs undefined. SQL, FTS5, transactions unchanged. |
 | `src/semantic/semantic.ts` | Type import swap; force Transformers.js WASM backend under compile; `db.loadExtension` for sqlite-vec (was `sqliteVec.load(db)`). Logic unchanged. |
-| `src/browser.ts` | Delete from runtime path (dead code). |
+| former `src/browser.ts` | Completed: module and browser scripts removed. |
 | `src/sana/client.ts`, `cookies.ts` | None. `fetch` + manual redirects + cookie jar are pure TS and run unchanged on Bun. |
 | `src/mcp.ts`, `src/tools/*` | None. `@modelcontextprotocol/sdk` works on Bun. |
 | `src/cli.ts` | None. `commander` works on Bun. |
 | `src/sync/spawn.ts`, `lock.ts`, `daemon.ts` | None. `child_process.spawn({detached:true})` + `unref()`, `process.kill(pid, 0)`, SQLite heartbeat - all standard, all work on Bun. |
 | `src/config.ts` | Re-point `DATA_DIR` to a user-writable location independent of the binary's install path (so a compiled binary run from `/usr/local/bin` still finds `~/.sana/`). |
-| `package.json` | Remove `playwright` and `better-sqlite3` from `dependencies`; move `@huggingface/transformers` + `sqlite-vec` to optional. Add Bun compile scripts. |
+| `package.json` | Completed: Playwright and `better-sqlite3` removed; Transformers.js and `sqlite-vec` are optional source dependencies; canonical compile scripts are present. |
 
 The total diff is small - mostly one file (`db.ts`) plus config/dependency
 housekeeping. No module of the runtime surface needs rewriting.
 
 ---
 
-## 6. CI and packaging (free, one runner)
+## 6. CI and packaging
 
-A single GitHub Actions job on an `ubuntu-latest` runner produces all six
-targets via a matrix:
+The release workflow produces the current seven-target contract on
+architecture-appropriate native runners:
 
-```yaml
-strategy:
-  matrix:
-    target:
-      - bun-linux-x64
-      - bun-linux-arm64
-      - bun-darwin-x64
-      - bun-darwin-arm64
-      - bun-windows-x64
-      - bun-windows-arm64
-steps:
-  - uses: oven-sh/setup-bun@v1
-    with: { bun-version: 1.3.14 }
-  - run: bun install --production
-  - run: bun build src/cli.ts --compile --minify --bytecode --sourcemap
-         --target=${{ matrix.target }} --outfile sana-${{ matrix.target }}
-  - uses: softprops/action-gh-release@v2
-```
+- Linux x64 and x64-musl build on Linux x64; Linux ARM64 and ARM64-musl build
+  on Linux ARM64.
+- macOS x64 and ARM64 build on native macOS runners for their architectures.
+- `bun-windows-x64` builds on native Windows x64. The canonical build command
+  rejects Linux/WSL and non-x64 Windows hosts, plus UNC, mapped, substituted,
+  and reparse-backed source aliases, before output mutation.
 
-Plus an optional `bun-linux-arm64-musl` (and `bun-linux-x64-musl`) for
-Alpine users, and a native windows-arm64 fallback job that builds without
-`--target` (compiling on-host) in case the cross-compiled arm64 artifact
-hits issue #25346.
+Every standalone build continues to use Bun bytecode. The host restriction is
+deliberately specific to `bun-windows-x64`; it does not change non-Windows
+target behavior or assert that all Bun cross-compilation is unsafe. Windows
+ARM64 is not currently published. Release attestation records a digest from a
+private execution snapshot, executes that same file identity through an
+inherited descriptor on Linux/macOS or a pinned read-only file mount for the
+musl container, requires the post-execution digest to remain identical, and
+refuses to attest if the release artifact no longer has those bytes. On
+Windows the smoke step holds a read-only file lease that excludes writes and
+deletion for the complete hash, execution, and attestation interval. Assembly
+requires the exact ordered target matrix, current compatibility epoch and
+protocols, and per-target attested digest evidence. Publication opens every
+verified asset once, binds its descriptor to the immutable assembled digest
+tuple, and uploads through those already-open descriptors with authoritative
+asset names; later pathname replacement cannot substitute upload bytes. The
+upload helper validates the raw release upload template against the exact
+repository, release id, path, and GitHub-context HTTPS origin before it
+constructs an authorization header or performs network I/O. The publication
+coordinator captures validator output only after a zero exit and exact
+canonical inventory check, pins the release's positive numeric id, performs
+subsequent release and asset operations through repository-qualified
+id-specific API paths, and revalidates that same draft immediately before and
+after the final id-specific publication update.
 
-Installers are the same ~30-line `install.sh` / `install.ps1` described in
-`go-port.md`: detect OS/arch, fetch the matching asset from GitHub Releases,
-drop on `PATH`. `curl <url> | sh` and `irm <url> | iex` both work. No C
-toolchain, no per-target build environment - cross-compile handles it.
+Installers select the matching verified release asset: detect OS/arch, fetch
+the asset from GitHub Releases, and put it on `PATH`. `curl <url> | sh` and
+`irm <url> | iex` both work. No C toolchain is required for the base runtime.
 
 ---
 
@@ -393,12 +425,17 @@ toolchain, no per-target build environment - cross-compile handles it.
    still the reality. **Mitigation:** none within Bun; if size is
    disqualifying, choose Go/Rust.
 
-2. **`bun-windows-arm64` cross-compile is the least reliable target.** It is
-   in the official target list and works in some real CI workflows, but
-   issue #25346 and several community matrices flag it as buggy. The other
-   five targets are solid. **Mitigation:** ship it from the Linux runner but
-   keep a native windows-arm64 fallback runner; arm64 Windows is a small
-   share of installs.
+2. **Windows standalone builds need target-specific host validation.** With
+   Bun 1.3.14, the observed bytecode Windows PE compiled under WSL using Linux
+   Bun exited with code 3 on Windows after Bun reported
+   `Segmentation fault at address 0xDA0`. The same source and build
+   configuration, compiled separately by native Windows x64 Bun, exited with
+   code 0 and printed the version. These observations came from separate
+   builds; they do not establish byte-identical artifacts. **Mitigation:**
+   build the canonical Windows x64 artifact only with native x64 Windows Bun
+   from an NTFS checkout and enforce the host and source-root requirements
+   before output mutation. Windows ARM64 remains outside the release matrix
+   pending its own validation.
 
 3. **ONNX Runtime native backend is awkward under `--compile`.** Embedding
    `.node` files is now supported, but `onnxruntime-node` also dynamically
@@ -429,14 +466,14 @@ Secondary (non-blocking):
 
 ## 8. Where Bun sits vs Go and Rust for sana-mcp's goals
 
-sana-mcp's stated goals, ranked: (1) single one-command binary across all
-six targets, (2) optional lightweight embeddings, (3) low effort.
+sana-mcp's stated goals, ranked: (1) single one-command binary across the
+seven published targets, (2) optional lightweight embeddings, (3) low effort.
 
 | Goal | Bun | Go (`go-port.md`) | Rust (`rust-port.md`) |
 |---|---|---|---|
 | Single `curl \| sh` / `irm \| iex` binary | yes | yes | yes |
-| All 6 OS/arch targets from one Linux runner | yes (windows-arm64 least reliable) | yes (trivial, `CGO_ENABLED=0`) | yes |
-| Default base binary has zero native deps | yes (`bun:sqlite` + drop playwright) | yes (modernc pure-Go) | yes (rusqlite bundled) |
+| Seven published target artifacts | yes (native runners; Windows x64 requires native Windows x64) | yes | yes |
+| Default base binary has zero native deps | yes (`bun:sqlite`; Playwright absent) | yes (modernc pure-Go) | yes (rusqlite bundled) |
 | sqlite-vec (optional semantic) | `loadExtension`, embed+extract | blank import, pure-Go | load_extension, bundled |
 | On-device MiniLM (optional semantic) | WASM backend, or sidecar | CGO sidecar (onnxruntime_go) | ort crate sidecar |
 | **Binary size (base)** | **~55-95 MB** | ~10-18 MB | ~8-15 MB |
@@ -448,9 +485,9 @@ six targets, (2) optional lightweight embeddings, (3) low effort.
 
 ### Single biggest advantage: effort
 
-Bun reuses the entire TypeScript codebase. The only substantive code edit is
-the `better-sqlite3` -> `bun:sqlite` swap in `src/store/db.ts` (mechanical),
-plus deleting the dead `playwright` import and re-pointing `DATA_DIR`. The
+Bun reuses the entire TypeScript codebase. The database, dependency, and
+data-directory migration described by this study has already been completed.
+The
 MCP server, the Sana tRPC client, the daemon, the CLI, the SQL schema, FTS5
 queries, and the embeddings pipeline all carry over verbatim. Go and Rust
 require rewriting every one of those modules from scratch.
@@ -466,11 +503,12 @@ noticeable-but-acceptable cost.
 ### Is it the lowest-risk fastest path?
 
 **Yes - if effort is the dominant axis and binary size is acceptable.** Bun
-is unambiguously the fastest path to a one-command binary across all six
-targets, with the lowest rewrite risk, because it preserves the codebase.
-The base app compiles with zero native dependencies once `better-sqlite3` is
-swapped and `playwright` dropped, and the two optional features map onto
-clean sidecar / WASM patterns.
+is unambiguously the fastest path to a one-command binary across all seven
+published targets, with the lowest rewrite risk, because it preserves the
+codebase. The standalone app now compiles with zero native dependencies and
+intentionally ships keyword search only. Optional semantic search remains
+available to source runs instead of relying on an unimplemented standalone
+sidecar or WASM packaging claim.
 
 **No - if binary size or minimum idle RSS is the dominant axis.** Go remains
 the recommendation when the ~10-18 MB binary and ~15 MB idle RSS matter more

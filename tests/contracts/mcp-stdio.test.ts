@@ -51,6 +51,7 @@ const SET_IDLE_LISTING = fileURLToPath(
 const FIXED_NOW_MS = Date.parse("2026-01-03T12:05:00Z");
 const temporaryRoots: string[] = [];
 const liveDataAliasRoots = new Set<string>();
+let disposableAliasTargetRoot: string | undefined;
 const PROCESS_TIMEOUT_MS = 10_000;
 const CLEANUP_TIMEOUT_MS = 2_000;
 const BUILD_PHASE_BUDGET_MS = 30_000;
@@ -109,6 +110,13 @@ interface McpResult extends ProcessResult {
 
 type SemanticFailure = "unavailable" | "error" | "non-error";
 
+function dedicatedDisposableAliasTarget(): string {
+  disposableAliasTargetRoot ??= mkdtempSync(
+    path.join(tmpdir(), "sana-mcp-contract-alias-target-"),
+  );
+  return disposableAliasTargetRoot;
+}
+
 function fixture(name: string): string {
   return readFileSync(new URL(`../fixtures/contracts/${name}`, import.meta.url), "utf8").replace(
     /\r?\n$/,
@@ -145,6 +153,7 @@ function isolatedEnvironment(
     SANA_TRANSCRIPTS_DIR: path.join(dataDir, "transcripts"),
     SANA_SEMANTIC: semanticRequested ? "1" : "0",
     SANA_TEST_FORBIDDEN_DATA_DIR: path.join(ROOT, "data"),
+    SANA_TEST_FORBIDDEN_DATA_ALIAS_TARGET: dedicatedDisposableAliasTarget(),
     SANA_TEST_DAEMON_PID: String(process.pid),
     SANA_TEST_FIXED_NOW_MS: String(FIXED_NOW_MS),
     NO_COLOR: "1",
@@ -918,21 +927,46 @@ async function runAuthDispatch(
 
 afterAll(() => {
   for (const dir of temporaryRoots) rmSync(dir, { recursive: true, force: true });
+  if (disposableAliasTargetRoot !== undefined) {
+    rmSync(disposableAliasTargetRoot, { recursive: true, force: true });
+  }
 });
 
 describe.serial("MCP stdio contract", () => {
   test("isolates live data and blocks the app's network and daemon paths", async () => {
     const dataDir = createDataDir();
-    const canCreateRepositoryAlias =
-      process.platform !== "win32" || !ROOT.startsWith("\\\\");
-    if (canCreateRepositoryAlias) {
+    const forbiddenDirectory = dedicatedDisposableAliasTarget();
+    const canCreateLiveDataAlias =
+      process.platform !== "win32" || !forbiddenDirectory.startsWith("\\\\");
+    if (canCreateLiveDataAlias) {
       symlinkSync(
-        path.join(ROOT, "data"),
+        forbiddenDirectory,
         path.join(dataDir, "live-data-alias"),
         process.platform === "win32" ? "junction" : "dir"
       );
       liveDataAliasRoots.add(dataDir);
     }
+
+    const missingAliasTargetEnvironment = isolatedEnvironment(dataDir);
+    delete missingAliasTargetEnvironment.SANA_TEST_FORBIDDEN_DATA_ALIAS_TARGET;
+    const missingAliasTarget = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        "--preload",
+        NETWORK_PRELOAD,
+        "-e",
+        "process.exit(0)",
+      ],
+      cwd: ROOT,
+      env: missingAliasTargetEnvironment,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(missingAliasTarget.exitCode).not.toBe(0);
+    expect(missingAliasTarget.stderr.toString()).toContain(
+      "SANA_TEST_FORBIDDEN_DATA_ALIAS_TARGET is required",
+    );
+
     const result = await runProcess([GUARD_PROBE], dataDir);
     if (result.code !== 0) {
       throw new Error(`guard probe failed: ${JSON.stringify(result)}`);
@@ -943,7 +977,7 @@ describe.serial("MCP stdio contract", () => {
     const expected = [
       "live data metadata",
     ];
-    if (canCreateRepositoryAlias) {
+    if (canCreateLiveDataAlias) {
       expected.push(
         "live data alias metadata",
         "live data alias SQLite read-only",
@@ -951,7 +985,7 @@ describe.serial("MCP stdio contract", () => {
     }
     expected.push("Sana client fetch", "production daemon spawn");
     expect(JSON.parse(result.stdout)).toEqual(expected);
-  }, outerTestBudget(1));
+  }, outerTestBudget(2));
 
   test("rejects runtimes outside the canonical standalone target set", () => {
     expect(() => standaloneTargetForRuntime("win32", "arm64")).toThrow(

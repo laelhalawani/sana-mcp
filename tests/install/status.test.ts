@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { ClientDef } from "../../src/install/clients.js";
+import { claudeCodePredecessorEntry } from "../../src/install/clients.js";
 import { registrationStatus } from "../../src/install/status.js";
 
 const target = { command: "/opt/sana-mcp", args: ["mcp"] };
@@ -104,5 +105,55 @@ test("registration status types thrown path resolution without inventing a path"
     );
     assert.equal(status.pathUnavailableReason, status.reason);
     assert.equal("file" in status, false);
+  }
+});
+
+test("registration status recognizes only an exact declared predecessor", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-mcp-status-predecessor-"),
+  );
+  const file = path.join(directory, "client.json");
+  const client: ClientDef = {
+    id: "claude-code-fixture",
+    name: "Claude Code fixture",
+    detect: () => ({ state: "present", evidence: [file] }),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () => ({ state: "available", path: file }),
+      topKey: "mcpServers",
+      predecessors: [claudeCodePredecessorEntry],
+    },
+    reloadHint: "reload",
+  };
+  const predecessor = {
+    type: "stdio",
+    command: target.command,
+    args: target.args,
+    env: {},
+  };
+  try {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ mcpServers: { "sana-mcp": predecessor } }),
+    );
+    assert.equal(
+      (await registrationStatus(client, "sana-mcp", target)).state,
+      "owned",
+    );
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        mcpServers: {
+          "sana-mcp": { ...predecessor, unsupported: true },
+        },
+      }),
+    );
+    assert.equal(
+      (await registrationStatus(client, "sana-mcp", target)).state,
+      "foreign",
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true });
   }
 });

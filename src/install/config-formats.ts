@@ -25,6 +25,7 @@ export interface FormatChangeOptions {
   target: ServerTarget;
   operation: ConfigOperation;
   build?: EntryBuilder;
+  predecessors?: readonly EntryBuilder[];
 }
 
 export interface RenderedFormatChange {
@@ -149,10 +150,13 @@ function ownedEntry(
 export function isOwnedConfigEntry(
   current: unknown,
   target: ServerTarget,
-  build: EntryBuilder = standardConfigEntry
+  build: EntryBuilder = standardConfigEntry,
+  predecessors: readonly EntryBuilder[] = [],
 ): boolean {
   assertValidTarget(target);
-  return ownedEntry(current, build(target));
+  return [build, ...predecessors].some((builder) =>
+    ownedEntry(current, builder(target))
+  );
 }
 
 function parseJsonObject(
@@ -760,6 +764,12 @@ export function inspectAndRenderConfig(
     assertSafeObjectKey(options.topKey, "config container name");
   assertValidTarget(options.target);
   const expected = (options.build ?? standardConfigEntry)(options.target);
+  const ownedExpected = [
+    expected,
+    ...(options.predecessors ?? []).map((builder) => builder(options.target)),
+  ];
+  const isOwned = (current: unknown): boolean =>
+    ownedExpected.some((candidate) => ownedEntry(current, candidate));
 
   if (options.format === "json" || options.format === "jsonc") {
     if (!options.topKey)
@@ -775,7 +785,7 @@ export function inspectAndRenderConfig(
     const ownership: FormatOwnership =
       current === undefined
         ? { state: "absent" }
-        : ownedEntry(current, expected)
+        : isOwned(current)
           ? { state: "owned" }
           : {
               state: "foreign",
@@ -822,7 +832,7 @@ export function inspectAndRenderConfig(
     const ownership: FormatOwnership =
       current === undefined
         ? { state: "absent" }
-        : ownedEntry(current, expected)
+        : isOwned(current)
           ? { state: "owned" }
           : {
               state: "foreign",
