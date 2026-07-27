@@ -54,7 +54,7 @@ layouts below assume it hands back exactly the fields named.
 Every screen renders a two-line header supplied by the shell:
 
 ```
-Sana - Meetings                                    lael@etals.com - synced
+Sana - Meetings                                    you@example.com - synced
 Home / List / "Weekly sync 2026-06-03"
 ```
 
@@ -588,7 +588,7 @@ sufficient; this is an escape hatch, and it is a network call so it is opt-in).
 
    NAME                     EMAIL                          HOST
    ─────────────────────────────────────────────────────────────
-   Lael Ordonez             lael@etals.com                 yes
+   Lael Ordonez             you@example.com                 yes
    Sam Rivera               sam@acme.com                   -
    Dana Cho                 dana@acme.com                  -
    (guest)                  jordan@acme.com                -
@@ -677,7 +677,7 @@ methods `handleLogin` uses, but drives them directly (not through the
 ```
  Sign in to Sana
 
- ? Email on your Sana.ai subscription:  lael@etals.com▊
+ ? Email on your Sana.ai subscription:  you@example.com▊
 ```
 
 1. `email = input({ message: "Email on your Sana.ai subscription:" })`, trimmed.
@@ -686,7 +686,7 @@ methods `handleLogin` uses, but drives them directly (not through the
 2. Spinner `Sending code...` -> `await client.requestSignInCode(email)` then
    `client.save()`.
    ```
-    A 6-digit code was emailed to lael@etals.com.
+    A 6-digit code was emailed to you@example.com.
 
     ? Enter the code:  ______
       Did not arrive? [s] resend   [Esc] cancel
@@ -702,7 +702,7 @@ methods `handleLogin` uses, but drives them directly (not through the
    ```
    Then show success and route onward:
    ```
-    Signed in as lael@etals.com.
+    Signed in as you@example.com.
 
     Downloading your transcripts now. This can take a minute.
       [ View sync status ]     [ Back to menu ]

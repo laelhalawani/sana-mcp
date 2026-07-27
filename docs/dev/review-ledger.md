@@ -2350,7 +2350,7 @@ claimed.
 The repository-transfer boundary remains explicit. CI and the authenticated
 private predecessor fixture derive repository identity dynamically from
 `GITHUB_REPOSITORY`. The preserved public installer and update URLs currently
-resolve directly under `Etals-AiApp`. Only after a future repository transfer
+resolve directly under `laelhalawani`. Only after a future repository transfer
 may those URLs rely on GitHub redirects until a reviewed version projection
 updates them. This is not a current correction-stage defect.
 

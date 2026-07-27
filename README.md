@@ -1,7 +1,7 @@
 # sana-mcp
 
-[![release](https://img.shields.io/github/v/release/Etals-AiApp/sana-ai-mcp?include_prereleases&label=release)](https://github.com/Etals-AiApp/sana-ai-mcp/releases)
-[![license](https://img.shields.io/github/license/Etals-AiApp/sana-ai-mcp)](#license)
+[![release](https://img.shields.io/github/v/release/laelhalawani/sana-mcp?include_prereleases&label=release)](https://github.com/laelhalawani/sana-mcp/releases)
+[![license](https://img.shields.io/github/license/laelhalawani/sana-mcp)](#license)
 [![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#what-it-does)
 
 Give any AI agent instant, local access to your [Sana.AI](https://sana.ai) meeting
@@ -12,13 +12,13 @@ unlocking search, read, summarize, and more through a single
 macOS / Linux:
 
 ```bash
-sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.sh
+sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
+irm https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.ps1 | iex
 ```
 
 The installer selects the release for your OS, CPU, and (on Linux) libc, verifies
@@ -201,7 +201,7 @@ your existing servers are preserved - and the operation is idempotent.
 
 No supported client detected, or prefer to wire it up yourself? Point your client
 at the installed binary with the `mcp` subcommand (use the absolute path, or grab
-the binary from the [Releases page](https://github.com/Etals-AiApp/sana-ai-mcp/releases)):
+the binary from the [Releases page](https://github.com/laelhalawani/sana-mcp/releases)):
 
 ```json
 {
@@ -304,7 +304,7 @@ No data leaves your machine except the authenticated requests to Sana itself.
 Requires [Bun](https://bun.sh) 1.3+.
 
 ```bash
-git clone https://github.com/Etals-AiApp/sana-ai-mcp.git
+git clone https://github.com/laelhalawani/sana-mcp.git
 cd sana-ai-mcp
 bun install
 bun run check         # typecheck + isolated-safe test suite
@@ -354,5 +354,5 @@ manual dispatch can also build or resume that exact release.
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE). Maintained by [Etals](https://etals.com) -
-[github.com/Etals-AiApp/sana-ai-mcp](https://github.com/Etals-AiApp/sana-ai-mcp).
+GPL-3.0. See [LICENSE](LICENSE). Maintained by [laelhalawani](https://github.com/laelhalawani) -
+[github.com/laelhalawani/sana-mcp](https://github.com/laelhalawani/sana-mcp).

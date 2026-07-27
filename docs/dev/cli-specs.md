@@ -59,13 +59,13 @@ the machine except authenticated requests to Sana.
 macOS / Linux:
 
 ```
-curl -fsSL https://github.com/Etals-AiApp/sana-ai-mcp/raw/main/install.sh | sh
+curl -fsSL https://github.com/laelhalawani/sana-mcp/raw/main/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```
-irm https://github.com/Etals-AiApp/sana-ai-mcp/raw/main/install.ps1 | iex
+irm https://github.com/laelhalawani/sana-mcp/raw/main/install.ps1 | iex
 ```
 
 Both scripts:
@@ -104,7 +104,7 @@ Both scripts:
    - An updater handoff does not start the configurer.
 
 Manual install: download the asset for your platform from the
-[Releases page](https://github.com/Etals-AiApp/sana-ai-mcp/releases), verify its
+[Releases page](https://github.com/laelhalawani/sana-mcp/releases), verify its
 `.sha256`, `chmod +x` (POSIX), and put it on PATH.
 
 ### 2.2 Installer environment variables

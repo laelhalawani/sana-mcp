@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
 # Install the latest sana-mcp release:
-#   sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.sh
+#   sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh
 # Pin a release:
-#   SANA_MCP_VERSION=v0.4.6 sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/Etals-AiApp/sana-ai-mcp/releases/download/v0.4.6/install.sh
+#   SANA_MCP_VERSION=v0.4.6 sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.6/install.sh
 set -eu
 set -f
 umask 077
 
-repo="Etals-AiApp/sana-ai-mcp"
+repo="laelhalawani/sana-mcp"
 tmp_dir=""
 staged_binary=""
 staged_receipt=""

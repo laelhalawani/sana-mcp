@@ -137,7 +137,7 @@ attempt successfully created the exact `v0.4.5` tag but observed a transient
 404 while immediately reading it back, so it stopped before creating a release.
 The idempotent rerun resolved the same immutable tag, rebuilt all targets,
 passed the Windows gate again, and published
-<https://github.com/Etals-AiApp/sana-ai-mcp/releases/tag/v0.4.5>. The published
+<https://github.com/laelhalawani/sana-mcp/releases/tag/v0.4.5>. The published
 `install.ps1` SHA-256 is
 `e64ce62eeccbd1fd6acd068f3732f9f04bbbd2a680ae6a3f02512b926a1ee670`,
 exactly matching the tagged source.
@@ -167,7 +167,7 @@ mutation.
 The production Windows command is:
 
 ```powershell
-irm https://github.com/Etals-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
+irm https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.ps1 | iex
 ```
 
 ## Safety constraints

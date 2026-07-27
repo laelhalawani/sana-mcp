@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Etals-AiApp/sana-ai-mcp/releases/manifest.schema.json",
+  "$id": "https://github.com/laelhalawani/sana-mcp/releases/manifest.schema.json",
   "title": "sana-mcp release manifest",
   "description": "Version 1 standalone distribution contract.",
   "$comment": "Consumers MUST pass schema-valid input through parseReleaseManifest. The strict parser additionally enforces releaseTag/packageVersion equality, unique targets, and case-insensitive uniqueness across all declared release filenames; those relational rules are not expressible in portable draft 2020-12 JSON Schema.",
