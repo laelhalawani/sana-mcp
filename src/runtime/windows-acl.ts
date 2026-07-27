@@ -7,6 +7,10 @@ const RECEIPT_NAME = ".sana-acl-setup-v1.json";
 const RECEIPT_VERSION = 1;
 const SETUP_TIMEOUT_MS = 8_000;
 const MAX_RECEIPT_BYTES = 16 * 1024;
+const RESERVED_ACL_ENVIRONMENT_KEYS = new Set([
+  "sana_acl_setup",
+  "systemroot",
+]);
 
 export interface WindowsAclSetupRequest {
   readonly root: string;
@@ -178,6 +182,20 @@ function publishReceipt(root: string): void {
   }
 }
 
+function aclEnvironment(
+  systemRoot: string,
+  setup: { readonly root: string; readonly paths: readonly string[] },
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (RESERVED_ACL_ENVIRONMENT_KEYS.has(key.toLowerCase())) continue;
+    environment[key] = value;
+  }
+  environment.SystemRoot = systemRoot;
+  environment.SANA_ACL_SETUP = JSON.stringify(setup);
+  return environment;
+}
+
 const ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $payload = ConvertFrom-Json -InputObject $env:SANA_ACL_SETUP
@@ -224,14 +242,27 @@ foreach ($target in $targets) {
   } else {
     [IO.File]::SetAccessControl($target, $acl)
   }
-  $verified = Get-Acl -LiteralPath $target
-  $allows = @($verified.Access | Where-Object {
-    $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow
-  })
-  if ($verified.AreAccessRulesProtected -ne $true -or $allows.Count -ne 1 -or
-      $allows[0].IdentityReference.Translate(
-        [Security.Principal.SecurityIdentifier]
-      ).Value -ne $sid.Value) {
+  $verified = if ($isDirectory) {
+    [IO.Directory]::GetAccessControl($target, $sections)
+  } else {
+    [IO.File]::GetAccessControl($target, $sections)
+  }
+  $verifiedRules = @($verified.GetAccessRules(
+    $true,
+    $true,
+    [Security.Principal.SecurityIdentifier]
+  ))
+  if ($verified.AreAccessRulesProtected -ne $true -or
+      $verifiedRules.Count -ne 1 -or
+      $verifiedRules[0].IsInherited -ne $false -or
+      $verifiedRules[0].AccessControlType -ne
+        [Security.AccessControl.AccessControlType]::Allow -or
+      $verifiedRules[0].IdentityReference.Value -ne $sid.Value -or
+      $verifiedRules[0].FileSystemRights -ne
+        [Security.AccessControl.FileSystemRights]::FullControl -or
+      $verifiedRules[0].InheritanceFlags -ne $inheritance -or
+      $verifiedRules[0].PropagationFlags -ne
+        [Security.AccessControl.PropagationFlags]::None) {
     throw "ACL verification failed: $target"
   }
 }
@@ -277,11 +308,10 @@ export const ensureWindowsPrivateRoot: WindowsAclSetup = (request): void => {
       timeout: SETUP_TIMEOUT_MS,
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
-      env: {
-        ...process.env,
-        SystemRoot: request.systemRoot,
-        SANA_ACL_SETUP: JSON.stringify({ root: canonicalRoot, paths: known }),
-      },
+      env: aclEnvironment(request.systemRoot, {
+        root: canonicalRoot,
+        paths: known,
+      }),
     },
   );
   if (result.error || result.status !== 0) {

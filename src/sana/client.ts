@@ -772,16 +772,21 @@ export class SanaClient {
         z
           .object({
             user: sanaUserSchema,
-            workspace: workspaceSchema.optional(),
+            workspace: workspaceSchema.nullable().optional(),
           })
           .passthrough(),
       );
-      if (!data.workspace) {
+      const workspaceId =
+        data.workspace?.id ?? data.user.lastUsedWorkspaceId;
+      if (workspaceId === undefined) {
         throw new AuthoritativeWorkspaceUnavailableError();
       }
-      // Adopt only the workspace selected by the authenticated response.
+      // Both candidates come from the fully validated authenticated response.
+      // The active workspace wins when Sana supplies it; Sana's validated
+      // last-used workspace is the routing identity when that projection is
+      // explicitly null or absent.
       this.userId = data.user.id;
-      this.workspaceId = data.workspace.id;
+      this.workspaceId = workspaceId;
       this.email = data.user.email;
       return data.user;
     } catch (error) {

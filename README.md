@@ -317,8 +317,39 @@ installed `sana-mcp`. The
 compile target is always explicit; valid published targets are
 `bun-linux-x64`, `bun-linux-x64-musl`, `bun-linux-arm64`,
 `bun-linux-arm64-musl`, `bun-darwin-x64`, `bun-darwin-arm64`, and
-`bun-windows-x64`. A package-version bump merged to `main` publishes the matching
-release automatically when its tag does not exist. A pushed matching `v*` tag or
+`bun-windows-x64`. Standalone builds keep Bun bytecode enabled. The canonical
+`bun-windows-x64` artifact must be built by x64 Bun running on native Windows
+(`process.platform === "win32"` and `process.arch === "x64"`) from a source
+checkout on a native Windows filesystem. Linux Bun, WSL Bun, and native
+Windows Bun invoked through UNC, mapped-network, `SUBST`, junction, symlink,
+or other reparse-backed source aliases reject that target before creating its
+output or parent directory. The guard resolves the source directory through
+Windows, derives its helper from the native system-directory API rather than
+environment paths, requires fixed local NTFS backing, and accepts ordinary and
+extended DOS paths that prove that backing.
+From Windows, run `bun run compile -- --target bun-windows-x64` in native
+PowerShell with native Windows Bun from an NTFS checkout. This restriction is
+specific to the Windows x64 target; the supported non-Windows build behavior
+is unchanged. Release jobs execute a private snapshot through one stable file
+identity: an inherited descriptor on Linux/macOS, a pinned read-only file mount
+for the musl compatibility smoke, and a write/delete-excluding file lease on
+Windows. Descriptor offsets are reset before every macOS consumer, and the
+macOS job forcibly replaces the snapshot pathname to prove execution stays
+bound to the open file. The snapshot digest must match before and after
+`--version`, `__inspect`, and `--help`, and attestation refuses an artifact
+that differs from those executed bytes. Assembly requires the exact ordered
+target matrix and current compatibility tuple, then publication binds every
+file to its attested assembled digest through one already-open descriptor.
+Uploads read those descriptors while supplying authoritative asset names;
+replacing a snapshot pathname cannot replace uploaded bytes. Before an
+authorization header is constructed, the uploader also requires the raw
+GitHub upload template to match the exact repository, release id, path, and
+GitHub-context upload origin. Publication pins that positive release id,
+re-fetches it directly across every verification boundary, downloads assets
+by their pinned API identities, and publishes only through an id-specific API
+update after a final draft recheck. A
+package-version bump merged to `main` publishes the matching release
+automatically when its tag does not exist. A pushed matching `v*` tag or
 manual dispatch can also build or resume that exact release.
 
 ## License
