@@ -5,6 +5,7 @@ import { mkdirSync } from "node:fs";
 import {
   access,
   chmod,
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -25,11 +26,67 @@ const predecessorVersion = "0.4.5";
 const predecessorTag = `v${predecessorVersion}`;
 const predecessorWindowsFixture =
   `${predecessorTag}-sana-mcp-windows-x64.exe`;
+const windowsCompatibleUpdateEnvironmentKeys = {
+  currentBinary: "SANA_MCP_TEST_CURRENT_WINDOWS_BINARY",
+  sourceCommit: "SANA_MCP_TEST_SOURCE_COMMIT",
+  predecessorFixtureDirectory:
+    "SANA_MCP_TEST_PREDECESSOR_WINDOWS_FIXTURE_DIR",
+} as const;
+type WindowsCompatibleUpdateConfiguration =
+  | { kind: "skip" }
+  | {
+    kind: "configured";
+    currentBinary: string;
+    sourceCommit: string;
+    predecessorFixtureDirectory: string;
+  };
 const compatibleUpdateInstallerEnvironmentLines = [
   '  [void]$InstallerInfo.EnvironmentVariables.Remove("SANA_MCP_REPLACE_INCOMPATIBLE")',
   '  [void]$InstallerInfo.EnvironmentVariables.Remove("SANA_MCP_INCOMPATIBLE_RESET")',
   `  foreach ($Pair in @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; SANA_DATA_DIR=$Data; SANA_TRANSCRIPTS_DIR=$Transcripts; SANA_MCP_INSTALL_DIR=$Install; SANA_MCP_VERSION="${currentTag}"; SANA_MCP_YES="1"; SANA_MCP_TEST_RELEASE_DIR=$Release; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD"; PSModulePath=$WindowsPowerShellModulePath }.GetEnumerator()) { $InstallerInfo.EnvironmentVariables[$Pair.Key] = $Pair.Value }`,
 ] as const;
+
+function resolveWindowsCompatibleUpdateConfiguration(
+  environment: Readonly<Record<string, string | undefined>>,
+): WindowsCompatibleUpdateConfiguration {
+  const entries = Object.entries(windowsCompatibleUpdateEnvironmentKeys) as
+    Array<
+      [
+        keyof typeof windowsCompatibleUpdateEnvironmentKeys,
+        (typeof windowsCompatibleUpdateEnvironmentKeys)[keyof typeof windowsCompatibleUpdateEnvironmentKeys],
+      ]
+    >;
+  const present = entries.filter(([, key]) =>
+    Object.prototype.hasOwnProperty.call(environment, key)
+  );
+  if (present.length === 0) return { kind: "skip" };
+
+  for (const [, key] of entries) {
+    if (!Object.prototype.hasOwnProperty.call(environment, key)) {
+      throw new Error(
+        `${key} is required when the Windows compatible-update E2E is configured`,
+      );
+    }
+    const value = environment[key];
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new Error(
+        `${key} must be a nonblank string when the Windows compatible-update E2E is configured`,
+      );
+    }
+  }
+
+  return {
+    kind: "configured",
+    currentBinary:
+      environment[windowsCompatibleUpdateEnvironmentKeys.currentBinary]!,
+    sourceCommit:
+      environment[windowsCompatibleUpdateEnvironmentKeys.sourceCommit]!,
+    predecessorFixtureDirectory:
+      environment[
+        windowsCompatibleUpdateEnvironmentKeys.predecessorFixtureDirectory
+      ]!,
+  };
+}
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
@@ -48,6 +105,82 @@ async function waitForFile(file: string): Promise<void> {
       await new Promise<void>((resolve) => setTimeout(resolve, 20));
     }
   }
+}
+
+interface OwnedProcessResult {
+  readonly status: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly timedOut: boolean;
+}
+
+async function runOwnedProcess(
+  executable: string,
+  arguments_: readonly string[],
+  options: Readonly<{
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs: number;
+  }>,
+): Promise<OwnedProcessResult> {
+  const child = spawn(executable, [...arguments_], {
+    cwd: options.cwd,
+    env: options.env,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer | string) => {
+    stdout.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  child.stderr.on("data", (chunk: Buffer | string) => {
+    stderr.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  let spawnError: Error | undefined;
+  child.once("error", (error) => {
+    spawnError = error;
+  });
+  const closed = new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+  });
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, options.timeoutMs);
+  try {
+    const settled = await Promise.race([
+      closed.then(() => true),
+      new Promise<false>((resolve) =>
+        setTimeout(() => resolve(false), options.timeoutMs + 5_000),
+      ),
+    ]);
+    if (!settled) {
+      child.kill("SIGKILL");
+      throw new Error(
+        `owned process ${executable} did not close within ${
+          options.timeoutMs + 5_000
+        }ms`,
+      );
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (spawnError !== undefined) {
+    throw new AggregateError(
+      [spawnError],
+      `could not start owned process ${executable}`,
+    );
+  }
+  return {
+    status: child.exitCode,
+    signal: child.signalCode,
+    stdout: Buffer.concat(stdout).toString("utf8"),
+    stderr: Buffer.concat(stderr).toString("utf8"),
+    timedOut,
+  };
 }
 
 async function createOfflineRelease(
@@ -1502,17 +1635,43 @@ test("PowerShell receiptless recognition accepts only published legacy digests",
 });
 
 test("PowerShell retires an active exact-path runtime, publishes safely, and makes old-state rollback idempotent", { timeout: 30_000 }, async () => {
-  const command =
-    process.platform === "win32"
-      ? "powershell.exe"
-      : (
-          spawnSync(
-            "/bin/sh",
-            ["-c", "command -v pwsh || command -v powershell.exe"],
-            { encoding: "utf8" },
-          ).stdout.trim()
-        );
-  if (command.length === 0) return;
+  let command: string;
+  if (process.platform === "win32") {
+    command = "powershell.exe";
+  } else if (process.platform === "linux") {
+    const powershellLookup = spawnSync(
+      "/bin/sh",
+      ["-c", "command -v powershell.exe"],
+      { encoding: "utf8" },
+    );
+    const wslpathLookup = spawnSync(
+      "/bin/sh",
+      ["-c", "command -v wslpath"],
+      { encoding: "utf8" },
+    );
+    if (
+      powershellLookup.status !== 0 ||
+      wslpathLookup.status !== 0 ||
+      powershellLookup.stdout.trim().length === 0 ||
+      wslpathLookup.stdout.trim().length === 0
+    ) {
+      return;
+    }
+    command = powershellLookup.stdout.trim();
+    const powershellProbe = spawnSync(
+      command,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        'if ($PSVersionTable.PSEdition -cne "Desktop") { exit 1 }',
+      ],
+      { encoding: "utf8" },
+    );
+    if (powershellProbe.status !== 0) return;
+  } else {
+    return;
+  }
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const fileFunctionStart = installer.indexOf("function Get-Sha256");
@@ -1522,7 +1681,9 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
   const processFunctionStart = installer.indexOf(
     "function Get-CanonicalRuntimeProcesses",
   );
-  const processFunctionEnd = installer.indexOf("\nfunction Assert-NotReparse");
+  const processFunctionEnd = installer.indexOf(
+    "\nfunction Resolve-InstallDirectory",
+  );
   assert.notEqual(fileFunctionStart, -1);
   assert.notEqual(fileFunctionEnd, -1);
   assert.notEqual(processFunctionStart, -1);
@@ -1543,7 +1704,8 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
       const converted = spawnSync("wslpath", ["-w", harnessPath], {
         encoding: "utf8",
       });
-      if (converted.status !== 0) return;
+      assert.equal(converted.status, 0, converted.stderr);
+      assert.notEqual(converted.stdout.trim(), "");
       executableHarnessPath = converted.stdout.trim();
     }
     await writeFile(
@@ -1552,7 +1714,10 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
         '$ErrorActionPreference = "Stop"',
         fileFunctions,
         processFunctions,
-        '$Root = Join-Path $env:TEMP ("sana-installer-native-" + [Guid]::NewGuid().ToString("N"))',
+        '$NativeTemp = [IO.Path]::GetTempPath()',
+        'if ([string]::IsNullOrWhiteSpace($NativeTemp) -or -not [IO.Path]::IsPathRooted($NativeTemp)) { throw "Windows did not provide a rooted .NET temporary directory" }',
+        '$NativeTemp = [IO.Path]::GetFullPath($NativeTemp)',
+        '$Root = Join-Path $NativeTemp ("sana-installer-native-" + [Guid]::NewGuid().ToString("N"))',
         '$Install = Join-Path $Root "installed"',
         '$Other = Join-Path $Root "other"',
         '[IO.Directory]::CreateDirectory($Install) | Out-Null',
@@ -1565,6 +1730,8 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
         '$OtherProcess = $null',
         '$PublishedProcess = $null',
         '$RetiredProcess = $null',
+        '$PrimaryError = $null',
+        '$CleanupFailures = @()',
         "try {",
         '  Copy-Item -LiteralPath (Join-Path $PSHOME "powershell.exe") -Destination $Target',
         '  Copy-Item -LiteralPath $Target -Destination $OtherTarget',
@@ -1584,6 +1751,7 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
         '  if ($OtherProcess.HasExited) { throw "same-name other-path process was terminated" }',
         '  $Retired = $null',
         '  Publish-InstallerFile $Stage $Target $NewHash $OldHash ([ref] $Retired)',
+        '  if ([string]::IsNullOrWhiteSpace($Retired)) { throw "publication did not retain the previous runtime" }',
         '  if ((Get-Sha256 $Target) -cne $NewHash) { throw "replacement was not published" }',
         "  $PublishedProcess = Start-Process -FilePath $Target -ArgumentList @('/c','ping -n 30 127.0.0.1 > nul') -WindowStyle Hidden -PassThru",
         "  $RetiredProcess = Start-Process -FilePath $Retired -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru",
@@ -1597,13 +1765,24 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
         '  Restore-InstallerFileState $Target $Previous $OldHash $NewHash "installed binary"',
         '  $After = (Get-Item -LiteralPath $Target).LastWriteTimeUtc.Ticks',
         '  if ($After -ne $Before) { throw "already-old rollback was not a no-op" }',
+        "} catch {",
+        '  $PrimaryError = $_.Exception',
         "} finally {",
         '  foreach ($ProcessToClean in @($TargetProcess, $OtherProcess, $PublishedProcess, $RetiredProcess)) {',
         '    if ($null -eq $ProcessToClean) { continue }',
-        '    try { if (-not $ProcessToClean.HasExited) { $ProcessToClean.Kill() }; $ProcessToClean.WaitForExit(3000) | Out-Null } catch { }',
+        "    try {",
+        '      if (-not $ProcessToClean.HasExited) { $ProcessToClean.Kill() }',
+        '      if (-not $ProcessToClean.WaitForExit(3000)) { throw "PID $($ProcessToClean.Id) did not exit within cleanup deadline" }',
+        '    } catch { $CleanupFailures += $_.Exception.Message }',
         "  }",
-        '  if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue }',
+        '  try {',
+        '    if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force }',
+        '    if (Test-Path -LiteralPath $Root) { throw "isolated native root still exists" }',
+        '  } catch { $CleanupFailures += "could not remove isolated native root $Root`: $($_.Exception.Message)" }',
         "}",
+        'if ($null -ne $PrimaryError) { if ($CleanupFailures.Count -gt 0) { throw "$($PrimaryError.Message); cleanup failed: $($CleanupFailures -join \'; \')" }; throw $PrimaryError }',
+        'if ($CleanupFailures.Count -gt 0) { throw "cleanup failed: $($CleanupFailures -join \'; \')" }',
+        'if (Test-Path -LiteralPath $Root) { throw "isolated native root remained after successful cleanup" }',
         "",
       ].join("\n"),
     );
@@ -1630,12 +1809,101 @@ test("Windows compatible-update E2E strips destructive authority from the instal
   );
 });
 
+test("Windows compatible-update E2E configuration skips only when every exact key is absent", () => {
+  assert.deepEqual(
+    resolveWindowsCompatibleUpdateConfiguration({
+      UNRELATED_TEST_SETTING: "present",
+    }),
+    { kind: "skip" },
+  );
+  assert.throws(
+    () =>
+      resolveWindowsCompatibleUpdateConfiguration({
+        SANA_MCP_TEST_CURRENT_WINDOWS_BINARY: "C:\\fixture\\current.exe",
+      }),
+    /SANA_MCP_TEST_SOURCE_COMMIT is required/u,
+  );
+  assert.throws(
+    () =>
+      resolveWindowsCompatibleUpdateConfiguration({
+        SANA_MCP_TEST_CURRENT_WINDOWS_BINARY: "",
+        SANA_MCP_TEST_SOURCE_COMMIT: " \t",
+        SANA_MCP_TEST_PREDECESSOR_WINDOWS_FIXTURE_DIR: "",
+      }),
+    /SANA_MCP_TEST_CURRENT_WINDOWS_BINARY must be a nonblank string/u,
+  );
+  const complete = {
+    SANA_MCP_TEST_CURRENT_WINDOWS_BINARY: "C:\\fixture\\current.exe",
+    SANA_MCP_TEST_SOURCE_COMMIT:
+      "0123456789abcdef0123456789abcdef01234567",
+    SANA_MCP_TEST_PREDECESSOR_WINDOWS_FIXTURE_DIR:
+      "C:\\fixture\\predecessor",
+  };
+  assert.deepEqual(resolveWindowsCompatibleUpdateConfiguration(complete), {
+    kind: "configured",
+    currentBinary: complete.SANA_MCP_TEST_CURRENT_WINDOWS_BINARY,
+    sourceCommit: complete.SANA_MCP_TEST_SOURCE_COMMIT,
+    predecessorFixtureDirectory:
+      complete.SANA_MCP_TEST_PREDECESSOR_WINDOWS_FIXTURE_DIR,
+  });
+});
+
 test(`Windows full installer replaces an active receipt-backed ${predecessorTag} mcp runtime`, { timeout: 180_000 }, async () => {
-  const configuredCurrentBinary =
-    process.env.SANA_MCP_TEST_CURRENT_WINDOWS_BINARY;
-  const sourceCommit = process.env.SANA_MCP_TEST_SOURCE_COMMIT;
-  if (!configuredCurrentBinary || !sourceCommit) return;
+  const configuration =
+    resolveWindowsCompatibleUpdateConfiguration(process.env);
+  if (configuration.kind === "skip") return;
+  const configuredCurrentBinary = configuration.currentBinary;
+  const sourceCommit = configuration.sourceCommit;
+  const configuredPredecessorFixtureDirectory =
+    configuration.predecessorFixtureDirectory;
   assert.match(sourceCommit, /^[a-f0-9]{40}$/);
+  assert.equal(
+    path.isAbsolute(configuredPredecessorFixtureDirectory),
+    true,
+    "the predecessor Windows fixture directory must be absolute",
+  );
+  const predecessorFixtureDirectoryStat = await lstat(
+    configuredPredecessorFixtureDirectory,
+  );
+  assert.equal(
+    predecessorFixtureDirectoryStat.isDirectory(),
+    true,
+    "the predecessor Windows fixture path must be a directory",
+  );
+  assert.equal(
+    predecessorFixtureDirectoryStat.isSymbolicLink(),
+    false,
+    "the predecessor Windows fixture directory must not be a symbolic link or junction",
+  );
+  const readPredecessorFixture = async (name: string): Promise<Buffer> => {
+    const fixturePath = path.join(
+      configuredPredecessorFixtureDirectory,
+      name,
+    );
+    const fixtureStat = await lstat(fixturePath);
+    assert.equal(
+      fixtureStat.isFile(),
+      true,
+      `the predecessor Windows fixture ${name} must be a regular file`,
+    );
+    assert.equal(
+      fixtureStat.isSymbolicLink(),
+      false,
+      `the predecessor Windows fixture ${name} must not be a symbolic link`,
+    );
+    return readFile(fixturePath);
+  };
+  const [
+    oldManifestBytes,
+    oldManifestChecksumBytes,
+    oldBinaryBytes,
+    oldBinaryChecksumBytes,
+  ] = await Promise.all([
+    readPredecessorFixture("manifest.json"),
+    readPredecessorFixture("manifest.json.sha256"),
+    readPredecessorFixture("sana-mcp-windows-x64.exe"),
+    readPredecessorFixture("sana-mcp-windows-x64.exe.sha256"),
+  ]);
 
   const powershell =
     process.platform === "win32"
@@ -1649,31 +1917,17 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
         );
   assert.notEqual(powershell, "");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-windows-e2e-"));
+  const rootPublicationPath = path.join(
+    temporary,
+    "windows-root-publication.json",
+  );
+  let primaryError: unknown;
+  try {
   const fixture = path.join(temporary, "fixture");
   await mkdir(fixture);
-  const download = async (name: string): Promise<string> => {
-    const response = await fetch(
-      `https://github.com/Etals-AiApp/sana-ai-mcp/releases/download/${predecessorTag}/${name}`,
-    );
-    assert.equal(
-      response.ok,
-      true,
-      `could not download official ${predecessorTag} ${name}`,
-    );
-    const destination = path.join(fixture, name);
-    await writeFile(destination, Buffer.from(await response.arrayBuffer()));
-    return destination;
-  };
-  const oldManifestPath = await download("manifest.json");
-  const oldManifestChecksumPath = await download("manifest.json.sha256");
-  const oldBinaryPath = await download("sana-mcp-windows-x64.exe");
-  const oldBinaryChecksumPath = await download(
-    "sana-mcp-windows-x64.exe.sha256",
-  );
-  const oldManifestBytes = await readFile(oldManifestPath);
   const oldManifestHash = sha256(oldManifestBytes);
   assert.equal(
-    (await readFile(oldManifestChecksumPath, "utf8")).trim(),
+    oldManifestChecksumBytes.toString("utf8").trim(),
     `${oldManifestHash}  manifest.json`,
   );
   const oldManifest = JSON.parse(oldManifestBytes.toString("utf8")) as {
@@ -1700,15 +1954,20 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
     (asset) => asset.target === "bun-windows-x64",
   );
   assert.ok(oldAsset);
-  const oldBinaryHash = sha256(await readFile(oldBinaryPath));
+  assert.equal(oldAsset.assetName, "sana-mcp-windows-x64.exe");
+  assert.equal(
+    oldAsset.checksumFileName,
+    "sana-mcp-windows-x64.exe.sha256",
+  );
+  const oldBinaryHash = sha256(oldBinaryBytes);
   assert.equal(oldBinaryHash, oldAsset.sha256);
   assert.equal(
-    (await readFile(oldBinaryChecksumPath, "utf8")).trim(),
+    oldBinaryChecksumBytes.toString("utf8").trim(),
     `${oldBinaryHash}  sana-mcp-windows-x64.exe`,
   );
   await writeFile(
     path.join(fixture, predecessorWindowsFixture),
-    await readFile(oldBinaryPath),
+    oldBinaryBytes,
   );
 
   let currentBinaryPath = path.resolve(configuredCurrentBinary);
@@ -1843,6 +2102,125 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
     installer.slice(downloaderEnd);
   const patchedInstallerPath = path.join(fixture, "install-e2e.ps1");
   await writeFile(patchedInstallerPath, patchedInstaller);
+  const nativeProbePath = path.join(fixture, "native-state-probe.mjs");
+  await writeFile(
+    nativeProbePath,
+    String.raw`
+import fs from "node:fs";
+import path from "node:path";
+import { Database } from "bun:sqlite";
+
+const fail = (message) => {
+  throw new Error(message);
+};
+const assert = (condition, message) => {
+  if (!condition) fail(message);
+};
+const required = (name) => {
+  const value = process.env[name];
+  if (typeof value !== "string" || value.length === 0) {
+    fail(name + " is required");
+  }
+  return value;
+};
+const expectedOrigin = required("SANA_TEST_ORIGIN");
+const expectedPid = Number(process.argv[2]);
+const expectedInstanceId = process.argv[3];
+if (
+  (!Number.isSafeInteger(expectedPid) ||
+    expectedPid <= 0 ||
+    typeof expectedInstanceId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      expectedInstanceId,
+    ))
+) {
+  fail("post-stop audit requires the captured daemon PID and UUID");
+}
+const dataDirectory = required("SANA_DATA_DIR");
+const session = JSON.parse(
+  fs.readFileSync(path.join(dataDirectory, "session.json"), "utf8"),
+);
+const database = new Database(path.join(dataDirectory, "sana.db"), {
+  readonly: true,
+  strict: true,
+});
+try {
+  const state = database.query("SELECT * FROM sync_state WHERE id = 1").get();
+  assert(state !== null, "sync state row is missing");
+  const meetingCount = database
+    .query("SELECT COUNT(*) AS count FROM meetings")
+    .get();
+  assert(meetingCount !== null, "meeting count row is missing");
+  assert(
+    session.generation === 3 &&
+      session.authenticatedOrigin === expectedOrigin &&
+      session.userId === "synthetic-user" &&
+      session.workspaceId === "synthetic-workspace" &&
+      session.email === "synthetic@example.test" &&
+      session.pendingLogin === null &&
+      session.cookies?.["sana-ai-session"] === "fresh-session" &&
+      typeof session.publicationToken === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        session.publicationToken,
+      ),
+    "persisted session identity is not exact",
+  );
+  assert(
+    state.auth_publication_token === session.publicationToken &&
+      state.auth_user_id === "synthetic-user" &&
+      state.auth_workspace_id === "synthetic-workspace" &&
+      state.auth_pending === 0 &&
+      state.auth_transition_pid === null &&
+      state.auth_transition_token === null &&
+      state.auth_transition_generation === null &&
+      state.auth_transition_kind === null &&
+      state.auth_transition_user_id === null &&
+      state.auth_transition_workspace_id === null &&
+      state.auth_issue_code === null &&
+      state.auth_issue_message === null &&
+      state.auth_issue_operation_token === null &&
+      state.auth_issue_generation === null &&
+      state.auth_issue_kind === null &&
+      state.sync_issue_code === null &&
+      state.sync_issue_cause === null &&
+      state.sync_issue_message === null &&
+      state.error === null,
+    "database authentication tuple is incomplete",
+  );
+  assert(meetingCount.count === 0, "meeting cache is not exactly empty");
+
+  const controlPath = path.join(dataDirectory, "daemon-control.json");
+  const stopPath = path.join(dataDirectory, "daemon-stop.json");
+  assert(
+    state.auth_generation === 3 &&
+      state.phase === "synced" &&
+      state.message === "Up to date - 0 meetings, 0 complete." &&
+      state.meetings_total === 0 &&
+      state.transcripts_done === 0 &&
+      state.transcripts_total === 0 &&
+      Number.isSafeInteger(state.last_full_sync_ms) &&
+      state.last_full_sync_ms > 0 &&
+      Number.isSafeInteger(state.last_incremental_ms) &&
+      state.last_incremental_ms >= state.last_full_sync_ms &&
+      state.blocking === 0 &&
+      state.catchup_epoch_ms === null &&
+      state.catchup_generation === 3 &&
+      state.cache_user_id === "synthetic-user" &&
+      state.cache_workspace_id === "synthetic-workspace" &&
+      state.daemon_pid === null &&
+      state.daemon_heartbeat_ms === null &&
+      state.daemon_instance_id === null &&
+      !fs.existsSync(controlPath) &&
+      !fs.existsSync(stopPath),
+    "post-stop synced database and daemon tuple is not exact: " +
+      JSON.stringify(state),
+  );
+  process.stdout.write('{"kind":"post-stop-audit"}\n');
+} finally {
+  database.close();
+}
+`,
+  );
 
   const windowsPath = (file: string): string => {
     if (process.platform === "win32") return file;
@@ -1850,27 +2228,95 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
     assert.equal(converted.status, 0, converted.stderr);
     return converted.stdout.trim();
   };
+  const configuredWindowsBun =
+    process.platform === "win32"
+      ? process.execPath
+      : spawnSync("/bin/sh", ["-c", "command -v bun.exe"], {
+          encoding: "utf8",
+        }).stdout.trim();
+  assert.notEqual(
+    configuredWindowsBun,
+    "",
+    "native Windows Bun is required for the compatible-update E2E",
+  );
+  const windowsBun = windowsPath(configuredWindowsBun);
+  const windowsRepository = windowsPath(root);
+  const windowsFakeServer = windowsPath(
+    path.join(root, "tests/fixtures/sana/fake-sana-server.ts"),
+  );
+  const windowsObservedFixture = windowsPath(
+    path.join(
+      root,
+      "tests/fixtures/sana/user-me-workspace-null.json",
+    ),
+  );
   const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
   const harnessPath = path.join(temporary, "e2e.ps1");
   await writeFile(
     harnessPath,
     [
+      'param([Parameter(Mandatory=$true)][string] $RootPublication,[switch] $ForceTimeout)',
       '$ErrorActionPreference = "Stop"',
+      '$JobAssemblyName = [Reflection.AssemblyName]::new("SanaMcpTestJob" + [Guid]::NewGuid().ToString("N"))',
+      '$JobAssembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($JobAssemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)',
+      '$JobModule = $JobAssembly.DefineDynamicModule($JobAssemblyName.Name)',
+      '$JobTypeBuilder = $JobModule.DefineType("NativeJob", [Reflection.TypeAttributes]::Public)',
+      '$JobMethodAttributes = [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl',
+      '$JobCallingConvention = [Reflection.CallingConventions]::Standard',
+      '$NativeCallingConvention = [Runtime.InteropServices.CallingConvention]::Winapi',
+      '$NativeCharSet = [Runtime.InteropServices.CharSet]::Unicode',
+      '$CreateJobMethod = $JobTypeBuilder.DefinePInvokeMethod("CreateJobObjectW","kernel32.dll",$JobMethodAttributes,$JobCallingConvention,[IntPtr],[Type[]]@([IntPtr],[string]),$NativeCallingConvention,$NativeCharSet)',
+      '$SetJobMethod = $JobTypeBuilder.DefinePInvokeMethod("SetInformationJobObject","kernel32.dll",$JobMethodAttributes,$JobCallingConvention,[bool],[Type[]]@([IntPtr],[int],[IntPtr],[uint32]),$NativeCallingConvention,[Runtime.InteropServices.CharSet]::Auto)',
+      '$AssignJobMethod = $JobTypeBuilder.DefinePInvokeMethod("AssignProcessToJobObject","kernel32.dll",$JobMethodAttributes,$JobCallingConvention,[bool],[Type[]]@([IntPtr],[IntPtr]),$NativeCallingConvention,[Runtime.InteropServices.CharSet]::Auto)',
+      '$CurrentProcessMethod = $JobTypeBuilder.DefinePInvokeMethod("GetCurrentProcess","kernel32.dll",$JobMethodAttributes,$JobCallingConvention,[IntPtr],[Type[]]@(),$NativeCallingConvention,[Runtime.InteropServices.CharSet]::Auto)',
+      'foreach ($Method in @($CreateJobMethod,$SetJobMethod,$AssignJobMethod,$CurrentProcessMethod)) { $Method.SetImplementationFlags($Method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig) }',
+      '$NativeJob = $JobTypeBuilder.CreateType()',
+      '$JobHandle = [IntPtr]$NativeJob.GetMethod("CreateJobObjectW").Invoke($null,@([IntPtr]::Zero,$null))',
+      'if ($JobHandle -eq [IntPtr]::Zero) { throw "CreateJobObjectW failed before descendant launch" }',
+      '$JobInfoSize = if ([IntPtr]::Size -eq 8) { 144 } else { 108 }',
+      '$JobInfo = [Runtime.InteropServices.Marshal]::AllocHGlobal($JobInfoSize)',
+      'try {',
+      '  for ($Offset=0; $Offset -lt $JobInfoSize; $Offset+=4) { [Runtime.InteropServices.Marshal]::WriteInt32($JobInfo,$Offset,0) }',
+      '  [Runtime.InteropServices.Marshal]::WriteInt32($JobInfo,16,0x2000)',
+      '  $JobConfigured = [bool]$NativeJob.GetMethod("SetInformationJobObject").Invoke($null,@($JobHandle,9,$JobInfo,[uint32]$JobInfoSize))',
+      '  if (-not $JobConfigured) { throw "SetInformationJobObject failed before descendant launch" }',
+      '} finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($JobInfo) }',
+      '$CurrentProcessHandle = [IntPtr]$NativeJob.GetMethod("GetCurrentProcess").Invoke($null,@())',
+      '$JobAssigned = [bool]$NativeJob.GetMethod("AssignProcessToJobObject").Invoke($null,@($JobHandle,$CurrentProcessHandle))',
+      'if (-not $JobAssigned) { throw "AssignProcessToJobObject failed before descendant launch" }',
+      '$script:SanaMcpTestJobHandle = $JobHandle',
       `$FixtureSource = ${quote(windowsPath(fixture))}`,
+      `$Bun = ${quote(windowsBun)}`,
+      `$Repository = ${quote(windowsRepository)}`,
+      `$FakeServerSource = ${quote(windowsFakeServer)}`,
+      `$ObservedFixture = ${quote(windowsObservedFixture)}`,
       '$KnownLocalAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)',
       'if ([string]::IsNullOrWhiteSpace($KnownLocalAppData)) { throw "Windows did not provide a canonical E2E root" }',
       '$WindowsPowerShellModulePath = [Environment]::GetEnvironmentVariable("PSModulePath", [EnvironmentVariableTarget]::Machine)',
       'if ([string]::IsNullOrWhiteSpace($WindowsPowerShellModulePath)) { throw "Windows did not provide a machine-scoped PSModulePath" }',
       '$env:PSModulePath = $WindowsPowerShellModulePath',
-      '$Root = Join-Path $KnownLocalAppData ("sana-mcp-e2e-" + [Guid]::NewGuid().ToString("N"))',
+      '$Root = Join-Path $KnownLocalAppData ("sana mcp e2e O\'Brien " + [Guid]::NewGuid().ToString("N"))',
+      'if ([string]::IsNullOrWhiteSpace($RootPublication)) { throw "isolated root publication authority is missing" }',
+      'if (-not [IO.Path]::IsPathRooted($RootPublication)) { throw "isolated root publication authority is not absolute: $RootPublication" }',
+      'if (Test-Path -LiteralPath $RootPublication) { throw "isolated root publication authority already exists: $RootPublication" }',
+      '$RootPublication = [IO.Path]::GetFullPath($RootPublication)',
+      '$RootPublicationParent = Split-Path -Parent $RootPublication',
+      'if (-not (Test-Path -LiteralPath $RootPublicationParent -PathType Container)) { throw "isolated root publication parent is unavailable" }',
+      '$RootPublicationRecord = [ordered]@{ root=$Root; harnessPid=$PID; mode="full" }',
+      '[IO.File]::WriteAllText($RootPublication,($RootPublicationRecord | ConvertTo-Json -Compress) + "`n",[Text.UTF8Encoding]::new($false))',
       '$Release = Join-Path $Root "release"',
       '$Install = Join-Path $Root "install"',
       '$Other = Join-Path $Root "other"',
       '$Profile = Join-Path $Root "profile"',
       '$LocalAppData = Join-Path $Profile "AppData\\Local"',
       '$RoamingAppData = Join-Path $Profile "AppData\\Roaming"',
+      '$TempDirectory = Join-Path $Root "temporary files"',
       '$Data = Join-Path $Root "data"',
       '$Transcripts = Join-Path $Root "transcripts"',
+      '$OtherData = Join-Path $Root "other-data"',
+      '$FakeReady = Join-Path $Root "fake ready.json"',
+      '$FakeState = Join-Path $Root "fake state.json"',
+      '$NativeRelease = Join-Path $Root "native release.txt"',
       '$DataSentinel = Join-Path $Data "compatible-auth-sentinel.bin"',
       '$TranscriptSentinel = Join-Path $Transcripts "compatible-transcript-sentinel.txt"',
       '$DataSentinelBytes = [byte[]](0,1,2,127,128,254,255)',
@@ -1884,10 +2330,71 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
       '$IsolatedProcessPath = "$env:SystemRoot\\System32;$env:SystemRoot;$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0"',
       '$InstalledBinary = Join-Path $Install "sana-mcp.exe"',
       '$OtherBinary = Join-Path $Other "sana-mcp.exe"',
+      '$ReceiptPath = Join-Path $Install ".sana-mcp-install-v1"',
+      '$VSCodeConfig = Join-Path $RoamingAppData "Code\\User\\mcp.json"',
+      '$ProbePath = Join-Path $Release "native-state-probe.mjs"',
       '$OldProcess = $null',
       '$OtherProcess = $null',
       '$InstallerProcess = $null',
+      '$FakeProcess = $null',
+      '$FakePid = $null',
+      '$FakeStartTime = $null',
+      '$FakePath = $null',
+      '$DaemonPid = $null',
+      '$DaemonInstanceId = $null',
+      '$DaemonStartTime = $null',
+      '$DaemonPath = $null',
+      '$RuntimeEnvironment = $null',
+      '$Ready = $null',
       '$PrimaryError = $null',
+      '$AuthorityKeys = @("GH_TOKEN","GITHUB_TOKEN","GITHUB_PAT","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy","SANA_MCP_REPLACE_INCOMPATIBLE","SANA_MCP_INCOMPATIBLE_RESET","SANA_MCP_TEST_RELEASE_DIR","SANA_MCP_VERSION","SANA_MCP_YES")',
+      "function Remove-ProcessAuthority([Diagnostics.ProcessStartInfo] $Info) {",
+      "  foreach ($Key in $AuthorityKeys) { [void]$Info.EnvironmentVariables.Remove($Key) }",
+      "}",
+      "function Set-RuntimeEnvironment([Diagnostics.ProcessStartInfo] $Info, [string] $ProcessData, [string] $Origin) {",
+      "  Remove-ProcessAuthority $Info",
+      '  foreach ($Pair in @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; SANA_DATA_DIR=$ProcessData; SANA_TRANSCRIPTS_DIR=$Transcripts; SANA_BASE_URL=$Origin; SANA_SEMANTIC="0"; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD"; TEMP=$TempDirectory; TMP=$TempDirectory; TMPDIR=$TempDirectory; PSModulePath=$WindowsPowerShellModulePath }.GetEnumerator()) { $Info.EnvironmentVariables[$Pair.Key] = $Pair.Value }',
+      "}",
+      "function Quote-NativeArgument([string] $Value) {",
+      '  if ($Value.Length -gt 0 -and $Value -cnotmatch \'[\\s"]\') { return $Value }',
+      '  $Escaped = [regex]::Replace($Value, \'(\\\\*)"\', \'$1$1\\"\')',
+      '  $Escaped = [regex]::Replace($Escaped, \'(\\\\+)$\', \'$1$1\')',
+      '  return \'"\' + $Escaped + \'"\'',
+      "}",
+      "function Join-NativeArguments([string[]] $Arguments) {",
+      '  return (($Arguments | ForEach-Object { Quote-NativeArgument $_ }) -join " ")',
+      "}",
+      "function Wait-Until([scriptblock] $Condition, [string] $Description, [int] $TimeoutMilliseconds = 15000) {",
+      "  $Deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)",
+      "  while (-not (& $Condition)) {",
+      '    if ([DateTime]::UtcNow -ge $Deadline) { throw "timed out waiting for $Description" }',
+      "    Start-Sleep -Milliseconds 20",
+      "  }",
+      "}",
+      "function Invoke-Isolated([string] $Executable, [string[]] $Arguments, [hashtable] $Environment) {",
+      "  $Keys = @($AuthorityKeys + @($Environment.Keys) | Select-Object -Unique)",
+      "  $Saved = @{}",
+      '  foreach ($Key in $Keys) { $Saved[$Key] = [Environment]::GetEnvironmentVariable($Key, "Process") }',
+      '  $StdoutPath = Join-Path $TempDirectory ([Guid]::NewGuid().ToString("N") + ".stdout")',
+      '  $StderrPath = Join-Path $TempDirectory ([Guid]::NewGuid().ToString("N") + ".stderr")',
+      "  try {",
+      '    foreach ($Key in $AuthorityKeys) { [Environment]::SetEnvironmentVariable($Key, $null, "Process") }',
+      '    foreach ($Pair in $Environment.GetEnumerator()) { [Environment]::SetEnvironmentVariable($Pair.Key, [string]$Pair.Value, "Process") }',
+      '    $SavedErrorActionPreference = $ErrorActionPreference',
+      '    $ErrorActionPreference = "Continue"',
+      "    & $Executable @Arguments 1> $StdoutPath 2> $StderrPath",
+      "    $Status = $LASTEXITCODE",
+      '    $ErrorActionPreference = $SavedErrorActionPreference',
+      "    return [pscustomobject]@{ Status=$Status; Stdout=[IO.File]::ReadAllText($StdoutPath); Stderr=[IO.File]::ReadAllText($StderrPath) }",
+      "  } finally {",
+      '    if ($null -ne $SavedErrorActionPreference) { $ErrorActionPreference = $SavedErrorActionPreference }',
+      '    foreach ($Key in $Keys) { [Environment]::SetEnvironmentVariable($Key, $Saved[$Key], "Process") }',
+      "    Remove-Item -LiteralPath $StdoutPath,$StderrPath -Force -ErrorAction SilentlyContinue",
+      "  }",
+      "}",
+      "function Runtime-Environment([string] $Origin) {",
+      '  return @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; SANA_DATA_DIR=$Data; SANA_TRANSCRIPTS_DIR=$Transcripts; SANA_BASE_URL=$Origin; SANA_SEMANTIC="0"; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD"; TEMP=$TempDirectory; TMP=$TempDirectory; TMPDIR=$TempDirectory; PSModulePath=$WindowsPowerShellModulePath }',
+      "}",
       "function Start-IsolatedMcp([string] $Executable, [string] $ProcessData) {",
       "  $Info = [Diagnostics.ProcessStartInfo]::new()",
       "  $Info.FileName = $Executable",
@@ -1897,28 +2404,54 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
       "  $Info.RedirectStandardInput = $true",
       "  $Info.RedirectStandardOutput = $true",
       "  $Info.RedirectStandardError = $true",
-      '  $Info.EnvironmentVariables["USERPROFILE"] = $Profile',
-      '  $Info.EnvironmentVariables["HOME"] = $Profile',
-      '  $Info.EnvironmentVariables["LOCALAPPDATA"] = $LocalAppData',
-      '  $Info.EnvironmentVariables["APPDATA"] = $RoamingAppData',
-      '  $Info.EnvironmentVariables["SANA_DATA_DIR"] = $ProcessData',
-      '  $Info.EnvironmentVariables["SANA_TRANSCRIPTS_DIR"] = $Transcripts',
-      '  $Info.EnvironmentVariables["PATH"] = $IsolatedProcessPath',
-      '  $Info.EnvironmentVariables["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"',
-      "  return [Diagnostics.Process]::Start($Info)",
+      '  Set-RuntimeEnvironment $Info $ProcessData "http://127.0.0.1:1"',
+      "  $Process = [Diagnostics.Process]::Start($Info)",
+      "  [void]$Process.StandardOutput.ReadToEndAsync()",
+      "  [void]$Process.StandardError.ReadToEndAsync()",
+      "  return $Process",
       "}",
+      "function Assert-ConfigInstalled {",
+      "  $Config = [IO.File]::ReadAllText($VSCodeConfig) | ConvertFrom-Json",
+      '  if ($Config.unrelated.enabled -cne $true -or $Config.unrelated.nested.value -cne "preserve") { throw "unrelated VS Code root structure changed" }',
+      '  $Foreign = $Config.servers.PSObject.Properties["foreign"].Value',
+      '  if ($Foreign.type -cne "stdio" -or $Foreign.command -cne "C:\\Foreign Tool\\foreign.exe" -or $Foreign.args.Count -ne 3 -or $Foreign.args[0] -cne "mcp" -or $Foreign.args[1] -cne "literal * ? [x]" -or $Foreign.args[2] -cne "O\'Brien") { throw "foreign VS Code server changed" }',
+      '  $Managed = $Config.servers.PSObject.Properties["sana-mcp"].Value',
+      '  if (@($Config.servers.PSObject.Properties).Count -ne 2 -or $Managed.type -cne "stdio" -or $Managed.command -cne $InstalledBinary -or $Managed.args.Count -ne 1 -or $Managed.args[0] -cne "mcp") { throw "managed VS Code server is not the exact installed standalone target" }',
+      "}",
+      "function Assert-ConfigUninstalled {",
+      "  $Config = [IO.File]::ReadAllText($VSCodeConfig) | ConvertFrom-Json",
+      '  if ($Config.unrelated.enabled -cne $true -or $Config.unrelated.nested.value -cne "preserve") { throw "uninstall changed unrelated VS Code root structure" }',
+      '  if ($null -ne $Config.servers.PSObject.Properties["sana-mcp"]) { throw "uninstall retained the managed VS Code server" }',
+      '  $Foreign = $Config.servers.PSObject.Properties["foreign"].Value',
+      '  if (@($Config.servers.PSObject.Properties).Count -ne 1 -or $Foreign.type -cne "stdio" -or $Foreign.command -cne "C:\\Foreign Tool\\foreign.exe" -or $Foreign.args.Count -ne 3 -or $Foreign.args[0] -cne "mcp" -or $Foreign.args[1] -cne "literal * ? [x]" -or $Foreign.args[2] -cne "O\'Brien") { throw "uninstall changed the foreign VS Code server" }',
+      "}",
+      'if ($ForceTimeout) {',
+      '  [IO.Directory]::CreateDirectory($Root) | Out-Null',
+      '  $StubbornInfo = [Diagnostics.ProcessStartInfo]::new()',
+      '  $StubbornInfo.FileName = (Join-Path $PSHOME "powershell.exe")',
+      '  $StubbornInfo.Arguments = \'-NoProfile -NonInteractive -Command "while ($true) { Start-Sleep -Seconds 60 }"\'',
+      '  $StubbornInfo.UseShellExecute = $false',
+      '  $StubbornInfo.CreateNoWindow = $true',
+      '  $StubbornProcess = [Diagnostics.Process]::Start($StubbornInfo)',
+      '  Start-Sleep -Milliseconds 250',
+      '  if ($StubbornProcess.HasExited) { throw "forced stubborn descendant exited before outer timeout" }',
+      '  $StubbornStartTime = $StubbornProcess.StartTime.ToFileTimeUtc()',
+      '  $RootPublicationRecord = [ordered]@{ root=$Root; harnessPid=$PID; mode="forced-timeout"; childKind="stubborn"; childPid=$StubbornProcess.Id; childStartTime=[string]$StubbornStartTime; childPath=$StubbornProcess.Path }',
+      '  [IO.File]::WriteAllText($RootPublication,($RootPublicationRecord | ConvertTo-Json -Compress) + "`n",[Text.UTF8Encoding]::new($false))',
+      '  while ($true) { Start-Sleep -Seconds 60 }',
+      '}',
       "try {",
-      '  foreach ($Directory in @($Release,$Install,$Other,$Profile,$LocalAppData,$RoamingAppData,$Data,$Transcripts)) { [IO.Directory]::CreateDirectory($Directory) | Out-Null }',
+      '  foreach ($Directory in @($Release,$Install,$Other,$Profile,$LocalAppData,$RoamingAppData,$TempDirectory,$Data,$Transcripts,$OtherData,(Split-Path -Parent $VSCodeConfig))) { [IO.Directory]::CreateDirectory($Directory) | Out-Null }',
       '  [IO.File]::WriteAllBytes($DataSentinel, $DataSentinelBytes)',
       '  [IO.File]::WriteAllText($TranscriptSentinel, $TranscriptSentinelText, $Utf8NoBom)',
-      '  [IO.Directory]::CreateDirectory((Join-Path $Profile ".codex")) | Out-Null',
+      '  $SeedConfig = [ordered]@{ servers=[ordered]@{ foreign=[ordered]@{ type="stdio"; command="C:\\Foreign Tool\\foreign.exe"; args=@("mcp","literal * ? [x]","O\'Brien") } }; unrelated=[ordered]@{ enabled=$true; nested=[ordered]@{ value="preserve" } } }',
+      '  [IO.File]::WriteAllText($VSCodeConfig, ($SeedConfig | ConvertTo-Json -Depth 20), $Utf8NoBom)',
       '  Copy-Item -Path (Join-Path $FixtureSource "*") -Destination $Release -Force',
+      '  [IO.File]::SetAttributes($ProbePath, [IO.FileAttributes]::ReadOnly)',
       `  Copy-Item -LiteralPath (Join-Path $FixtureSource "${predecessorWindowsFixture}") -Destination $InstalledBinary`,
       '  Copy-Item -LiteralPath $InstalledBinary -Destination $OtherBinary',
-      '  Copy-Item -LiteralPath (Join-Path $FixtureSource "old-receipt") -Destination (Join-Path $Install ".sana-mcp-install-v1")',
+      '  Copy-Item -LiteralPath (Join-Path $FixtureSource "old-receipt") -Destination $ReceiptPath',
       '  $OldProcess = Start-IsolatedMcp $InstalledBinary $Data',
-      '  $OtherData = Join-Path $Root "other-data"',
-      '  [IO.Directory]::CreateDirectory($OtherData) | Out-Null',
       '  $OtherProcess = Start-IsolatedMcp $OtherBinary $OtherData',
       '  Start-Sleep -Milliseconds 500',
       '  if ($OldProcess.HasExited -or $OtherProcess.HasExited) { throw "fixture MCP process exited before installation" }',
@@ -1930,10 +2463,17 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
       '  $InstallerInfo.RedirectStandardOutput = $true',
       '  $InstallerInfo.RedirectStandardError = $true',
       ...compatibleUpdateInstallerEnvironmentLines,
+      '  $InstallerInfo.EnvironmentVariables["TEMP"] = $TempDirectory',
+      '  $InstallerInfo.EnvironmentVariables["TMP"] = $TempDirectory',
+      '  $InstallerInfo.EnvironmentVariables["TMPDIR"] = $TempDirectory',
+      '  foreach ($Key in $AuthorityKeys) { if ($Key -notin @("SANA_MCP_TEST_RELEASE_DIR","SANA_MCP_VERSION","SANA_MCP_YES")) { [void]$InstallerInfo.EnvironmentVariables.Remove($Key) } }',
       '  $InstallerProcess = [Diagnostics.Process]::Start($InstallerInfo)',
-      '  $Stdout = $InstallerProcess.StandardOutput.ReadToEnd()',
-      '  $Stderr = $InstallerProcess.StandardError.ReadToEnd()',
-      '  if (-not $InstallerProcess.WaitForExit(60000)) { $InstallerProcess.Kill(); throw "installer timed out" }',
+      '  $InstallerStdoutTask = $InstallerProcess.StandardOutput.ReadToEndAsync()',
+      '  $InstallerStderrTask = $InstallerProcess.StandardError.ReadToEndAsync()',
+      '  if (-not $InstallerProcess.WaitForExit(60000)) { $InstallerProcess.Kill(); [void]$InstallerProcess.WaitForExit(3000); throw "installer timed out" }',
+      '  $InstallerProcess.WaitForExit()',
+      '  $Stdout = $InstallerStdoutTask.GetAwaiter().GetResult()',
+      '  $Stderr = $InstallerStderrTask.GetAwaiter().GetResult()',
       '  if ($InstallerProcess.ExitCode -ne 0) { throw "installer failed: $Stdout`n$Stderr" }',
       '  if (-not $OldProcess.WaitForExit(5000)) { throw "active installed MCP process survived replacement" }',
       '  if ($OtherProcess.HasExited) { throw "same-name other-path process was terminated" }',
@@ -1942,16 +2482,127 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
       `  if ((Get-FileHash -LiteralPath $InstalledBinary -Algorithm SHA256).Hash.ToLowerInvariant() -cne "${currentBinaryHash}") { throw "final binary digest mismatch" }`,
       '  if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($DataSentinel)) -cne $ExpectedDataSentinelBytes) { throw "compatible update mutated the data sentinel" }',
       '  if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($TranscriptSentinel)) -cne $ExpectedTranscriptSentinelBytes -or [IO.File]::ReadAllText($TranscriptSentinel, $Utf8NoBom) -cne $TranscriptSentinelText) { throw "compatible update mutated the transcript sentinel" }',
-      '  $Receipt = @{}; foreach ($Line in [IO.File]::ReadAllLines((Join-Path $Install ".sana-mcp-install-v1"))) { if ($Line) { $Index=$Line.IndexOf("="); $Receipt[$Line.Substring(0,$Index)]=$Line.Substring($Index+1) } }',
+      '  $Receipt = @{}; foreach ($Line in [IO.File]::ReadAllLines($ReceiptPath)) { if ($Line) { $Index=$Line.IndexOf("="); $Receipt[$Line.Substring(0,$Index)]=$Line.Substring($Index+1) } }',
       `  if ($Receipt.Count -ne 10 -or $Receipt["format"] -cne "sana-mcp-install-v2" -or $Receipt["version"] -cne "${currentVersion}" -or $Receipt["target"] -cne "bun-windows-x64" -or $Receipt["sourceCommit"] -cne "${sourceCommit}" -or $Receipt["binarySha256"] -cne "${currentBinaryHash}" -or $Receipt["pathManaged"] -cne "false" -or $Receipt["installerProtocol"] -cne "${currentIdentity.installerProtocol}" -or $Receipt["lifecycleProtocol"] -cne "${currentIdentity.lifecycleProtocol}" -or $Receipt["inspectProtocol"] -cne "${currentIdentity.inspectProtocol}" -or $Receipt["stateCompatibility"] -cne "${currentIdentity.stateCompatibility}") { throw "final receipt tuple mismatch" }`,
       '  $Unexpected = @(Get-ChildItem -LiteralPath $Install -Force | Where-Object { $_.Name -notin @("sana-mcp.exe", ".sana-mcp-install-v1") })',
       '  if ($Unexpected.Count -ne 0) { throw "installer artifacts remained: $($Unexpected.Name -join \', \')" }',
       '  if ([Environment]::GetEnvironmentVariable("Path", "User") -cne $OriginalUserPath) { throw "installer changed the real User PATH" }',
       '  if (Test-Path -LiteralPath $SerializationLock) { throw "installer left the real known-folder serialization lock: $SerializationLock" }',
+      "  Assert-ConfigInstalled",
+      '  $FakeArguments = @($FakeServerSource,"--mode","native","--scenario","happy","--ready-file",$FakeReady,"--state-file",$FakeState,"--fixture",$ObservedFixture,"--native-release-file",$NativeRelease,"--parent-pid",[string]$PID,"--lifetime-ms","55000")',
+      "  $FakeInfo = [Diagnostics.ProcessStartInfo]::new()",
+      "  $FakeInfo.FileName = $Bun",
+      "  $FakeInfo.Arguments = Join-NativeArguments $FakeArguments",
+      "  $FakeInfo.WorkingDirectory = $Repository",
+      "  $FakeInfo.UseShellExecute = $false",
+      "  $FakeInfo.CreateNoWindow = $true",
+      "  $FakeInfo.RedirectStandardOutput = $true",
+      "  $FakeInfo.RedirectStandardError = $true",
+      "  Remove-ProcessAuthority $FakeInfo",
+      '  foreach ($Pair in @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD"; TEMP=$TempDirectory; TMP=$TempDirectory; TMPDIR=$TempDirectory; PSModulePath=$WindowsPowerShellModulePath }.GetEnumerator()) { $FakeInfo.EnvironmentVariables[$Pair.Key] = $Pair.Value }',
+      "  $FakeProcess = [Diagnostics.Process]::Start($FakeInfo)",
+      "  $FakePid = $FakeProcess.Id",
+      "  $FakeStartTime = $FakeProcess.StartTime.ToFileTimeUtc()",
+      "  $FakePath = $FakeProcess.Path",
+      "  $FakeStdoutTask = $FakeProcess.StandardOutput.ReadToEndAsync()",
+      "  $FakeStderrTask = $FakeProcess.StandardError.ReadToEndAsync()",
+      '  Wait-Until { (Test-Path -LiteralPath $FakeReady -PathType Leaf) -or $FakeProcess.HasExited } "fake Sana readiness"',
+      '  if ($FakeProcess.HasExited) { throw "fake Sana exited before readiness: $($FakeStdoutTask.GetAwaiter().GetResult())$($FakeStderrTask.GetAwaiter().GetResult())" }',
+      "  $Ready = [IO.File]::ReadAllText($FakeReady) | ConvertFrom-Json",
+      '  if ($Ready.mode -cne "native" -or $Ready.scenario -cne "happy" -or $Ready.parentPid -ne $PID -or $Ready.pid -ne $FakePid -or $FakeProcess.StartTime.ToFileTimeUtc() -ne $FakeStartTime -or -not [string]::Equals($FakeProcess.Path,$FakePath,[StringComparison]::OrdinalIgnoreCase) -or $Ready.origin -cnotmatch \'^http://127\\.0\\.0\\.1:[1-9][0-9]*$\') { throw "fake Sana readiness tuple is invalid" }',
+      "  $RuntimeEnvironment = Runtime-Environment $Ready.origin",
+      '  $Request = Invoke-Isolated $InstalledBinary @("login","--email","synthetic@example.test") $RuntimeEnvironment',
+      '  $ExpectedRequestOutput = "We emailed a 6-digit code to synthetic@example.test.`nFinish signing in: sana-mcp login --email synthetic@example.test --code <code>`n"',
+      '  if ($Request.Status -ne 0 -or ($Request.Stdout -replace "`r`n","`n") -cne $ExpectedRequestOutput -or $Request.Stderr -cne "") { throw "request-code CLI output mismatch: $($Request.Status)`n$($Request.Stdout)`n$($Request.Stderr)" }',
+      '  $Verify = Invoke-Isolated $InstalledBinary @("login","--email","synthetic@example.test","--code","123456") $RuntimeEnvironment',
+      '  if ($Verify.Status -ne 0 -or ($Verify.Stdout -replace "`r`n","`n") -cne "Signed in as synthetic@example.test. Your meetings are syncing.`n" -or $Verify.Stderr -cne "") { throw "verify-code CLI output mismatch: $($Verify.Status)`n$($Verify.Stdout)`n$($Verify.Stderr)" }',
+      '  Wait-Until { if (-not (Test-Path -LiteralPath $FakeState -PathType Leaf)) { return $false }; try { return (([IO.File]::ReadAllText($FakeState) | ConvertFrom-Json).kind -ceq "daemon-blocked") } catch { return $false } } "native daemon request gate"',
+      '  $ProbeEnvironment = @{} + $RuntimeEnvironment; $ProbeEnvironment["SANA_TEST_REPOSITORY"]=$Repository; $ProbeEnvironment["SANA_TEST_ORIGIN"]=$Ready.origin',
+      '  $BlockedState = [IO.File]::ReadAllText($FakeState) | ConvertFrom-Json',
+      '  if ($BlockedState.kind -cne "daemon-blocked" -or $BlockedState.mode -cne "native" -or $BlockedState.scenario -cne "happy" -or $BlockedState.requests.Count -ne 5) { throw "native request gate did not hold the exact five-request pre-release sequence" }',
+      '  $BlockedSession = [IO.File]::ReadAllText((Join-Path $Data "session.json")) | ConvertFrom-Json',
+      '  $BlockedToken = [string]$BlockedSession.publicationToken',
+      '  if ($BlockedSession.generation -ne 2 -or $BlockedSession.authenticatedOrigin -cne $Ready.origin -or $BlockedSession.userId -cne "synthetic-user" -or $BlockedSession.workspaceId -cne "synthetic-workspace" -or $BlockedSession.email -cne "synthetic@example.test" -or $null -ne $BlockedSession.pendingLogin -or $BlockedSession.cookies.PSObject.Properties["sana-ai-session"].Value -cne "fresh-session" -or $BlockedToken -cnotmatch \'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$\') { throw "generation-two session publication tuple is not exact" }',
+      '  $BlockedControl = [IO.File]::ReadAllText((Join-Path $Data "daemon-control.json")) | ConvertFrom-Json',
+      '  if ($BlockedControl.protocol -ne 1 -or $BlockedControl.pid -le 0 -or $BlockedControl.instanceId -cnotmatch \'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$\' -or (Test-Path -LiteralPath (Join-Path $Data "daemon-stop.json"))) { throw "generation-two daemon control tuple is not exact" }',
+      "  $DaemonPid = [int]$BlockedControl.pid",
+      "  $DaemonInstanceId = [string]$BlockedControl.instanceId",
+      "  $CapturedDaemon = Get-Process -Id $DaemonPid -ErrorAction Stop",
+      "  $DaemonStartTime = $CapturedDaemon.StartTime.ToFileTimeUtc()",
+      "  $DaemonPath = $CapturedDaemon.Path",
+      '  if (-not [string]::Equals($DaemonPath,$InstalledBinary,[StringComparison]::OrdinalIgnoreCase)) { throw "captured daemon path is not the installed runtime" }',
+      '  [IO.File]::WriteAllText($NativeRelease, "release`n", $Utf8NoBom)',
+      '  Wait-Until { $FakeProcess.HasExited } "fake Sana response completion" 10000',
+      '  $SyncedSession = $null; $SyncDeadline = [DateTime]::UtcNow.AddMilliseconds(20000)',
+      "  while ($null -eq $SyncedSession -and [DateTime]::UtcNow -lt $SyncDeadline) {",
+      '    try { $CandidateSession = [IO.File]::ReadAllText((Join-Path $Data "session.json")) | ConvertFrom-Json; if ($CandidateSession.generation -eq 3) { $SyncedSession=$CandidateSession } } catch {}',
+      '    if ($null -eq $SyncedSession) { Start-Sleep -Milliseconds 20 }',
+      "  }",
+      '  if ($null -eq $SyncedSession) { throw "timed out waiting for generation-three session publication" }',
+      '  $SyncedToken = [string]$SyncedSession.publicationToken',
+      '  if ($SyncedSession.generation -ne 3 -or $SyncedSession.authenticatedOrigin -cne $Ready.origin -or $SyncedSession.userId -cne "synthetic-user" -or $SyncedSession.workspaceId -cne "synthetic-workspace" -or $SyncedSession.email -cne "synthetic@example.test" -or $null -ne $SyncedSession.pendingLogin -or $SyncedSession.cookies.PSObject.Properties["sana-ai-session"].Value -cne "fresh-session" -or $SyncedToken -cnotmatch \'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$\' -or $SyncedToken -ceq $BlockedToken) { throw "generation-three session publication tuple is not exact" }',
+      '  $DatabaseFiles = @((Join-Path $Data "sana.db"),(Join-Path $Data "sana.db-wal"),(Join-Path $Data "sana.db-shm"))',
+      '  $PreviousDatabaseStamp = $null; $StableDatabaseObservations = 0; $QuiescenceDeadline = [DateTime]::UtcNow.AddMilliseconds(5000)',
+      '  while ($StableDatabaseObservations -lt 3 -and [DateTime]::UtcNow -lt $QuiescenceDeadline) {',
+      '    $DatabaseStamp = (($DatabaseFiles | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | ForEach-Object { $Item=Get-Item -LiteralPath $_ -Force; "$($Item.FullName)|$($Item.Length)|$($Item.LastWriteTimeUtc.Ticks)" }) -join "`n")',
+      '    if (-not [string]::IsNullOrWhiteSpace($DatabaseStamp) -and $DatabaseStamp -ceq $PreviousDatabaseStamp) { $StableDatabaseObservations++ } else { $StableDatabaseObservations=0; $PreviousDatabaseStamp=$DatabaseStamp }',
+      '    if ($StableDatabaseObservations -lt 3) { Start-Sleep -Milliseconds 100 }',
+      '  }',
+      '  if ($StableDatabaseObservations -lt 3) { throw "daemon database files did not become quiescent after the exact response sequence" }',
+      "  $BeforeStop = Get-Process -Id $DaemonPid -ErrorAction Stop",
+      '  $BeforeStopControl = [IO.File]::ReadAllText((Join-Path $Data "daemon-control.json")) | ConvertFrom-Json',
+      '  if ($BeforeStop.StartTime.ToFileTimeUtc() -ne $DaemonStartTime -or -not [string]::Equals($BeforeStop.Path,$DaemonPath,[StringComparison]::OrdinalIgnoreCase) -or $BeforeStopControl.pid -ne $DaemonPid -or $BeforeStopControl.instanceId -cne $DaemonInstanceId) { throw "daemon identity changed before lifecycle stop" }',
+      '  $Lifecycle = Invoke-Isolated $InstalledBinary @("__lifecycle","stop","--format","properties") $RuntimeEnvironment',
+      '  if ($Lifecycle.Status -ne 0 -or ($Lifecycle.Stdout -replace "`r`n","`n") -cne "lifecycleProtocol=1`nstate=stopped`nchanged=true`n" -or $Lifecycle.Stderr -cne "") { throw "lifecycle stop output mismatch: $($Lifecycle.Status)`n$($Lifecycle.Stdout)`n$($Lifecycle.Stderr)" }',
+      '  Wait-Until { $null -eq (Get-Process -Id $DaemonPid -ErrorAction SilentlyContinue) } "exact daemon PID reaping" 5000',
+      '  $PostStopAudit = Invoke-Isolated $Bun @($ProbePath,[string]$DaemonPid,$DaemonInstanceId) $ProbeEnvironment',
+      '  if ($PostStopAudit.Status -ne 0 -or $PostStopAudit.Stderr -cne "" -or (($PostStopAudit.Stdout | ConvertFrom-Json).kind -cne "post-stop-audit")) { throw "post-stop state audit failed: $($PostStopAudit.Stdout)`n$($PostStopAudit.Stderr)" }',
+      '  $SyncedStatus = Invoke-Isolated $InstalledBinary @("status") $RuntimeEnvironment',
+      '  if ($SyncedStatus.Status -ne 0 -or ($SyncedStatus.Stdout -replace "`r`n","`n") -cne "Sync status: synced`nMeetings: 0`nTranscripts: 0/0`n" -or $SyncedStatus.Stderr -cne "") { throw "generation-three synced status mismatch: $($SyncedStatus.Status)`n$($SyncedStatus.Stdout)`n$($SyncedStatus.Stderr)" }',
+      '  $List = Invoke-Isolated $InstalledBinary @("list") $RuntimeEnvironment',
+      '  if ($List.Status -ne 0 -or ($List.Stdout -replace "`r`n","`n") -cne "No synced meetings found.`n" -or $List.Stderr -cne "") { throw "installed list output mismatch: $($List.Status)`n$($List.Stdout)`n$($List.Stderr)" }',
+      '  $Uninstall = Invoke-Isolated $InstalledBinary @("uninstall","--yes") $RuntimeEnvironment',
+      '  if ($Uninstall.Status -ne 0) { throw "installed uninstall failed: $($Uninstall.Stdout)`n$($Uninstall.Stderr)" }',
+      "  Assert-ConfigUninstalled",
+      '  if (-not (Test-Path -LiteralPath $InstalledBinary -PathType Leaf) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { throw "config-only uninstall removed installer-owned runtime artifacts" }',
+      '  if ($OtherProcess.HasExited -or -not (Test-Path -LiteralPath $OtherBinary -PathType Leaf)) { throw "same-name other-path runtime did not survive the complete lifecycle" }',
+      '  if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($DataSentinel)) -cne $ExpectedDataSentinelBytes -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($TranscriptSentinel)) -cne $ExpectedTranscriptSentinelBytes) { throw "compatible auth/transcript sentinels changed after login, sync, or uninstall" }',
+      '  $FakeProcess.WaitForExit(); $FakeStdout=$FakeStdoutTask.GetAwaiter().GetResult(); $FakeStderr=$FakeStderrTask.GetAwaiter().GetResult()',
+      '  $CompletedState = [IO.File]::ReadAllText($FakeState) | ConvertFrom-Json',
+      '  if ($FakeProcess.ExitCode -ne 0 -or $FakeStdout -cne "" -or $FakeStderr -cne "" -or $CompletedState.kind -cne "complete" -or $CompletedState.mode -cne "native" -or $CompletedState.scenario -cne "happy" -or $CompletedState.requests.Count -ne 6) { throw "fake Sana did not complete the exact six-request native sequence: $FakeStdout$FakeStderr" }',
+      '  if ([Environment]::GetEnvironmentVariable("Path", "User") -cne $OriginalUserPath) { throw "complete lifecycle changed the real User PATH" }',
       "} catch {",
       '  $PrimaryError = $_.Exception',
       "} finally {",
       '  $CleanupFailures = @()',
+      '  if ($null -ne $DaemonPid) {',
+      '    try {',
+      '      if (-not (Test-Path -LiteralPath $NativeRelease -PathType Leaf)) { [IO.File]::WriteAllText($NativeRelease, "release`n", $Utf8NoBom) }',
+      '      $CleanupDaemon = Get-Process -Id $DaemonPid -ErrorAction SilentlyContinue',
+      '      if ($null -ne $CleanupDaemon -and $null -ne $RuntimeEnvironment -and (Test-Path -LiteralPath $InstalledBinary -PathType Leaf)) {',
+      '        $CleanupLifecycle = Invoke-Isolated $InstalledBinary @("__lifecycle","stop","--format","properties") $RuntimeEnvironment',
+      '        if ($CleanupLifecycle.Status -ne 0) { $CleanupFailures += "reviewed lifecycle stop failed: $($CleanupLifecycle.Stdout)$($CleanupLifecycle.Stderr)" }',
+      '        $CleanupDaemon = Get-Process -Id $DaemonPid -ErrorAction SilentlyContinue',
+      '      }',
+      '      if ($null -ne $CleanupDaemon) {',
+      '        $ControlPath = Join-Path $Data "daemon-control.json"',
+      '        if ($null -eq $DaemonStartTime -or $null -eq $DaemonPath -or -not (Test-Path -LiteralPath $ControlPath -PathType Leaf)) { throw "live daemon lacks captured fallback authority" }',
+      '        $Control = [IO.File]::ReadAllText($ControlPath) | ConvertFrom-Json',
+      '        if ($Control.pid -ne $DaemonPid -or $Control.instanceId -cne $DaemonInstanceId -or $CleanupDaemon.StartTime.ToFileTimeUtc() -ne $DaemonStartTime -or -not [string]::Equals($CleanupDaemon.Path,$DaemonPath,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($DaemonPath,$InstalledBinary,[StringComparison]::OrdinalIgnoreCase)) { throw "refused to signal a daemon without captured PID/path/start-time/control continuity" }',
+      '        $CleanupDaemon.Kill()',
+      '        if (-not $CleanupDaemon.WaitForExit(3000)) { throw "captured daemon fallback handle did not exit" }',
+      '      }',
+      '    } catch { $CleanupFailures += $_.Exception.Message }',
+      '  }',
+      '  if ($null -ne $FakeProcess) {',
+      '    try {',
+      '      if (-not $FakeProcess.HasExited) {',
+      '        if ($FakeProcess.Id -ne $FakePid -or $FakeProcess.StartTime.ToFileTimeUtc() -ne $FakeStartTime -or -not [string]::Equals($FakeProcess.Path,$FakePath,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($FakePath,$Bun,[StringComparison]::OrdinalIgnoreCase)) { throw "owned fake Sana process lost PID/path/start-time continuity" }',
+      '        $FakeProcess.Kill()',
+      '      }',
+      '      if (-not $FakeProcess.WaitForExit(3000)) { throw "owned fake Sana handle did not exit" }',
+      '    } catch { $CleanupFailures += $_.Exception.Message }',
+      '  }',
       '  foreach ($ProcessToClean in @($OldProcess,$OtherProcess,$InstallerProcess)) {',
       '    if ($null -eq $ProcessToClean) { continue }',
       '    try {',
@@ -1959,29 +2610,288 @@ test(`Windows full installer replaces an active receipt-backed ${predecessorTag}
       '      if (-not $ProcessToClean.WaitForExit(3000)) { throw "PID $($ProcessToClean.Id) did not exit within cleanup deadline" }',
       '    } catch { $CleanupFailures += $_.Exception.Message }',
       "  }",
-      '  try { if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force }; if (Test-Path -LiteralPath $Root) { throw "isolated root still exists" } } catch { $CleanupFailures += "could not remove isolated root $Root`: $($_.Exception.Message)" }',
+      '  try { if (Test-Path -LiteralPath $Root) { Get-ChildItem -LiteralPath $Root -Recurse -Force | Where-Object { -not $_.PSIsContainer } | ForEach-Object { $_.IsReadOnly=$false }; Remove-Item -LiteralPath $Root -Recurse -Force }; if (Test-Path -LiteralPath $Root) { throw "isolated root still exists" } } catch { $CleanupFailures += "could not remove isolated root $Root`: $($_.Exception.Message)" }',
       '  if (Test-Path -LiteralPath $SerializationLock) { $CleanupFailures += "real serialization lock remained at $SerializationLock" }',
+      '  if ([Environment]::GetEnvironmentVariable("Path", "User") -cne $OriginalUserPath) { $CleanupFailures += "real User PATH changed" }',
       "}",
       'if ($null -ne $PrimaryError) { if ($CleanupFailures.Count -gt 0) { throw "$($PrimaryError.Message); cleanup failed: $($CleanupFailures -join \'; \')" }; throw $PrimaryError }',
       'if ($CleanupFailures.Count -gt 0) { throw "cleanup failed: $($CleanupFailures -join \'; \')" }',
+      'Write-Output "native compatible-update auth/sync/uninstall E2E passed"',
       "",
     ].join("\n"),
   );
-  try {
-    const result = spawnSync(
+    const forcedPublicationPath = path.join(
+      temporary,
+      "forced-timeout-root.json",
+    );
+    const unrelatedSentinelPath = path.join(
+      temporary,
+      "unrelated-sentinel.txt",
+    );
+    await writeFile(unrelatedSentinelPath, "unrelated sentinel\n");
+    const unrelated = spawn(
       powershell,
-      ["-NoProfile", "-NonInteractive", "-File", windowsPath(harnessPath)],
-      { encoding: "utf8", timeout: 120_000 },
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "while ($true) { Start-Sleep -Seconds 60 }",
+      ],
+      {
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    unrelated.stdout.resume();
+    unrelated.stderr.resume();
+    await once(unrelated, "spawn");
+    const unrelatedClosed = new Promise<void>((resolve) => {
+      unrelated.once("close", () => resolve());
+    });
+    let forcedHostRoot: string | undefined;
+    try {
+      const forced = await runOwnedProcess(
+        powershell,
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-File",
+          windowsPath(harnessPath),
+          "-RootPublication",
+          windowsPath(forcedPublicationPath),
+          "-ForceTimeout",
+        ],
+        {
+          timeoutMs: 3_000,
+        },
+      );
+      assert.equal(forced.timedOut, true, forced.stderr || forced.stdout);
+      const forcedRecord = JSON.parse(
+        await readFile(forcedPublicationPath, "utf8"),
+      ) as {
+        root: string;
+        mode: string;
+        childKind: string;
+        childPid: number;
+        childStartTime: string;
+        childPath: string;
+      };
+      assert.equal(forcedRecord.mode, "forced-timeout");
+      assert.equal(forcedRecord.childKind, "stubborn");
+      assert.match(
+        path.win32.basename(forcedRecord.root),
+        /^sana mcp e2e O'Brien [0-9a-f]{32}$/u,
+      );
+      assert.ok(
+        Number.isSafeInteger(forcedRecord.childPid) &&
+          forcedRecord.childPid > 0 &&
+          /^[1-9][0-9]*$/u.test(forcedRecord.childStartTime) &&
+          path.win32.isAbsolute(forcedRecord.childPath),
+      );
+      const childProbe = await runOwnedProcess(
+        powershell,
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$Observed=Get-Process -Id $env:CHILD_PID -ErrorAction SilentlyContinue",
+            "if ($null -eq $Observed) { exit 0 }",
+            "$ObservedStart=$Observed.StartTime.ToFileTimeUtc()",
+            "if ($ObservedStart -ne [int64]$env:CHILD_START -or -not [string]::Equals($Observed.Path,$env:CHILD_PATH,[StringComparison]::OrdinalIgnoreCase)) { exit 0 }",
+            "exit 1",
+          ].join("; "),
+        ],
+        {
+          timeoutMs: 5_000,
+          env: {
+            ...process.env,
+            CHILD_PID: String(forcedRecord.childPid),
+            CHILD_START: String(forcedRecord.childStartTime),
+            CHILD_PATH: forcedRecord.childPath,
+          },
+        },
+      );
+      assert.equal(
+        childProbe.status,
+        0,
+        "Job Object did not reap the exact stubborn descendant",
+      );
+      assert.equal(
+        unrelated.exitCode,
+        null,
+        "Job Object affected the unrelated owned sentinel process",
+      );
+      assert.equal(
+        await readFile(unrelatedSentinelPath, "utf8"),
+        "unrelated sentinel\n",
+      );
+      forcedHostRoot =
+        process.platform === "win32"
+          ? forcedRecord.root
+          : (() => {
+              const converted = spawnSync(
+                "wslpath",
+                ["-u", forcedRecord.root],
+                { encoding: "utf8" },
+              );
+              assert.equal(converted.status, 0, converted.stderr);
+              return converted.stdout.trim();
+            })();
+      await rm(forcedHostRoot, { recursive: true, force: false });
+      await assert.rejects(access(forcedHostRoot), {
+        code: "ENOENT",
+      });
+    } finally {
+      if (forcedHostRoot === undefined) {
+        try {
+          const published = JSON.parse(
+            await readFile(forcedPublicationPath, "utf8"),
+          ) as { root?: unknown };
+          if (
+            typeof published.root === "string" &&
+            /^sana mcp e2e O'Brien [0-9a-f]{32}$/u.test(
+              path.win32.basename(published.root),
+            )
+          ) {
+            forcedHostRoot =
+              process.platform === "win32"
+                ? published.root
+                : (() => {
+                    const converted = spawnSync(
+                      "wslpath",
+                      ["-u", published.root as string],
+                      { encoding: "utf8" },
+                    );
+                    return converted.status === 0
+                      ? converted.stdout.trim()
+                      : undefined;
+                  })();
+          }
+        } catch {
+          // The primary forced-mode assertion retains authority.
+        }
+      }
+      if (forcedHostRoot !== undefined) {
+        await rm(forcedHostRoot, { recursive: true, force: true });
+      }
+      if (unrelated.exitCode === null && unrelated.signalCode === null) {
+        unrelated.kill("SIGKILL");
+      }
+      const sentinelSettled = await Promise.race([
+        unrelatedClosed.then(() => true),
+        new Promise<false>((resolve) =>
+          setTimeout(() => resolve(false), 5_000),
+        ),
+      ]);
+      if (!sentinelSettled) {
+        throw new Error(
+          "owned unrelated sentinel did not close within 5000ms",
+        );
+      }
+    }
+    const result = await runOwnedProcess(
+      powershell,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        windowsPath(harnessPath),
+        "-RootPublication",
+        windowsPath(rootPublicationPath),
+      ],
+      {
+        timeoutMs: 120_000,
+      },
     );
     assert.equal(result.status, 0, result.stderr || result.stdout);
+  } catch (error) {
+    primaryError = error;
   } finally {
-    await rm(temporary, { recursive: true, force: true });
+    const cleanupErrors: unknown[] = [];
+    try {
+      const published = JSON.parse(
+        await readFile(rootPublicationPath, "utf8"),
+      ) as { root?: unknown };
+      if (
+        typeof published.root !== "string" ||
+        !/^sana mcp e2e O'Brien [0-9a-f]{32}$/u.test(
+          path.win32.basename(published.root),
+        )
+      ) {
+        throw new Error(
+          "Windows harness published an invalid isolated root",
+        );
+      }
+      const hostRoot =
+        process.platform === "win32"
+          ? published.root
+          : (() => {
+              const converted = spawnSync(
+                "wslpath",
+                ["-u", published.root],
+                { encoding: "utf8" },
+              );
+              if (converted.status !== 0) {
+                throw new Error(
+                  `could not resolve published Windows root: ${converted.stderr}`,
+                );
+              }
+              return converted.stdout.trim();
+            })();
+      await rm(hostRoot, { recursive: true, force: true });
+      try {
+        await access(hostRoot);
+        throw new Error("published Windows root remained after cleanup");
+      } catch (error) {
+        if (
+          !(
+            error instanceof Error &&
+            "code" in error &&
+            (error as NodeJS.ErrnoException).code === "ENOENT"
+          )
+        ) {
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (
+        !(
+          error instanceof Error &&
+          "code" in error &&
+          (error as NodeJS.ErrnoException).code === "ENOENT"
+        )
+      ) {
+        cleanupErrors.push(error);
+      }
+    }
+    try {
+      await rm(temporary, { recursive: true, force: true });
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (primaryError !== undefined) {
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [primaryError, ...cleanupErrors],
+          "native Windows E2E and cleanup failed",
+        );
+      }
+      throw primaryError;
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        cleanupErrors,
+        "native Windows E2E cleanup failed",
+      );
+    }
   }
 });
 
 test("Windows confirms incompatible replacement before download and resets state transactionally", async () => {
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const cli = await readFile(path.join(root, "src/cli.ts"), "utf8");
+  const lifecycle = await readFile(path.join(root, "src/sync/lifecycle.ts"), "utf8");
   assert.match(installer, /^# Install[\s\S]*\n& \{\n/u);
   assert.doesNotMatch(installer, /\$script:/u);
   const acquireSharedLock = installer.indexOf(
@@ -2224,10 +3134,11 @@ test("Windows confirms incompatible replacement before download and resets state
     installer,
     /if \(\$RetiredArtifact\.safe\) \{[\s\S]*?Remove-Item[\s\S]*?\} else \{[\s\S]*?retained authoritative retired file at/u,
   );
-  assert.match(
-    cli,
-    /let stoppedObservations = 0;[\s\S]*?while \(Date\.now\(\) < deadline\)[\s\S]*?stoppedObservations >= 3[\s\S]*?requestDaemonStop\(stoppedPid\)[\s\S]*?while \(pidAlive\(stoppedPid\)\)/u,
-  );
+  // The lifecycle stop flow drives a stable-observation loop, publishes a stop
+  // request, and waits for the exact process to exit before declaring stopped.
+  assert.match(lifecycle, /stoppedObservations[\s\S]*?publishStop[\s\S]*?pidAlive/u);
+  assert.match(lifecycle, /stableStopped[\s\S]*?stoppedObservations/u);
+  assert.match(cli, /runDaemonLifecycle/u);
 });
 
 test("advertised install commands stay concise and match installer headers", async () => {

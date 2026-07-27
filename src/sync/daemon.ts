@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import {
   SanaStore,
   SyncGenerationChangedError,
@@ -11,6 +12,7 @@ import {
   DaemonLeaseLostError,
   DaemonStaleOwnerError,
   heartbeatDaemonLease,
+  pidAlive,
 } from "./lock.js";
 import {
   semanticEnabled,
@@ -28,8 +30,11 @@ import {
 import {
   clearDaemonControl,
   daemonStopRequested,
+  observeDaemonControl,
   publishDaemonControl,
+  refreshDaemonControl,
   type DaemonControlIdentity,
+  type DaemonControlObservation,
 } from "./control.js";
 
 const INCREMENTAL_INTERVAL_MS = RUNTIME_ENV.syncIntervalMs;
@@ -46,11 +51,42 @@ class DaemonStopRequestedError extends Error {
   }
 }
 
+export interface ForegroundControlDependencies {
+  readonly observeControl: () => DaemonControlObservation;
+  readonly pidAlive: (pid: number) => boolean;
+  readonly clearControl: (identity: DaemonControlIdentity) => void;
+}
+
+export function retireDeadForegroundControl(
+  dependencies: ForegroundControlDependencies,
+): void {
+  const observed = dependencies.observeControl();
+  if (observed.kind === "missing") return;
+  if (observed.kind === "legacy") {
+    throw new Error(
+      "Foreground daemon found legacy control authority; use the verified installer replacement path",
+    );
+  }
+  if (dependencies.pidAlive(observed.identity.pid)) {
+    throw new Error(
+      `Foreground daemon control still names live process ${observed.identity.pid}; refusing restart`,
+    );
+  }
+  dependencies.clearControl(observed.identity);
+  const after = dependencies.observeControl();
+  if (after.kind !== "missing") {
+    throw new Error(
+      "Foreground daemon control changed during proven-dead retirement; preserved the current authority",
+    );
+  }
+}
+
 function heartbeat(
   store: SanaStore,
   control: DaemonControlIdentity,
 ): boolean {
   heartbeatDaemonLease(store, control.instanceId);
+  refreshDaemonControl(control);
   return daemonStopRequested(control.instanceId);
 }
 
@@ -61,10 +97,15 @@ async function heartbeatSleep(
   stop: () => boolean,
   control: DaemonControlIdentity,
 ): Promise<void> {
-  const end = Date.now() + ms;
-  while (Date.now() < end && !stop()) {
+  const startedAt = performance.now();
+  while (performance.now() - startedAt < ms && !stop()) {
     if (heartbeat(store, control)) return;
-    await sleep(Math.min(HEARTBEAT_MS, end - Date.now()));
+    await sleep(
+      Math.max(
+        0,
+        Math.min(HEARTBEAT_MS, ms - (performance.now() - startedAt)),
+      ),
+    );
   }
 }
 
@@ -112,9 +153,11 @@ export async function syncOnce(
   cycle: SyncCycleIdentity,
   leaseInstanceId: string,
   stopRequested: () => boolean = () => false,
+  controlHeartbeat: () => void = () => {},
 ): Promise<void> {
   const heartbeatOrStop = (): void => {
     heartbeatDaemonLease(store, leaseInstanceId);
+    controlHeartbeat();
     if (stopRequested()) throw new DaemonStopRequestedError();
   };
   const initialState = store.getSyncState();
@@ -340,6 +383,11 @@ export async function syncOnce(
 }
 
 export async function runDaemon(): Promise<void> {
+  retireDeadForegroundControl({
+    observeControl: () => observeDaemonControl(),
+    pidAlive,
+    clearControl: (identity) => clearDaemonControl(identity),
+  });
   const store = new SanaStore();
   let leaseAcquired = false;
   let leaseInstanceId: string | undefined;
@@ -411,6 +459,7 @@ export async function runDaemon(): Promise<void> {
           activeCycle,
           activeControl.instanceId,
           () => daemonStopRequested(activeControl.instanceId),
+          () => refreshDaemonControl(activeControl),
         );
       } catch (e) {
         if (e instanceof DaemonLeaseLostError) throw e;
@@ -465,26 +514,50 @@ export async function runDaemon(): Promise<void> {
   } finally {
     process.off("SIGTERM", onSigterm);
     process.off("SIGINT", onSigint);
-    if (control !== undefined) {
+    const errors: unknown[] = [];
+    let retainControl = false;
+    try {
+      finalizeDaemonResources(
+        store,
+        leaseAcquired,
+        leaseInstanceId,
+        primaryError,
+      );
+    } catch (error) {
+      if (
+        error instanceof DaemonResourceFinalizationError &&
+        error.retainControl
+      ) {
+        retainControl = true;
+      }
+      if (error instanceof AggregateError) errors.push(...error.errors);
+      else errors.push(error);
+    }
+    if (control !== undefined && !retainControl) {
       try {
         clearDaemonControl(control);
       } catch (error) {
-        primaryError =
-          primaryError === undefined
-            ? error
-            : new AggregateError(
-                [primaryError, error],
-                "Daemon execution or control cleanup failed",
-              );
+        errors.push(error);
       }
     }
-    finalizeDaemonResources(
-      store,
-      leaseAcquired,
-      leaseInstanceId,
-      primaryError,
-    );
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        "Daemon execution, database cleanup, or control cleanup failed",
+      );
+    }
     if (leaseAcquired) log("daemon stopped");
+  }
+}
+
+export class DaemonResourceFinalizationError extends AggregateError {
+  constructor(
+    errors: readonly unknown[],
+    readonly retainControl: boolean,
+  ) {
+    super(errors, "Daemon execution or cleanup failed");
+    this.name = "DaemonResourceFinalizationError";
   }
 }
 
@@ -501,6 +574,7 @@ export function finalizeDaemonResources(
   primaryError?: unknown,
 ): void {
   const errors: unknown[] = [];
+  let closeFailed = false;
   if (primaryError !== undefined) errors.push(primaryError);
 
   if (leaseAcquired) {
@@ -527,11 +601,11 @@ export function finalizeDaemonResources(
   try {
     store.close();
   } catch (error) {
+    closeFailed = true;
     errors.push(error);
   }
 
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) {
-    throw new AggregateError(errors, "Daemon execution or cleanup failed");
+  if (errors.length > 0) {
+    throw new DaemonResourceFinalizationError(errors, closeFailed);
   }
 }
