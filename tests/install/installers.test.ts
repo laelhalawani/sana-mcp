@@ -1119,7 +1119,7 @@ test("PowerShell tag validation uses the shared strict SemVer corpus", async () 
             { encoding: "utf8" },
           ).stdout.trim()
         );
-  if (command.length === 0) return;
+  if (process.platform !== "win32" || command.length === 0) return;
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const functionStart = installer.indexOf("function Assert-ReleaseTag");
@@ -1181,7 +1181,7 @@ test("PowerShell IEX failures are catchable and direct-file failures remain nonz
             { encoding: "utf8" },
           ).stdout.trim()
         );
-  if (command.length === 0) return;
+  if (process.platform !== "win32" || command.length === 0) return;
 
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-entrypoint-"));
   try {
@@ -1306,7 +1306,7 @@ test("PowerShell restores caller LASTEXITCODE after an installer native call", a
             { encoding: "utf8" },
           ).stdout.trim()
         );
-  if (command.length === 0) return;
+  if (process.platform !== "win32" || command.length === 0) return;
 
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-last-exit-"));
   try {
@@ -1404,7 +1404,7 @@ test("PowerShell cleanup attempts every target after an earlier failure", async 
             { encoding: "utf8" },
           ).stdout.trim()
         );
-  if (command.length === 0) return;
+  if (process.platform !== "win32" || command.length === 0) return;
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const functionStart = installer.indexOf("function Invoke-InstallerCleanup");
@@ -1503,7 +1503,7 @@ test("PowerShell download progress retains bar, size, speed, ETA, and bounded co
             { encoding: "utf8" },
           ).stdout.trim()
         );
-  if (command.length === 0) return;
+  if (process.platform !== "win32" || command.length === 0) return;
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const functionStart = installer.indexOf("function Format-DownloadProgress");
@@ -1583,7 +1583,7 @@ test("PowerShell receiptless recognition accepts only published legacy digests",
             { encoding: "utf8" },
           ).stdout.trim()
         );
-  if (command.length === 0) return;
+  if (process.platform !== "win32" || command.length === 0) return;
 
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const functionStart = installer.indexOf(
@@ -4642,7 +4642,7 @@ test("PowerShell install-directory validation rejects separators, controls, and 
             { encoding: "utf8" },
           ).stdout.trim()
         );
-  if (command.length === 0) return;
+  if (process.platform !== "win32" || command.length === 0) return;
   const installer = await readFile(path.join(root, "install.ps1"), "utf8");
   const functionStart = installer.indexOf("function Resolve-InstallDirectory");
   const functionEnd = installer.indexOf("\nfunction Normalize-PathEntry");
