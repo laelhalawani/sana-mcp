@@ -1,5 +1,5 @@
 # Install the latest sana-mcp release:
-#   irm https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex
+#   irm https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.ps1 | iex
 # Pin a release:
 #   Set $env:SANA_MCP_VERSION to an exact tag, then run the command above.
 & {
@@ -28,7 +28,7 @@ try {
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $PSNativeCommandUseErrorActionPreference = $false
-$Repo = "Lumen-AiApp/sana-ai-mcp"
+$Repo = "laelhalawani/sana-mcp"
 $TempDir = $null
 $StagedBinary = $null
 $InstallLock = $null

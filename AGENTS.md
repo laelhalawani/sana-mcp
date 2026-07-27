@@ -2,6 +2,16 @@
 
 These instructions apply to every task in this repository.
 
+## `.env` is immutable without explicit user approval
+
+Never delete the `.env` file, and never delete, overwrite, blank, or otherwise
+remove any value from it, unless the user explicitly requests that specific
+change in the current task. Reading `.env` to use a value (for example, to run a
+push with a token from the URL) is allowed; mutating or removing its contents is
+not. If a task seems to require changing `.env`, stop and ask the user first and
+do not act until they confirm. There is no fallback or "cleanup" path that
+justifies touching `.env` without this confirmation.
+
 ## Required delivery framework
 
 For every repository change, use this three-stage workflow. Split even a narrow
