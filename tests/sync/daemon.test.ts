@@ -6,6 +6,11 @@ import { EventEmitter } from "node:events";
 import { spawnSync, type ChildProcess } from "node:child_process";
 import type { SanaClient } from "../../src/sana/client.js";
 import type { SyncState } from "../../src/store/db.js";
+import type {
+  DaemonControlObservation,
+  DaemonStartupClaim,
+  DaemonStartupObservation,
+} from "../../src/sync/control.js";
 
 const embedCalls: Array<{ meetingId: string; createdAtMs: number }> = [];
 const embeddedWrites: string[] = [];
@@ -41,17 +46,14 @@ mock.module("../../src/semantic/semantic.js", () => ({
 }));
 
 const {
+  DaemonResourceFinalizationError,
   daemonSessionPreflight,
   finalizeDaemonResources,
+  retireDeadForegroundControl,
   syncOnce,
 } = await import(
   "../../src/sync/daemon.js"
 );
-const {
-  DaemonLaunchError,
-  ensureDaemonRunningWith,
-  waitForDaemonReadiness,
-} = await import("../../src/sync/spawn.js");
 const { DaemonStaleOwnerError } = await import("../../src/sync/lock.js");
 const { SyncGenerationChangedError } = await import("../../src/store/db.js");
 
@@ -415,6 +417,113 @@ test("daemon finalization preserves execution and cleanup errors", () => {
     clearError,
     closeError,
   ]);
+  expect(caught).toBeInstanceOf(DaemonResourceFinalizationError);
+  expect(
+    (caught as InstanceType<typeof DaemonResourceFinalizationError>)
+      .retainControl,
+  ).toBe(true);
+});
+
+test("uncertain SQLite close retains ready control until exact process death", () => {
+  const closeError = new Error("SQLite close failed");
+  let caught: unknown;
+  try {
+    finalizeDaemonResources(
+      {
+        clearDaemonIdentityIfOwned: () => "cleared",
+        close: () => {
+          throw closeError;
+        },
+      },
+      true,
+      TEST_DAEMON_INSTANCE,
+    );
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(DaemonResourceFinalizationError);
+  expect(
+    (caught as InstanceType<typeof DaemonResourceFinalizationError>)
+      .retainControl,
+  ).toBe(true);
+  expect((caught as AggregateError).errors).toEqual([closeError]);
+});
+
+test("foreground daemon retires only proven-dead exact v2 crash residue before store startup", () => {
+  let control: DaemonControlObservation = {
+    kind: "ready",
+    identity: {
+      pid: 707,
+      instanceId: TEST_DAEMON_INSTANCE,
+    },
+    heartbeatMs: 1_000,
+    freshness: "stale",
+  };
+  const cleared: Array<{ pid: number; instanceId: string }> = [];
+  retireDeadForegroundControl({
+    observeControl: () => control,
+    pidAlive: () => false,
+    clearControl: (identity) => {
+      cleared.push(identity);
+      control = { kind: "missing" };
+    },
+  });
+  expect(cleared).toEqual([{
+    pid: 707,
+    instanceId: TEST_DAEMON_INSTANCE,
+  }]);
+
+  control = {
+    kind: "ready",
+    identity: {
+      pid: 808,
+      instanceId: TEST_SUCCESSOR_INSTANCE,
+    },
+    heartbeatMs: 1_000,
+    freshness: "fresh",
+  };
+  expect(() =>
+    retireDeadForegroundControl({
+      observeControl: () => control,
+      pidAlive: () => true,
+      clearControl: () => {
+        throw new Error("must not clear live successor");
+      },
+    })
+  ).toThrow(/live process 808/u);
+  expect(control).toMatchObject({
+    identity: { instanceId: TEST_SUCCESSOR_INSTANCE },
+  });
+
+  control = {
+    kind: "ready",
+    identity: {
+      pid: 707,
+      instanceId: TEST_DAEMON_INSTANCE,
+    },
+    heartbeatMs: 1_000,
+    freshness: "stale",
+  };
+  expect(() =>
+    retireDeadForegroundControl({
+      observeControl: () => control,
+      pidAlive: () => false,
+      clearControl: () => {
+        control = {
+          kind: "ready",
+          identity: {
+            pid: 808,
+            instanceId: TEST_SUCCESSOR_INSTANCE,
+          },
+          heartbeatMs: 1_000,
+          freshness: "fresh",
+        };
+      },
+    })
+  ).toThrow(/changed during proven-dead retirement/u);
+  expect(control).toMatchObject({
+    identity: { instanceId: TEST_SUCCESSOR_INSTANCE },
+  });
 });
 
 test("daemon waits on a pending challenge without authentication or expiry effects", async () => {
@@ -502,596 +611,4 @@ test("SQLite lease preserves stale live owners and replaces proven dead owners",
     second.close();
   `);
   expect(child.status, child.stderr).toBe(0);
-});
-
-test("readiness requires the newly spawned child identity and heartbeat", async () => {
-  const child = fakeChild(808);
-  let state = syncState({
-    daemon_pid: 707,
-    daemon_heartbeat_ms: 9_999,
-  });
-  let clock = 10_000;
-  let controlPublished = false;
-
-  const ready = waitForDaemonReadiness(
-    child,
-    { getSyncState: () => state },
-    state,
-    clock,
-    {
-      now: () => clock,
-      sleep: async (ms) => {
-        clock += ms;
-        if (state.daemon_pid !== 808) {
-          state = syncState({
-            daemon_pid: 808,
-            daemon_heartbeat_ms: clock,
-          });
-        } else {
-          controlPublished = true;
-        }
-      },
-      pidAlive: () => true,
-      controlReady: (pid, instanceId) =>
-        pid === 808 &&
-        instanceId === TEST_DAEMON_INSTANCE &&
-        controlPublished,
-      timeoutMs: 100,
-      pollMs: 10,
-    },
-  );
-
-  await expect(ready).resolves.toBe("child");
-});
-
-test("readiness accepts a different new live lease as a concurrent winner", async () => {
-  const child = fakeChild(808);
-  let state = syncState();
-  let clock = 10_000;
-  const ready = waitForDaemonReadiness(
-    child,
-    { getSyncState: () => state },
-    state,
-    clock,
-    {
-      now: () => clock,
-      sleep: async (ms) => {
-        clock += ms;
-        state = syncState({
-          daemon_pid: 909,
-          daemon_heartbeat_ms: clock,
-        });
-      },
-      pidAlive: (pid) => pid === 909,
-      controlReady: (pid, instanceId) =>
-        pid === 909 && instanceId === TEST_DAEMON_INSTANCE,
-      timeoutMs: 100,
-      pollMs: 10,
-    },
-  );
-
-  await expect(ready).resolves.toBe("concurrent");
-});
-
-test("a child exit before readiness is an observable launch failure", async () => {
-  const child = fakeChild(808);
-  const baseline = syncState();
-  const ready = waitForDaemonReadiness(
-    child,
-    { getSyncState: () => baseline },
-    baseline,
-    10_000,
-    {
-      now: () => 10_000,
-      sleep: async () => {
-        child.emit("exit", 1, null);
-      },
-      timeoutMs: 100,
-      pollMs: 10,
-    },
-  );
-
-  await expect(ready).rejects.toThrow(
-    "Daemon exited before becoming ready (exit code 1)",
-  );
-});
-
-test("startup state initialization failures remain observable", async () => {
-  const child = fakeChild(808);
-  const initError = new Error("database initialization failed");
-  await expect(
-    waitForDaemonReadiness(
-      child,
-      {
-        getSyncState: () => {
-          throw initError;
-        },
-      },
-      syncState(),
-      10_000,
-      {
-        now: () => 10_000,
-        sleep: async () => {},
-        timeoutMs: 100,
-        pollMs: 10,
-      },
-    ),
-  ).rejects.toBe(initError);
-});
-
-test("readiness timeout is bounded and typed", async () => {
-  const child = fakeChild(808);
-  const baseline = syncState();
-  let clock = 10_000;
-  await expect(
-    waitForDaemonReadiness(
-      child,
-      { getSyncState: () => baseline },
-      baseline,
-      clock,
-      {
-        now: () => clock,
-        sleep: async (ms) => {
-          clock += ms;
-        },
-        timeoutMs: 30,
-        pollMs: 10,
-      },
-    ),
-  ).rejects.toBeInstanceOf(DaemonLaunchError);
-});
-
-test("ensure daemon cleans up and unrefs only after structured readiness", async () => {
-  const child = fakeChild(808);
-  let state = syncState();
-  let clock = 10_000;
-  let unrefCount = 0;
-  let killCount = 0;
-  let closeLogCount = 0;
-  let closeStoreCount = 0;
-  child.unref = () => {
-    unrefCount++;
-    return child;
-  };
-  child.kill = () => {
-    killCount++;
-    return true;
-  };
-
-  const result = await ensureDaemonRunningWith({
-    createStore: () => ({
-      getSyncState: () => state,
-      close: () => {
-        closeStoreCount++;
-      },
-    }),
-    prepareDataDir: () => {},
-    openLog: () => 91,
-    closeLog: (descriptor) => {
-      expect(descriptor).toBe(91);
-      closeLogCount++;
-    },
-    command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-    spawnProcess: () => child,
-    now: () => clock,
-    sleep: async (ms) => {
-      clock += ms;
-      state = syncState({
-        daemon_pid: 808,
-        daemon_heartbeat_ms: clock,
-      });
-    },
-    pidAlive: () => true,
-    controlReady: (pid, instanceId) =>
-      pid === 808 &&
-      instanceId === TEST_DAEMON_INSTANCE &&
-      state.daemon_pid === pid,
-    timeoutMs: 100,
-    pollMs: 10,
-  });
-
-  expect(result).toEqual({ alreadyRunning: false, spawned: true });
-  expect(unrefCount).toBe(1);
-  expect(killCount).toBe(0);
-  expect(closeLogCount).toBe(1);
-  expect(closeStoreCount).toBe(1);
-});
-
-test("ensure daemon preserves the already-running result without spawning", async () => {
-  let prepareCount = 0;
-  let spawnCount = 0;
-  let closeCount = 0;
-  const result = await ensureDaemonRunningWith({
-    createStore: () => ({
-      getSyncState: () =>
-        syncState({
-          daemon_pid: 707,
-          daemon_heartbeat_ms: 10_000,
-        }),
-      close: () => {
-        closeCount++;
-      },
-    }),
-    prepareDataDir: () => {
-      prepareCount++;
-    },
-    openLog: () => {
-      throw new Error("log should not open");
-    },
-    closeLog: () => {},
-    command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-    spawnProcess: () => {
-      spawnCount++;
-      return fakeChild(808);
-    },
-    now: () => 10_001,
-    sleep: async () => {},
-    pidAlive: (pid) => pid === 707,
-    controlReady: (pid, instanceId) =>
-      pid === 707 && instanceId === TEST_DAEMON_INSTANCE,
-    timeoutMs: 100,
-    pollMs: 10,
-  });
-
-  expect(result).toEqual({ alreadyRunning: true, spawned: false });
-  expect(prepareCount).toBe(0);
-  expect(spawnCount).toBe(0);
-  expect(closeCount).toBe(1);
-});
-
-test("an existing heartbeat is not ready until cooperative control is published", async () => {
-  let clock = 10_001;
-  let controlPublished = false;
-  let spawnCount = 0;
-  const result = await ensureDaemonRunningWith({
-    createStore: () => ({
-      getSyncState: () =>
-        syncState({
-          daemon_pid: 707,
-          daemon_heartbeat_ms: 10_000,
-        }),
-      close: () => {},
-    }),
-    prepareDataDir: () => {},
-    openLog: () => 91,
-    closeLog: () => {},
-    command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-    spawnProcess: () => {
-      spawnCount++;
-      return fakeChild(808);
-    },
-    now: () => clock,
-    sleep: async (ms) => {
-      clock += ms;
-      controlPublished = true;
-    },
-    pidAlive: (pid) => pid === 707,
-    controlReady: (pid, instanceId) =>
-      pid === 707 &&
-      instanceId === TEST_DAEMON_INSTANCE &&
-      controlPublished,
-    timeoutMs: 100,
-    pollMs: 10,
-  });
-
-  expect(result).toEqual({ alreadyRunning: true, spawned: false });
-  expect(spawnCount).toBe(0);
-  expect(controlPublished).toBe(true);
-});
-
-test("ensure daemon reports a live stale owner without spawning a writer", async () => {
-  let spawnCount = 0;
-  await expect(
-    ensureDaemonRunningWith({
-      createStore: () => ({
-        getSyncState: () =>
-          syncState({
-            daemon_pid: 707,
-            daemon_heartbeat_ms: 1,
-          }),
-        close: () => {},
-      }),
-      prepareDataDir: () => {},
-      openLog: () => 91,
-      closeLog: () => {},
-      command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-      spawnProcess: () => {
-        spawnCount++;
-        return fakeChild(808);
-      },
-      now: () => 100_000,
-      sleep: async () => {},
-      pidAlive: (pid) => pid === 707,
-      controlReady: () => false,
-      timeoutMs: 100,
-      pollMs: 10,
-    }),
-  ).rejects.toBeInstanceOf(DaemonStaleOwnerError);
-  expect(spawnCount).toBe(0);
-});
-
-test("existing daemon readiness follows a live replacement identity", async () => {
-  let state = syncState({
-    daemon_pid: 707,
-    daemon_heartbeat_ms: 10_000,
-  });
-  let clock = 10_001;
-  let spawnCount = 0;
-
-  const result = await ensureDaemonRunningWith({
-    createStore: () => ({
-      getSyncState: () => state,
-      close: () => {},
-    }),
-    prepareDataDir: () => {},
-    openLog: () => {
-      throw new Error("log should not open");
-    },
-    closeLog: () => {},
-    command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-    spawnProcess: () => {
-      spawnCount++;
-      return fakeChild(808);
-    },
-    now: () => clock,
-    sleep: async (ms) => {
-      clock += ms;
-      state = syncState({
-        daemon_pid: 909,
-        daemon_heartbeat_ms: clock,
-        daemon_instance_id: TEST_SUCCESSOR_INSTANCE,
-      });
-    },
-    pidAlive: (pid) => pid === 707 || pid === 909,
-    controlReady: (pid, instanceId) =>
-      pid === 909 && instanceId === TEST_SUCCESSOR_INSTANCE,
-    timeoutMs: 100,
-    pollMs: 10,
-  });
-
-  expect(result).toEqual({ alreadyRunning: true, spawned: false });
-  expect(spawnCount).toBe(0);
-});
-
-test("ensure daemon kills a child that never becomes ready", async () => {
-  const child = fakeChild(808);
-  let clock = 10_000;
-  let killCount = 0;
-  child.kill = () => {
-    killCount++;
-    Object.defineProperty(child, "signalCode", {
-      value: "SIGTERM",
-      writable: true,
-      configurable: true,
-    });
-    child.emit("exit", null, "SIGTERM");
-    return true;
-  };
-
-  await expect(
-    ensureDaemonRunningWith({
-      createStore: () => ({
-        getSyncState: () => syncState(),
-        close: () => {},
-      }),
-      prepareDataDir: () => {},
-      openLog: () => 91,
-      closeLog: () => {},
-      command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-      spawnProcess: () => child,
-      now: () => clock,
-      sleep: async (ms) => {
-        clock += ms;
-      },
-      pidAlive: () => false,
-      controlReady: () => false,
-      timeoutMs: 20,
-      pollMs: 10,
-    }),
-  ).rejects.toBeInstanceOf(DaemonLaunchError);
-  expect(killCount).toBe(1);
-});
-
-test("concurrent winner is not reported until the losing child exits", async () => {
-  const child = fakeChild(808);
-  let state = syncState();
-  let clock = 10_000;
-  let exited = false;
-  let cancelledTimers = 0;
-  child.kill = () => {
-    queueMicrotask(() => {
-      exited = true;
-      Object.defineProperty(child, "signalCode", {
-        value: "SIGTERM",
-        writable: true,
-        configurable: true,
-      });
-      child.emit("exit", null, "SIGTERM");
-    });
-    return true;
-  };
-
-  const result = await ensureDaemonRunningWith({
-    createStore: () => ({
-      getSyncState: () => state,
-      close: () => {},
-    }),
-    prepareDataDir: () => {},
-    openLog: () => 91,
-    closeLog: () => {},
-    command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-    spawnProcess: () => child,
-    now: () => clock,
-    sleep: async (ms) => {
-      clock += ms;
-      if (state.daemon_pid === null) {
-        state = syncState({
-          daemon_pid: 909,
-          daemon_heartbeat_ms: clock,
-        });
-      }
-      await Promise.resolve();
-    },
-    pidAlive: (pid) => pid === 909,
-    controlReady: (pid, instanceId) =>
-      pid === 909 && instanceId === TEST_DAEMON_INSTANCE,
-    timeoutMs: 100,
-    pollMs: 10,
-    scheduleTimer: () => ({}) as ReturnType<typeof setTimeout>,
-    cancelTimer: () => {
-      cancelledTimers++;
-    },
-  });
-
-  expect(result).toEqual({ alreadyRunning: true, spawned: false });
-  expect(exited).toBe(true);
-  expect(cancelledTimers).toBe(1);
-});
-
-test("losing-child kill and reap failures are aggregated", async () => {
-  const child = fakeChild(808);
-  let clock = 10_000;
-  const killError = new Error("kill failed");
-  child.kill = () => {
-    throw killError;
-  };
-
-  let caught: unknown;
-  try {
-    await ensureDaemonRunningWith({
-      createStore: () => ({
-        getSyncState: () => syncState(),
-        close: () => {},
-      }),
-      prepareDataDir: () => {},
-      openLog: () => 91,
-      closeLog: () => {},
-      command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-      spawnProcess: () => child,
-      now: () => clock,
-      sleep: async (ms) => {
-        clock += ms;
-      },
-      pidAlive: () => false,
-      controlReady: () => false,
-      timeoutMs: 20,
-      pollMs: 10,
-      scheduleTimer: (callback) => {
-        queueMicrotask(callback);
-        return {} as ReturnType<typeof setTimeout>;
-      },
-      cancelTimer: () => {},
-    });
-  } catch (error) {
-    caught = error;
-  }
-  expect(caught).toBeInstanceOf(AggregateError);
-  const flattened = (caught as AggregateError).errors.flatMap((error) =>
-    error instanceof AggregateError ? error.errors : [error],
-  );
-  expect(flattened).toContain(killError);
-  expect(
-    flattened.some(
-      (error) =>
-        error instanceof Error &&
-        error.message.includes("did not exit after bounded SIGTERM and SIGKILL"),
-    ),
-  ).toBe(true);
-});
-
-test("stuck child escalates to SIGKILL and proves final exit", async () => {
-  const child = fakeChild(808);
-  const signals: Array<NodeJS.Signals | number | undefined> = [];
-  let state = syncState();
-  let clock = 10_000;
-  child.kill = (signal) => {
-    signals.push(signal);
-    if (signal === "SIGKILL") {
-      Object.defineProperty(child, "signalCode", {
-        value: "SIGKILL",
-        writable: true,
-        configurable: true,
-      });
-      child.emit("exit", null, "SIGKILL");
-    }
-    return true;
-  };
-
-  const result = await ensureDaemonRunningWith({
-    createStore: () => ({
-      getSyncState: () => state,
-      close: () => {},
-    }),
-    prepareDataDir: () => {},
-    openLog: () => 91,
-    closeLog: () => {},
-    command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-    spawnProcess: () => child,
-    now: () => clock,
-    sleep: async (ms) => {
-      clock += ms;
-      state = syncState({
-        daemon_pid: 909,
-        daemon_heartbeat_ms: clock,
-      });
-    },
-    pidAlive: (pid) => pid === 909,
-    controlReady: (pid, instanceId) =>
-      pid === 909 && instanceId === TEST_DAEMON_INSTANCE,
-    timeoutMs: 100,
-    pollMs: 10,
-    scheduleTimer: (callback) => {
-      queueMicrotask(callback);
-      return {} as ReturnType<typeof setTimeout>;
-    },
-    cancelTimer: () => {},
-  });
-
-  expect(result).toEqual({ alreadyRunning: true, spawned: false });
-  expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
-  expect(child.signalCode).toBe("SIGKILL");
-});
-
-test("late child errors remain handled and observable during reap", async () => {
-  const child = fakeChild(808);
-  const lateError = new Error("late child failure");
-  let state = syncState();
-  let clock = 10_000;
-  child.kill = () => {
-    child.emit("error", lateError);
-    Object.defineProperty(child, "signalCode", {
-      value: "SIGTERM",
-      writable: true,
-      configurable: true,
-    });
-    child.emit("exit", null, "SIGTERM");
-    return true;
-  };
-
-  await expect(
-    ensureDaemonRunningWith({
-      createStore: () => ({
-        getSyncState: () => state,
-        close: () => {},
-      }),
-      prepareDataDir: () => {},
-      openLog: () => 91,
-      closeLog: () => {},
-      command: () => ({ executable: "/fixture/sana-mcp", args: ["daemon"] }),
-      spawnProcess: () => child,
-      now: () => clock,
-      sleep: async (ms) => {
-        clock += ms;
-        state = syncState({
-          daemon_pid: 909,
-          daemon_heartbeat_ms: clock,
-        });
-      },
-      pidAlive: (pid) => pid === 909,
-      controlReady: (pid, instanceId) =>
-        pid === 909 && instanceId === TEST_DAEMON_INSTANCE,
-      timeoutMs: 100,
-      pollMs: 10,
-    }),
-  ).rejects.toBe(lateError);
 });
