@@ -347,17 +347,32 @@ export async function runApp(
 
   const activeRuntime = runtime ?? new LocalAppRuntime();
   try {
-    line("sana-mcp");
     for (;;) {
       activeRuntime.refresh();
       const status = activeRuntime.status();
+      if (status.session.loggedIn) {
+        let result: Awaited<ReturnType<AppPrompts["meetingBrowser"]>>;
+        try {
+          result = await prompts.meetingBrowser(activeRuntime);
+        } catch (error) {
+          if (error instanceof ExitPromptError) return;
+          throw error;
+        }
+        if (result.action === "quit") return;
+        try {
+          if (result.action === "account") await signIn(activeRuntime, prompts);
+          else await activeRuntime.configure();
+        } catch (error) {
+          if (error instanceof ExitPromptError) return;
+          line(`Could not complete that action: ${errorMessage(error)}`);
+        }
+        continue;
+      }
       let choice: AppChoice;
       try {
         choice = await choose(
           prompts,
-          status.session.loggedIn
-            ? signedInChoices(status.blocking)
-            : signedOutChoices(status.session.expired),
+          signedOutChoices(status.session.expired),
         );
       } catch (error) {
         if (error instanceof ExitPromptError) return;
@@ -368,16 +383,11 @@ export async function runApp(
         if (choice === "login") await signIn(activeRuntime, prompts);
         else if (choice === "configure") await activeRuntime.configure();
         else if (choice === "status") await showStatus(activeRuntime);
-        else if (status.blocking) {
-          line("Your meetings are still syncing. Choose Sync status for progress.");
-        } else if (choice === "list") await showMeetings(activeRuntime);
-        else if (choice === "meeting") {
-          await showMeeting(activeRuntime, prompts);
-        } else if (choice === "search") {
-          await showSearch(activeRuntime, prompts);
-        }
+        else if (choice === "list") await showMeetings(activeRuntime);
+        else if (choice === "meeting") await showMeeting(activeRuntime, prompts);
+        else if (choice === "search") await showSearch(activeRuntime, prompts);
       } catch (error) {
-        if (error instanceof ExitPromptError) continue;
+        if (error instanceof ExitPromptError) return;
         line(`Could not complete that action: ${errorMessage(error)}`);
       }
     }

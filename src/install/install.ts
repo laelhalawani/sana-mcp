@@ -165,6 +165,8 @@ export interface InstallInteraction extends ConfigurerPresentationOptions {
     clients: readonly ClientDef[],
   ): Promise<readonly string[]>;
   openAuthSession?(): ConfigurerAuthSession;
+  /** Test/embedding seam for the one-shot local sync status summary. */
+  syncStatusSnapshot?(): Readonly<{ phase: unknown }>;
   applyBatch?(
     mutations: readonly InstallerConfigMutation[],
     options: {
@@ -700,42 +702,40 @@ function configPathDetail(result: ConfigPathProvenance): string {
 }
 
 export function describeApplyResult(result: ApplyResult): string {
-  const config = configPathDetail(result);
   switch (result.state) {
     case "applied":
       return result.warning
         ? `registered with warning: ${sanitizeTerminalText(
             result.warning,
-          )}${config}`
-        : `registered${config}`;
+          )}`
+        : "registered";
     case "planned":
-      return `would register${config}`;
+      return "would register";
     case "noop":
-      return `already registered (no change)${config}`;
+      return "already registered (no change)";
     case "collision":
-      return `blocked: ${sanitizeTerminalText(result.reason)}${config}`;
+      return `blocked: ${sanitizeTerminalText(result.reason)}${configPathDetail(result)}`;
     case "unavailable":
-      return `unavailable: ${sanitizeTerminalText(result.reason)}${config}`;
+      return `unavailable: ${sanitizeTerminalText(result.reason)}${configPathDetail(result)}`;
     case "conflict":
-      return `conflict: ${sanitizeTerminalText(result.reason)}${config}`;
+      return `conflict: ${sanitizeTerminalText(result.reason)}${configPathDetail(result)}`;
     case "ambiguous":
       return `outcome needs verification: ${sanitizeTerminalText(
         result.reason,
-      )}${config}`;
+      )}${configPathDetail(result)}`;
     case "failed":
-      return `failed: ${sanitizeTerminalText(result.reason)}${config}`;
+      return `failed: ${sanitizeTerminalText(result.reason)}${configPathDetail(result)}`;
   }
 }
 
 function describeRemove(result: ApplyResult): string {
-  const config = configPathDetail(result);
-  if (result.state === "planned") return `would remove${config}`;
+  if (result.state === "planned") return "would remove";
   if (result.state === "applied")
     return result.warning
-      ? `removed with warning: ${sanitizeTerminalText(result.warning)}${config}`
-      : `removed${config}`;
+      ? `removed with warning: ${sanitizeTerminalText(result.warning)}`
+      : "removed";
   if (result.state === "noop")
-    return `not registered (nothing to remove)${config}`;
+    return "not registered (nothing to remove)";
   return describeApplyResult(result);
 }
 
@@ -1097,92 +1097,60 @@ function isInteractive(
   return interaction.isInteractiveInput?.() ?? presentation.policy.interactive;
 }
 
-/**
- * Show a brief, live-updating sync-progress display after login so the user
- * knows their meetings are syncing and can safely close the terminal.
- * Polls for up to ~12 seconds; prints a "you can close" message if still
- * syncing, or a "sync complete" message if it finishes in that window.
- */
-async function showSyncProgress(
-  presentation: ConfigurerPresentation,
-): Promise<void> {
-  // The progress display is purely a nicety for interactive terminal users.
-  // It opens the local runtime (SQLite) and polls for up to ~12 seconds, which
-  // is unacceptable in non-interactive contexts (tests, CI, piped output) where
-  // it would block exit. Guard conservatively: require a real interactive
-  // terminal on BOTH stdout and stderr, and bail on any CI environment (where
-  // PTY allocation can make isTTY misleading). An explicit opt-out is also
-  // honored.
-  if (!process.stderr.isTTY || process.stdout.isTTY !== true) return;
-  if (process.env.CI === "true" || process.env.CI === "1") return;
-  if (process.env.SANA_MCP_NO_SYNC_DISPLAY === "1") return;
-  const ui = presentation.ui;
-  const stream = process.stderr;
-  const maxWaitMs = 12_000;
-  const startedAt = Date.now();
+async function syncIsComplete(
+  interaction: InstallInteraction,
+): Promise<boolean> {
+  if (interaction.syncStatusSnapshot) {
+    try {
+      return interaction.syncStatusSnapshot().phase === "synced";
+    } catch {
+      return false;
+    }
+  }
+  // An injected authentication session is not authoritative for local runtime
+  // state, and tests/embedders must not accidentally open the user's store.
+  if (interaction.openAuthSession) return false;
 
-  let runtime: { refresh(): void; status(...args: unknown[]): unknown; close(): void } | undefined;
+  let runtime: { status(): unknown; close(): void } | undefined;
   try {
     const mod = await import("../app/runtime.js");
     runtime = new mod.LocalAppRuntime();
+    const status = runtime.status() as { phase?: unknown };
+    return status.phase === "synced";
   } catch {
-    return;
-  }
-  if (!runtime) return;
-
-  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-  const s = (v: unknown): string => (typeof v === "number" ? String(v) : "?");
-
-  try {
-    stream.write("\n");
-    for (;;) {
-      runtime.refresh();
-      const status = runtime.status() as Record<string, unknown>;
-      const elapsed = Date.now() - startedAt;
-
-      if (status.phase === "synced" || !status.blocking) {
-        stream.write("\r\u001b[K");
-        presentation.print(ui.color.green("✔ "), "Meeting sync complete.");
-        presentation.print(
-          ui.color.dim("Run "),
-          ui.color.cyan("sana-mcp"),
-          ui.color.dim(
-            " to browse your meetings and transcripts, or use the meeting_transcripts tool from any registered AI client.",
-          ),
-        );
-        return;
-      }
-
-      const done = s(status.transcriptsDone);
-      const total = s(status.transcriptsTotal);
-      const eta = status.etaMinutes ? ` ~${status.etaMinutes} min` : "";
-      const dots = ".".repeat(Math.floor(elapsed / 1000) % 3 + 1);
-      stream.write(
-        `\r${ui.color.dim("Syncing")} ${done}/${total} transcripts${eta}${dots}   `,
-      );
-
-      if (elapsed >= maxWaitMs) {
-        stream.write("\r\u001b[K");
-        presentation.print(`Syncing ${done}/${total} transcripts${eta}…`);
-        presentation.blank();
-        presentation.print(
-          ui.color.dim(
-            "You can close this window or press Ctrl+C — the sync continues in the background.",
-          ),
-        );
-        presentation.print(
-          ui.color.dim("Run "),
-          ui.color.cyan("sana-mcp status"),
-          ui.color.dim(" to check progress at any time."),
-        );
-        return;
-      }
-
-      await sleep(1000);
-    }
+    return false;
   } finally {
-    runtime.close();
+    try {
+      runtime?.close();
+    } catch {
+      // The summary remains truthful without a safely available snapshot.
+    }
   }
+}
+
+function printSetupSummary(
+  presentation: ConfigurerPresentation,
+  options: {
+    connectedClients: number;
+    signedIn: boolean;
+    syncComplete: boolean;
+    reloadHints: readonly string[];
+  },
+): void {
+  presentation.blank();
+  presentation.print(presentation.ui.color.bold("sana-mcp setup"));
+  presentation.print("AI clients  ", options.connectedClients, " connected");
+  presentation.print(
+    "Sana account  ",
+    options.signedIn ? "signed in" : "not signed in",
+  );
+  presentation.print(
+    "Meeting sync  ",
+    options.syncComplete ? "complete" : "continuing in background",
+  );
+  if (options.reloadHints.length > 0)
+    presentation.print("Reload  ", [...new Set(options.reloadHints)].join("; "));
+  presentation.print("Next: sana-mcp");
 }
 
 async function promptWizard(
@@ -1411,8 +1379,6 @@ async function runStructuredLogin(
   if (current.kind === "ready") {
     setDisposition("confirmed");
     interaction.onPhase?.("post-auth-confirmed");
-    presentation.blank();
-    presentation.print(presentation.ui.color.dim("Already signed in to Sana."));
     return "already-signed-in";
   }
 
@@ -1424,11 +1390,6 @@ async function runStructuredLogin(
   if (!wantsLogin) {
     setDisposition("skipped");
     interaction.onPhase?.("post-auth-skipped");
-    presentation.print(
-      presentation.ui.color.dim(
-        "Sign-in skipped. Run sana-mcp login when you are ready.",
-      ),
-    );
     return "skipped";
   }
 
@@ -1438,11 +1399,6 @@ async function runStructuredLogin(
   if (!email) {
     setDisposition("skipped");
     interaction.onPhase?.("post-auth-skipped");
-    presentation.print(
-      presentation.ui.color.dim(
-        "No email entered. Run sana-mcp login when you are ready.",
-      ),
-    );
     return "skipped";
   }
 
@@ -1474,12 +1430,6 @@ async function runStructuredLogin(
       result.failure,
     );
   interaction.onPhase?.("post-auth-confirmed");
-  presentation.print("Signed in as ", result.user.email, ".");
-  presentation.print(
-    presentation.ui.color.dim(
-      "Your meetings are syncing. Run sana-mcp status to check progress.",
-    ),
-  );
   return "signed-in";
 }
 
@@ -1866,10 +1816,10 @@ export async function runInstall(
     }
   }
 
-  presentation.blank();
-  if (acted.length === 0) {
-    presentation.print("No client configuration changes selected.");
-  } else {
+  if (dryRun) {
+    presentation.blank();
+    if (acted.length === 0)
+      presentation.print("No client configuration changes selected.");
     acted.forEach((client, index) => {
       const result = results[index]!;
       printApplyResult(
@@ -1878,6 +1828,17 @@ export async function runInstall(
         result,
         selection.desired[client.id] === true,
       );
+    });
+  } else {
+    acted.forEach((client, index) => {
+      const result = results[index]!;
+      if (needsManualAction(result))
+        printApplyResult(
+          presentation,
+          client,
+          result,
+          selection.desired[client.id] === true,
+        );
     });
   }
 
@@ -1916,6 +1877,18 @@ export async function runInstall(
       presentation.print(
         "Sana sign-in cancelled. Client configuration changes were kept.",
       );
+      printSetupSummary(presentation, {
+        connectedClients: collected.rows.filter(
+          (row) => selection.desired[row.id] === true,
+        ).length,
+        signedIn: false,
+        syncComplete: await syncIsComplete(interaction),
+        reloadHints: acted.flatMap((client, index) =>
+          results[index]?.state === "applied" && client.reloadHint
+            ? [client.reloadHint]
+            : [],
+        ),
+      });
     } catch (presentationFailure) {
       throw postAuthPresentationError(
         cancellationAuthority,
@@ -1931,13 +1904,18 @@ export async function runInstall(
     };
   }
   try {
-    presentation.blank();
-    if (login.outcome === "skipped") {
-      presentation.print("Client configuration complete. Sana sign-in was skipped.");
-    } else {
-      presentation.print("Client configuration and Sana sign-in are ready.");
-      await showSyncProgress(presentation);
-    }
+    printSetupSummary(presentation, {
+      connectedClients: collected.rows.filter(
+        (row) => selection.desired[row.id] === true,
+      ).length,
+      signedIn: login.outcome !== "skipped",
+      syncComplete: await syncIsComplete(interaction),
+      reloadHints: acted.flatMap((client, index) =>
+        results[index]?.state === "applied" && client.reloadHint
+          ? [client.reloadHint]
+          : [],
+      ),
+    });
   } catch (presentationFailure) {
     throw postAuthPresentationError(login, presentationFailure);
   }

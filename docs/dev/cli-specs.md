@@ -15,7 +15,7 @@ flags, environment variables, and exit/edge behaviour.
 
 Status legend used throughout:
 
-- [shipped] - implemented in the current `v0.4.10` release candidate.
+- [shipped] - implemented in the current `v0.4.11` release candidate.
 - [planned] - designed in the per-area documents but not implemented in the
   current release candidate.
 
@@ -408,10 +408,8 @@ CLI. Every tool returns a plain string; nothing throws to the caller.
 Argument detail:
 
 - `list.sort`: `"newest"` (default) or `"oldest"`. `list.filter`:
-  `{status: "ready"|"downloading"|"failed", date: {from, to}}`; dates are ISO
+  `{status: "ready"|"downloading"|"processing"|"retrying", date: {from, to}}`; dates are ISO
   (`"YYYY-MM-DD"`) or epoch ms. `list.page` default 1, `list.limit` default 50.
-  (Note: a meeting can be in a `processing` state which `list` displays but which
-  is not a selectable `filter.status` value.)
 - `read.lines`: 1-based `[start, end]` range; a line is one spoken turn. With no
   `full`/`lines` selection, `read` reports the line count and options rather than
   dumping. `read.full=true` returns everything. `read.timestamps` default true.
@@ -468,20 +466,19 @@ prompt re-login (human wording in the CLI, agent wording in the MCP tool).
 
 ## 7. Sync and the daemon
 
-- The daemon is the only component that talks to Sana. It refreshes the meeting
-  list (stopping early on incremental runs once a fully-known page is seen),
-  downloads each meeting's transcript + metadata, optionally builds embeddings,
-  then marks state `synced`. It heartbeats every 5s and runs an incremental check
+- The daemon is the only component that talks to Sana. It refreshes the complete
+  meeting list, downloads missing transcript and metadata artifacts, optionally
+  builds embeddings, and marks state `synced` only when no canonical artifacts
+  are missing. It heartbeats every 5s and runs an incremental check
   every `SANA_SYNC_INTERVAL_MS` (default 10 min), waking early when a login
   requests a fresh catch-up.
-- On every login a catch-up sync runs and data tools are held (`blocking = 1`)
-  until it finishes, so a returning user gets current content. `status` reports
-  progress + ETA. `blocking` is cleared atomically only when the cycle both
-  finished its work and started at/after the login's `catchup_epoch_ms` (closes a
-  cross-process race).
-- Failed transcript downloads are retried; after `SANA_MAX_ATTEMPTS` (default 5)
-  a meeting is marked `failed` and stops blocking the rest. A fresh login resets
-  the counters.
+- On every login a catch-up sync runs. Data tools are held (`blocking = 1`) only
+  until the current account's cache identity is safe; ready meetings remain
+  usable while incomplete artifacts continue syncing.
+- Failed artifact downloads remain `retrying` indefinitely with exponential
+  delay. `SANA_MAX_ATTEMPTS` controls when that delay stops increasing, not
+  whether another attempt will happen. Login or daemon restart retries them
+  immediately.
 - If semantic embeddings cannot run (deps unavailable in the compiled binary),
   the daemon degrades to keyword-only for that run rather than blocking forever.
 - Auto-spawn: read commands and login call `ensureDaemonRunning()`, which spawns
@@ -490,9 +487,9 @@ prompt re-login (human wording in the CLI, agent wording in the MCP tool).
   responding to signal 0, plus an exclusive lockfile (`daemon.lock`, atomic
   create with dead-PID recovery) to prevent double-spawn.
 
-Meeting `status` values shown in `list`: `ready` (transcript present),
-`downloading` (retriable, below the attempt cap), `processing` (Sana still
-processing), `failed` (at/over the attempt cap).
+Meeting `status` values shown in `list`: `ready` (transcript and metadata
+present), `downloading` (not yet attempted), `processing` (Sana still
+processing), and `retrying` (an incomplete artifact will be tried again).
 
 ---
 
@@ -504,8 +501,8 @@ All optional.
 |---|---|---|
 | `SANA_SEMANTIC` | off | `1`/`true`/`yes`/`on` enables semantic/hybrid search. |
 | `SANA_SYNC_INTERVAL_MS` | `600000` | Incremental sync check interval. |
-| `SANA_REQUEST_DELAY_MS` | `150` | Delay between transcript downloads (politeness). |
-| `SANA_MAX_ATTEMPTS` | `5` | Download retries before a meeting is `failed`. |
+| `SANA_REQUEST_DELAY_MS` | `150` | Delay between Sana artifact requests. |
+| `SANA_MAX_ATTEMPTS` | `5` | Failures before the retry delay stops increasing. |
 | `SANA_MAX_NEW_TRANSCRIPTS` | `0` (unlimited) | Cap new transcript downloads per cycle. |
 | `SANA_COUNT_WAIT_MS` | `30000` | How long login waits to report the meeting count. |
 | `SANA_EMBED_MODEL` | `Xenova/all-MiniLM-L6-v2` | Embedding model id. |

@@ -42,6 +42,7 @@ $Committed = $false
 $OldPresent = $false
 $LegacyInstall = $false
 $OldWasRunning = $false
+$ShouldRunAfterInstall = $false
 $PathChanged = $false
 $OldUserPath = $null
 $PreserveTemp = $false
@@ -125,6 +126,69 @@ function Invoke-PostInstallConfigurer(
       message = $_.Exception.Message
     }
   }
+}
+
+function Publish-CurrentProcessPath(
+  [string] $InstallDirectory,
+  [string] $Executable
+) {
+  $OriginalProcessPath = $env:Path
+  try {
+    $ProcessEntries = if ([string]::IsNullOrEmpty($OriginalProcessPath)) {
+      @()
+    } else {
+      @($OriginalProcessPath -split ";")
+    }
+    $InstallDirectoryPresent = @(
+      $ProcessEntries | Where-Object {
+        [string]::Equals(
+          $_,
+          $InstallDirectory,
+          [StringComparison]::OrdinalIgnoreCase
+        )
+      }
+    ).Count -gt 0
+    if (-not $InstallDirectoryPresent) {
+      $env:Path = if ([string]::IsNullOrEmpty($OriginalProcessPath)) {
+        $InstallDirectory
+      } else {
+        "$InstallDirectory;$OriginalProcessPath"
+      }
+    }
+
+    $Resolved = @(Get-Command sana-mcp -CommandType Application -ErrorAction Stop)
+    if ($Resolved.Count -eq 0 -or
+        -not [string]::Equals(
+          [IO.Path]::GetFullPath($Resolved[0].Source),
+          [IO.Path]::GetFullPath($Executable),
+          [StringComparison]::OrdinalIgnoreCase
+        )) {
+      throw "Bare sana-mcp did not resolve to the installed application."
+    }
+    $VersionOutput = @(& sana-mcp --version 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+      throw "Bare sana-mcp --version exited with code $LASTEXITCODE."
+    }
+    return $true
+  } catch {
+    $env:Path = $OriginalProcessPath
+    Write-Host "Close and reopen PowerShell before running sana-mcp."
+    Write-Host "Run: $(Format-ExecutableCommand $Executable)"
+    return $false
+  }
+}
+
+function Get-ShouldRunAfterInstall(
+  [bool] $ExistingReceiptBacked,
+  [bool] $OldRunning,
+  [bool] $UpdaterHandoff,
+  [bool] $IncompatibleReplacement
+) {
+  return $OldRunning -or (
+    $ExistingReceiptBacked -and
+    -not $UpdaterHandoff -and
+    -not $IncompatibleReplacement
+  )
 }
 
 function Open-HttpsResponse([string] $Source) {
@@ -1900,6 +1964,12 @@ try {
     $OldReceiptDigest = Get-Sha256 $OldReceiptBackup
   }
 
+  $ShouldRunAfterInstall = Get-ShouldRunAfterInstall `
+    ($OldPresent -and -not $LegacyInstall) `
+    $OldWasRunning `
+    ($env:SANA_MCP_UPDATE -eq "1") `
+    $IncompatibleStateReset
+
   $OldUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
   $UserEntries = if ([string]::IsNullOrEmpty($OldUserPath)) {
     @()
@@ -2043,9 +2113,6 @@ try {
     ) {
       throw "The published user PATH update could not be verified."
     }
-    Write-Host "Added $InstallDir to PATH for new shells."
-  } elseif ($MatchingEntries.Count -eq 1) {
-    Write-Host "Verified $InstallDir is already on PATH for new shells."
   }
 
   if (
@@ -2164,7 +2231,7 @@ try {
   if (-not $IncompatibleStateReset) {
     $RuntimeStateTouched = $true
   }
-  if ($OldWasRunning) {
+  if ($ShouldRunAfterInstall) {
     $Started = Invoke-Lifecycle $Destination "start"
     if ($Started["state"] -cne "running") {
       throw "The upgraded sana-mcp daemon did not start."
@@ -2207,7 +2274,7 @@ try {
        (Get-Sha256 $ReceiptPath) -cne $NewReceiptDigest)) {
     throw "Published receipt retirement state changed before commit."
   }
-  if ($OldPresent -and $OldWasRunning) {
+  if ($OldPresent -and $ShouldRunAfterInstall) {
     $RestartedAfterRetirement = Invoke-Lifecycle $Destination "start"
     if ($RestartedAfterRetirement["state"] -cne "running") {
       throw "The upgraded sana-mcp daemon did not restart after runtime retirement."
@@ -2315,10 +2382,6 @@ try {
         "sana-mcp: deferred recovery path: $IncompatibleResetJournal"
       )
     }
-  }
-  Write-Host "Installed $Destination"
-  if (-not $NewPathManaged -and $MatchingEntries.Count -eq 0) {
-    Write-Host "Add $InstallDir to PATH to run sana-mcp from new shells."
   }
 } catch {
   $InstallError = $_.Exception.Message
@@ -2572,7 +2635,6 @@ if ($env:SANA_MCP_UPDATE -eq "1") {
     Write-Host "Run this command to configure clients and sign in: $(Format-InstallCommand $Destination)"
   }
 } elseif ($env:SANA_MCP_YES -eq "1") {
-  Write-Host "Registering sana-mcp with detected MCP clients."
   $SetupOutcome =
     Invoke-PostInstallConfigurer $Destination -Yes
   if ($SetupOutcome.state -ceq "exited") {
@@ -2590,9 +2652,7 @@ if ($env:SANA_MCP_UPDATE -eq "1") {
       "sana-mcp: retry with: $(Format-InstallCommand $Destination -Yes)"
     )
   }
-  Write-Host "Run this command to sign in: $(Format-ExecutableCommand $Destination)"
 } else {
-  Write-Host "Starting sana-mcp setup."
   $SetupOutcome =
     Invoke-PostInstallConfigurer $Destination
   if ($SetupOutcome.state -ceq "exited") {
@@ -2610,6 +2670,9 @@ if ($env:SANA_MCP_UPDATE -eq "1") {
       "sana-mcp: retry with: $(Format-InstallCommand $Destination)"
     )
   }
+}
+if ($env:SANA_MCP_UPDATE -ne "1") {
+  [void] (Publish-CurrentProcessPath $InstallDir $Destination)
 }
 } finally {
   if ($CallerHadLastExitCode) {

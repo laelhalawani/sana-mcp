@@ -18,21 +18,21 @@ import {
   transcriptLines,
   type TranscriptLine,
 } from "../sana/transcript.js";
-import { MAX_TRANSCRIPT_ATTEMPTS } from "../config.js";
 import {
   parseMeetingListArguments,
 } from "./args.js";
 
-export type RowStatus = "ready" | "downloading" | "processing" | "failed";
+export type RowStatus = "ready" | "downloading" | "processing" | "retrying";
 
 export function rowStatus(r: {
   has_transcript: number;
+  has_metadata: number;
   attempts: number;
   processing_phase: string | null;
 }): RowStatus {
-  if (r.has_transcript) return "ready";
+  if (r.has_transcript && r.has_metadata) return "ready";
   if (r.processing_phase && r.processing_phase !== "done") return "processing";
-  return r.attempts >= MAX_TRANSCRIPT_ATTEMPTS ? "failed" : "downloading";
+  return r.attempts > 0 ? "retrying" : "downloading";
 }
 
 // ---- list ----------------------------------------------------------------

@@ -97,6 +97,13 @@ export function retireDeadForegroundControl(
   }
 }
 
+/** @internal Reset persisted artifact backoff once after daemon lease acquisition. */
+export function prepareDaemonRetryState(
+  store: Pick<SanaStore, "resetFailures">,
+): void {
+  store.resetFailures();
+}
+
 function heartbeat(
   store: SanaStore,
   control: DaemonControlIdentity,
@@ -186,8 +193,7 @@ export async function syncOnce(
     store.writeSyncGeneration(cycle, operation);
   const write = <Value>(operation: () => Value): Value =>
     store.writeCacheGeneration(cycle, operation);
-  // --- refresh meeting list (stop early once a page is fully known, unless
-  //     this is the very first sync where we want everything). ---
+  // --- refresh the complete meeting list so source processing phases advance ---
   writeAuthState(() => {
     store.updateSyncState({
       phase: "listing",
@@ -216,8 +222,6 @@ export async function syncOnce(
     discovered += newOnThisPage;
     heartbeatOrStop();
     store.assertSyncGeneration(cycle);
-    // Incremental runs can stop once a whole page is already known.
-    if (!identityChanged && !firstEver && newOnThisPage === 0) return false;
   });
 
   if (identityChanged) {
@@ -236,28 +240,37 @@ export async function syncOnce(
   // --- download transcript + metadata for incomplete meetings ---
   // A meeting is complete only when it has both a transcript and metadata; we
   // fetch just the missing part so existing transcripts are not re-downloaded.
-  let incomplete = store.meetingsIncomplete();
+  let incomplete = store.meetingsDue(Date.now());
+  const pending = store.countIncomplete();
   const cap = RUNTIME_ENV.maxNewTranscripts;
   if (cap > 0) incomplete = incomplete.slice(0, cap);
   write(() => {
     store.updateSyncState({
-      phase: incomplete.length ? "downloading" : "synced",
+      phase: pending > 0 ? "downloading" : "synced",
       transcripts_total: total,
-      transcripts_done: store.countComplete(),
-      message: incomplete.length ? `Downloading meetings: 0/${incomplete.length}...` : "Up to date.",
+      transcripts_done: store.countTranscripts(),
+      message:
+        incomplete.length > 0
+          ? `Downloading meetings: 0/${incomplete.length}...`
+          : pending > 0
+            ? `${pending} meeting(s) pending; waiting for processing or retry delay.`
+            : "Up to date.",
     });
   });
+  store.releaseCurrentCache(cycle);
 
   let done = 0;
   let failed = 0;
+  let processed = 0;
   for (const id of incomplete) {
-    let anySuccess = false;
-    let lastError: Error | undefined;
+    let lastError: unknown;
 
     // Transcript — fetched and saved independently.
     if (!store.getTranscript(id)) {
       try {
-        const segs = await client.getTranscription(id);
+        const segs = await client.getTranscription(id).finally(
+          async () => await sleep(REQUEST_DELAY_MS),
+        );
         write(() =>
           store.saveTranscript({
             meeting_id: id,
@@ -267,23 +280,24 @@ export async function syncOnce(
             segment_count: segs.length,
           }),
         );
-        anySuccess = true;
         done++;
       } catch (e) {
         if (e instanceof SessionExpiredError) throw e;
         if (e instanceof SyncGenerationChangedError) throw e;
-        lastError = e as Error;
+        lastError = e;
       }
-    } else {
-      anySuccess = true;
     }
 
     // Metadata (summary, notes, participants) — fetched and saved independently
     // so a participant-validation error never discards the transcript.
     if (!store.getMetadata(id)) {
       try {
-        const meta = await client.getMeetingById(id);
-        const participants = await client.getMeetingParticipants(id);
+        const meta = await client.getMeetingById(id).finally(
+          async () => await sleep(REQUEST_DELAY_MS),
+        );
+        const participants = await client.getMeetingParticipants(id).finally(
+          async () => await sleep(REQUEST_DELAY_MS),
+        );
         write(() =>
           store.saveMetadata({
             meeting_id: id,
@@ -300,40 +314,39 @@ export async function syncOnce(
               meta?.recordingUrl || meta?.fallbackRecordingUrl ? 1 : 0,
           }),
         );
-        anySuccess = true;
       } catch (e) {
         if (e instanceof SessionExpiredError) throw e;
         if (e instanceof SyncGenerationChangedError) throw e;
-        if (!lastError) lastError = e as Error;
+        if (lastError === undefined) lastError = e;
       }
-    } else {
-      anySuccess = true;
     }
 
-    if (anySuccess) {
+    const complete = store.getTranscript(id) !== null && store.getMetadata(id) !== null;
+    if (complete) {
       write(() => store.clearFailure(id));
-    }
-    if (lastError && !anySuccess) {
-      write(() => store.recordFailure(id, lastError.message));
+    } else if (lastError !== undefined) {
+      const message =
+        lastError instanceof Error ? lastError.message : String(lastError);
+      write(() => store.recordFailure(id, message));
       failed++;
     }
-    if ((done + failed) % 3 === 0 || done + failed === incomplete.length) {
+    processed++;
+    if (processed % 3 === 0 || processed === incomplete.length) {
       write(() => {
         store.updateSyncState({
-          transcripts_done: store.countComplete(),
-          message: `Downloading meetings: ${done}/${incomplete.length}${failed ? ` (${failed} failed)` : ""}...`,
+          transcripts_done: store.countTranscripts(),
+          message: `Downloading meetings: ${processed}/${incomplete.length}${failed ? ` (${failed} retrying)` : ""}...`,
         });
       });
       heartbeatOrStop();
     }
-    await sleep(REQUEST_DELAY_MS);
   }
 
   // --- semantic embeddings (required for hybrid search when enabled) ---
   // If the embedding runtime/deps are unavailable (e.g. the compiled binary was
   // built with them --external), we do NOT fail the whole sync: we skip
-  // embeddings for this run so the login block can still clear and keyword
-  // search keeps working. Only a genuinely available-but-failing model retries.
+  // embeddings for this run so keyword search and canonical artifact state stay
+  // available. Any ordinary embedding error is logged and retried next cycle.
   const semanticState = semanticCapabilityState();
   let semanticUsable = semanticEnabled();
   if (semanticState.kind === "unsupported") {
@@ -344,14 +357,6 @@ export async function syncOnce(
   }
   if (semanticUsable) {
     const needEmbed = store.meetingsMissingEmbedding();
-    if (needEmbed.length) {
-      write(() => {
-        store.updateSyncState({
-          phase: "downloading",
-          message: `Embedding meetings: 0/${needEmbed.length}...`,
-        });
-      });
-    }
     let emb = 0;
     for (const id of needEmbed) {
       try {
@@ -373,7 +378,6 @@ export async function syncOnce(
         );
         write(() => {
           store.markEmbedded(id, EMBED_DIM, EMBED_MODEL);
-          store.clearFailure(id);
         });
         emb++;
       } catch (e) {
@@ -385,35 +389,24 @@ export async function syncOnce(
           log("semantic search unavailable, continuing with keyword search:", e.message);
           break;
         }
-        write(() => {
-          store.recordFailure(id, (e as Error).message);
-        });
+        log(
+          "semantic embedding failed; will retry:",
+          id,
+          e instanceof Error ? e.message : String(e),
+        );
       }
       if (emb % 3 === 0 || emb === needEmbed.length) {
-        write(() => {
-          store.updateSyncState({ message: `Embedding meetings: ${emb}/${needEmbed.length}...` });
-        });
         heartbeatOrStop();
       }
     }
   }
 
   const now = Date.now();
-  const workDone =
-    store.meetingsIncomplete().length === 0 &&
-    (!semanticUsable || store.meetingsMissingEmbedding().length === 0);
-  // Finalize atomically: clear the login block only if this cycle both did all
-  // its work AND used the current confirmed authentication generation (see
-  // finishSyncCycle). This is one SQL statement, so a login committing a new
-  // generation mid-cycle cannot be clobbered by a stale cycle.
+  // Finalize atomically from counts read under the current generation fence.
+  // A safe partial cache is released while pending artifacts retain their phase.
   store.finishSyncCycle({
-    message: `Up to date - ${total} meetings, ${store.countComplete()} complete.`,
-    meetings_total: total,
-    transcripts_total: total,
-    transcripts_done: store.countComplete(),
     last_full_sync_ms: firstEver ? now : store.getSyncState().last_full_sync_ms,
     last_incremental_ms: now,
-    workDone,
     cycle,
   });
   if (discovered > 0 || done > 0) log(`sync: +${discovered} meetings, +${done} transcripts`);
@@ -450,6 +443,7 @@ export async function runDaemon(): Promise<void> {
     }
     leaseAcquired = true;
     leaseInstanceId = claim.instanceId;
+    prepareDaemonRetryState(store);
     const activeControl = publishDaemonControl(process.pid, {
       instanceId: claim.instanceId,
     });

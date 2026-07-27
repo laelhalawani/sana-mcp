@@ -315,6 +315,9 @@ function renderStatus(client: SanaClient, store: SanaStore): string {
       `Background sync unavailable: ${status.syncUnavailable.message}`,
     );
   }
+  if (!status.blocking && status.phase !== "synced") {
+    lines.push("Your current meeting cache is available while syncing continues.");
+  }
   return lines.join("\n");
 }
 

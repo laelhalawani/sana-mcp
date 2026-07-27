@@ -70,7 +70,7 @@ try {
   store.upsertMeeting({
     id: "meeting-delta",
     external_id: "external-delta",
-    name: "Delta failed",
+    name: "Delta retrying",
     source: "sana-ai:meeting",
     created_at_ms: Date.parse("2026-01-05T10:00:00Z"),
     modified_at_ms: Date.parse("2026-01-05T11:00:00Z"),

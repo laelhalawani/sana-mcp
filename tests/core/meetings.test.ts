@@ -4,6 +4,7 @@ import {
   getSummaryView,
   getTranscriptView,
   queryMeetings,
+  rowStatus,
 } from "../../src/core/meetings.js";
 import type {
   MeetingRow,
@@ -366,7 +367,7 @@ describe("meeting query arguments", () => {
       { limit: 1001 },
       { sort: "recent" },
       { query: 7 },
-      { filter: { status: "processing" } },
+      { filter: { status: "failed" } },
       { filter: { date: { from: "not-a-date" } } },
     ]) {
       expect(() => queryMeetings(queryStore, args)).toThrow();
@@ -390,5 +391,32 @@ describe("meeting query arguments", () => {
       offset: 1000,
     });
     expect(received).toMatchObject({ limit: 1000, offset: 1000 });
+  });
+
+  test("row status requires both artifacts and never exposes failed", () => {
+    expect(
+      rowStatus({
+        has_transcript: 1,
+        has_metadata: 1,
+        attempts: 99,
+        processing_phase: "done",
+      }),
+    ).toBe("ready");
+    expect(
+      rowStatus({
+        has_transcript: 1,
+        has_metadata: 0,
+        attempts: 1,
+        processing_phase: "done",
+      }),
+    ).toBe("retrying");
+    expect(
+      rowStatus({
+        has_transcript: 0,
+        has_metadata: 0,
+        attempts: 0,
+        processing_phase: "transcribing",
+      }),
+    ).toBe("processing");
   });
 });

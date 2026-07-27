@@ -233,11 +233,62 @@ test("interactive structured login handles logged-in and logged-out sessions wit
         auth.calls.verify,
         loggedIn ? [] : [["person@example.test", "123456"]]
       );
-      assert.match(
-        output.join("\n"),
-        loggedIn ? /Already signed in to Sana/u : /Signed in as person@example\.test/u
+      const rendered = stripTerminalSequences(output.join("\n"));
+      assert.match(rendered, /sana-mcp setup/u);
+      assert.match(rendered, /AI clients  1 connected/u);
+      assert.match(rendered, /Sana account  signed in/u);
+      assert.match(rendered, /Meeting sync  continuing in background/u);
+      assert.equal(rendered.match(/sana-mcp setup/gu)?.length, 1);
+      assert.equal(rendered.match(/Next: sana-mcp/gu)?.length, 1);
+      assert.doesNotMatch(rendered, /Already signed in|Signed in as/u);
+      assert.doesNotMatch(
+        rendered,
+        /Client configuration (?:complete|and Sana sign-in are ready)/u,
       );
-      assert.doesNotMatch(output.join("\n"), /meeting_transcripts\(|your agent/u);
+      assert.doesNotMatch(
+        rendered,
+        new RegExp(file.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"),
+      );
+      for (const line of rendered.split("\n"))
+        assert.equal(line.trimStart().startsWith("="), false);
+      assert.doesNotMatch(rendered, /meeting_transcripts\(|your agent/u);
+    } finally {
+      fs.rmSync(root, { recursive: true });
+    }
+  }
+});
+
+test("interactive setup only reports sync complete for an actual synced phase", async () => {
+  for (const phase of ["idle", "synced"] as const) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-configurer-sync-"));
+    const file = path.join(root, "client.json");
+    const output: string[] = [];
+    try {
+      await runInstall(
+        {},
+        interaction(
+          [
+            fixture("present", file, {
+              state: "present",
+              evidence: [root],
+            }),
+          ],
+          output,
+          {
+            openAuthSession: () => fakeAuth({ loggedIn: true }).session,
+            syncStatusSnapshot: () => ({ phase, blocking: 0 }),
+          },
+        ),
+      );
+      const rendered = stripTerminalSequences(output.join("\n"));
+      assert.match(
+        rendered,
+        phase === "synced"
+          ? /Meeting sync  complete/u
+          : /Meeting sync  continuing in background/u,
+      );
+      if (phase !== "synced")
+        assert.doesNotMatch(rendered, /Meeting sync  complete/u);
     } finally {
       fs.rmSync(root, { recursive: true });
     }
@@ -1711,7 +1762,7 @@ test("public configurer starts from compatible saved registrations without rewri
     assert.equal(confirmCalls, 0);
     assert.equal(inputCalls, 0);
     const plainOutput = stripTerminalSequences(output.join("\n"));
-    assert.match(plainOutput, /Already signed in to Sana/u);
+    assert.match(plainOutput, /Sana account  signed in/u);
     assert.match(
       plainOutput,
       /Client foreign: configuration unavailable:/u
@@ -2124,7 +2175,7 @@ test("--yes is prompt-free, auth-free, and registers only detected clients", asy
     assert.equal(fs.existsSync(presentFile), true);
     assert.equal(fs.existsSync(absentFile), false);
     assert.doesNotMatch(output.join("\n"), /\u001b\[/u);
-    assert.match(output.join("\n"), /Client configuration complete/u);
+    assert.match(output.join("\n"), /registered/u);
   } finally {
     fs.rmSync(root, { recursive: true });
   }

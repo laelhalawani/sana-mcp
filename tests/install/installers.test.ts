@@ -399,7 +399,13 @@ test("POSIX one-line installer verifies the tuple and does not mask config failu
     const successful = run("success-bin", "0");
     assert.equal(successful.result.status, 0, successful.result.stderr);
     assert.match(successful.result.stdout, /Installing sana-mcp v0\.3\.2/);
-    assert.match(successful.result.stdout, /Installed /);
+    assert.match(successful.result.stdout, /(?:^|\n)sana-mcp installed\.\n?$/);
+    assert.doesNotMatch(successful.result.stdout, /(?:Added|Verified) .* to PATH/);
+    assert.doesNotMatch(
+      successful.result.stdout,
+      /Existing client configuration was left unchanged\./,
+    );
+    assert.doesNotMatch(successful.result.stdout, /(?:^|\n)Installed /);
     assert.equal(
       await readFile(
         path.join(successful.installDirectory, "sana-mcp"),
@@ -574,6 +580,8 @@ test("POSIX installer only writes startup files for explicitly supported shells"
       );
 
       assert.equal(result.status, 0, `${entry.name}: ${result.stderr}`);
+      assert.doesNotMatch(result.stdout, /Existing client configuration was left unchanged\./);
+      assert.doesNotMatch(result.stdout, /(?:^|\n)Installed /);
       const receipt = await readFile(
         path.join(installDirectory, ".sana-mcp-install-v1"),
         "utf8",
@@ -612,7 +620,12 @@ test("POSIX installer only writes startup files for explicitly supported shells"
         zshrc: ".zshrc",
         profile: ".profile",
       }[entry.expectedProfile];
-      assert.match(result.stdout, /Added .* to PATH in /, entry.name);
+      assert.doesNotMatch(result.stdout, /(?:Added|Verified) .* to PATH/, entry.name);
+      assert.doesNotMatch(
+        result.stdout,
+        /Existing client configuration was left unchanged\.|(?:^|\n)Installed /,
+        entry.name,
+      );
       assert.match(
         await readFile(path.join(home, expectedFile), "utf8"),
         /# >>> sana-mcp installer >>>/,
@@ -632,7 +645,7 @@ test("POSIX installer only writes startup files for explicitly supported shells"
   }
 });
 
-test("POSIX upgrades separate receipt-owned PATH state from current-shell availability", { timeout: 20_000 }, async () => {
+test("POSIX upgrades separate receipt-owned PATH state from current-shell availability", { timeout: 60_000 }, async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-shell-upgrade-"));
   try {
@@ -732,10 +745,12 @@ test("POSIX upgrades separate receipt-owned PATH state from current-shell availa
         entry.configExit,
       );
       assert.equal(upgrade.status, 0, `${entry.name}: ${upgrade.stderr}`);
-      assert.match(
+      assert.doesNotMatch(
         upgrade.stdout,
         /Existing client configuration was left unchanged\./,
       );
+      assert.doesNotMatch(upgrade.stdout, /(?:Added|Verified) .* to PATH/);
+      assert.doesNotMatch(upgrade.stdout, /(?:^|\n)Installed /);
 
       assert.equal(
         await readFile(bashrc, "utf8"),
@@ -755,10 +770,8 @@ test("POSIX upgrades separate receipt-owned PATH state from current-shell availa
       );
 
       if (entry.expectedPresentation === "verified") {
-        assert.match(upgrade.stdout, /Verified .* is already on PATH in /);
         assert.doesNotMatch(upgrade.stdout, /Add .* to PATH manually/);
       } else {
-        assert.doesNotMatch(upgrade.stdout, /(?:Added|Verified) .* to PATH/);
         assert.ok(
           upgrade.stdout.includes(
             `Add ${installDirectory} to PATH manually`,
@@ -874,7 +887,7 @@ test("POSIX upgrades preserve legacy receipt-owned profiles without claiming cur
         entry.configExit,
       );
       assert.equal(upgrade.status, 0, `${entry.name}: ${upgrade.stderr}`);
-      assert.match(
+      assert.doesNotMatch(
         upgrade.stdout,
         /Existing client configuration was left unchanged\./,
       );
@@ -913,6 +926,7 @@ test("POSIX upgrades preserve legacy receipt-owned profiles without claiming cur
         entry.name,
       );
       assert.doesNotMatch(upgrade.stdout, /(?:Added|Verified) .* to PATH/);
+      assert.doesNotMatch(upgrade.stdout, /(?:^|\n)Installed /);
       assert.match(
         upgrade.stdout,
         /installer-owned PATH block belongs to a different shell startup file\./,
@@ -2477,7 +2491,7 @@ try {
       '  if ($InstallerProcess.ExitCode -ne 0) { throw "installer failed: $Stdout`n$Stderr" }',
       '  if (-not $OldProcess.WaitForExit(5000)) { throw "active installed MCP process survived replacement" }',
       '  if ($OtherProcess.HasExited) { throw "same-name other-path process was terminated" }',
-      '  if ($Stdout -cnotmatch "Installed .*sana-mcp.exe" -or $Stdout -cnotmatch "Registering sana-mcp with 1 detected client") { throw "successful install/configurer handoff was not reported: $Stdout" }',
+      '  if ($Stdout -match "Installed .*sana-mcp.exe" -or $Stdout -match "Starting sana-mcp setup|Added .* to PATH for new shells|Verified .* is already on PATH for new shells" -or $Stdout -cnotmatch "Registering sana-mcp with 1 detected client") { throw "successful install/configurer handoff output was not concise: $Stdout" }',
       '  if ($Stderr -match "could not start|exited with code") { throw "configurer launch warning was emitted: $Stderr" }',
       `  if ((Get-FileHash -LiteralPath $InstalledBinary -Algorithm SHA256).Hash.ToLowerInvariant() -cne "${currentBinaryHash}") { throw "final binary digest mismatch" }`,
       '  if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($DataSentinel)) -cne $ExpectedDataSentinelBytes) { throw "compatible update mutated the data sentinel" }',
@@ -3159,6 +3173,101 @@ test("advertised install commands stay concise and match installer headers", asy
   assert.ok(windowsCommand.length < 140);
 });
 
+test("PowerShell current-process PATH publication resolves bare sana-mcp and restores on failure", { timeout: 30_000 }, async () => {
+  const powershell =
+    process.platform === "win32"
+      ? "powershell.exe"
+      : spawnSync(
+          "/bin/sh",
+          ["-c", "command -v powershell.exe"],
+          { encoding: "utf8" },
+        ).stdout.trim();
+  if (!powershell) return;
+  const wsl = process.platform === "linux";
+  if (
+    wsl &&
+    spawnSync("/bin/sh", ["-c", "command -v wslpath"], {
+      encoding: "utf8",
+    }).status !== 0
+  )
+    return;
+
+  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  const start = installer.indexOf("function Format-ExecutableCommand");
+  const end = installer.indexOf("\nfunction Open-HttpsResponse", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const functions = installer.slice(start, end);
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ps-process-path-"));
+  try {
+    const native = (value: string) => {
+      if (!wsl) return value;
+      const converted = spawnSync("wslpath", ["-w", value], {
+        encoding: "utf8",
+      });
+      assert.equal(converted.status, 0, converted.stderr);
+      return converted.stdout.trim();
+    };
+    const harness = path.join(temporary, "process-path.ps1");
+    await writeFile(
+      harness,
+      [
+        '$ErrorActionPreference = "Stop"',
+        functions,
+        '$env:PATHEXT = ".COM;.EXE;.BAT;.CMD"',
+        "$Original = $env:Path",
+        '$FixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("sana-process-path-" + [Guid]::NewGuid().ToString("N"))',
+        "try {",
+        '  $SuccessDirectory = Join-Path $FixtureRoot "success"',
+        '  $FailureDirectory = Join-Path $FixtureRoot "failure"',
+        '  [IO.Directory]::CreateDirectory($SuccessDirectory) | Out-Null',
+        '  [IO.Directory]::CreateDirectory($FailureDirectory) | Out-Null',
+        '  $SuccessExecutable = Join-Path $SuccessDirectory "sana-mcp.exe"',
+        '  $FailureExecutable = Join-Path $FailureDirectory "sana-mcp.exe"',
+        '  Add-Type -TypeDefinition \'using System; public class SuccessProgram { public static int Main(string[] args) { if (args.Length == 1 && args[0] == "--version") { Console.WriteLine("sana-mcp 1.2.3"); return 0; } return 64; } }\' -Language CSharp -OutputAssembly $SuccessExecutable -OutputType ConsoleApplication',
+        '  Add-Type -TypeDefinition \'public class FailureProgram { public static int Main(string[] args) { return 9; } }\' -Language CSharp -OutputAssembly $FailureExecutable -OutputType ConsoleApplication',
+        '  if (-not (Publish-CurrentProcessPath $SuccessDirectory $SuccessExecutable)) { throw "successful publication reported failure" }',
+        '  if (($env:Path -split ";")[0] -cne $SuccessDirectory) { throw "canonical install directory was not prepended" }',
+        '  $Bare = @(& sana-mcp --version)',
+        '  if ($LASTEXITCODE -ne 0 -or $Bare -cne "sana-mcp 1.2.3") { throw "bare command did not execute after publication" }',
+        "  $env:Path = $Original",
+        '  $Guidance = @(& { Publish-CurrentProcessPath $FailureDirectory $FailureExecutable } 6>&1) -join "`n"',
+        '  if ($env:Path -cne $Original) { throw "failed publication did not restore process PATH" }',
+        '  if ($Guidance -cnotmatch "Close and reopen PowerShell before running sana-mcp\\." -or -not $Guidance.Contains("Run: & \'" + $FailureExecutable + "\'")) { throw "failed publication omitted exact restart guidance: $Guidance" }',
+        "} finally {",
+        "  $env:Path = $Original",
+        '  Remove-Item -LiteralPath $FixtureRoot -Recurse -Force -ErrorAction SilentlyContinue',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const result = spawnSync(
+      powershell,
+      ["-NoProfile", "-NonInteractive", "-File", native(harness)],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell daemon policy distinguishes direct reinstalls from updater handoffs", async () => {
+  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  assert.match(
+    installer,
+    /function Get-ShouldRunAfterInstall[\s\S]*?\$OldRunning -or \([\s\S]*?\$ExistingReceiptBacked[\s\S]*?-not \$UpdaterHandoff[\s\S]*?-not \$IncompatibleReplacement/u,
+  );
+  assert.equal(
+    installer.match(/if \(\$ShouldRunAfterInstall\) \{/gu)?.length,
+    1,
+  );
+  assert.match(
+    installer,
+    /if \(\$OldPresent -and \$ShouldRunAfterInstall\) \{/u,
+  );
+});
+
 test("PowerShell deferred-install command quotes the executable and invokes it", async () => {
   const powershell =
     process.platform === "win32"
@@ -3333,7 +3442,8 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
     const firstFixture = await createOfflineRelease(temporary, "0.3.2");
     const first = run(firstFixture, "0.3.2", "0");
     assert.equal(first.status, 0, first.stderr);
-    assert.match(first.stdout, /Added .* to PATH/);
+    assert.doesNotMatch(first.stdout, /(?:Added|Verified) .* to PATH/);
+    assert.doesNotMatch(first.stdout, /(?:^|\n)Installed /);
     const oldBinary = await readFile(
       path.join(installDirectory, "sana-mcp"),
       "utf8",
@@ -3358,7 +3468,7 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
     const secondFixture = await createOfflineRelease(temporary, "0.3.3");
     const upgrade = run(secondFixture, "0.3.3", "23");
     assert.equal(upgrade.status, 0, upgrade.stderr);
-    assert.match(
+    assert.doesNotMatch(
       upgrade.stdout,
       /Existing client configuration was left unchanged\./,
     );
@@ -3376,7 +3486,8 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
     assert.equal(await readFile(profile, "utf8"), oldProfile);
     assert.equal((await readFile(stateFile, "utf8")).trim(), "running");
 
-    assert.match(upgrade.stdout, /Verified .* is already on PATH/);
+    assert.doesNotMatch(upgrade.stdout, /(?:Added|Verified) .* to PATH/);
+    assert.doesNotMatch(upgrade.stdout, /(?:^|\n)Installed /);
     assert.equal(
       (
         await readFile(profile, "utf8")
@@ -3458,7 +3569,7 @@ test("POSIX latest resolution verifies its projection before trusting the tag", 
   }
 });
 
-test("POSIX accepts a healthy fresh-login daemon and preserves stopped upgrade intent", async () => {
+test("POSIX direct reinstall starts a stopped daemon while updater handoff preserves stopped intent", async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-login-daemon-"));
   try {
@@ -3470,7 +3581,11 @@ test("POSIX accepts a healthy fresh-login daemon and preserves stopped upgrade i
     await mkdir(home);
     await writeFile(profile, "# profile\n");
     await writeFile(stateFile, "stopped\n");
-    const run = (fixture: string, version: string) =>
+    const run = (
+      fixture: string,
+      version: string,
+      updateAuthority?: Readonly<{ version: string; sha256: string }>,
+    ) =>
       spawnSync("/bin/sh", [path.join(root, "install.sh")], {
         encoding: "utf8",
         env: {
@@ -3485,6 +3600,16 @@ test("POSIX accepts a healthy fresh-login daemon and preserves stopped upgrade i
           SANA_MCP_INSTALL_DIR: installDirectory,
           SANA_MCP_VERSION: `v${version}`,
           SANA_MCP_YES: "1",
+          ...(updateAuthority
+            ? {
+                SANA_MCP_UPDATE: "1",
+                SANA_MCP_EXPECTED_INSTALLED_VERSION:
+                  updateAuthority.version,
+                SANA_MCP_EXPECTED_INSTALLED_TARGET: "bun-linux-x64",
+                SANA_MCP_EXPECTED_INSTALLED_SHA256: updateAuthority.sha256,
+                SANA_MCP_EXPECTED_INSTALLED_STATE_COMPATIBILITY: "1",
+              }
+            : {}),
         },
       });
 
@@ -3514,6 +3639,18 @@ test("POSIX accepts a healthy fresh-login daemon and preserves stopped upgrade i
       "0.3.3",
     );
     assert.equal(upgrade.status, 0, upgrade.stderr);
+    assert.equal((await readFile(stateFile, "utf8")).trim(), "running");
+
+    await writeFile(stateFile, "stopped\n");
+    const installed = await readFile(
+      path.join(installDirectory, "sana-mcp"),
+    );
+    const updater = run(
+      await createOfflineRelease(temporary, "0.3.4"),
+      "0.3.4",
+      { version: "0.3.3", sha256: sha256(installed) },
+    );
+    assert.equal(updater.status, 0, updater.stderr);
     assert.equal((await readFile(stateFile, "utf8")).trim(), "stopped");
   } finally {
     await rm(temporary, { recursive: true, force: true });

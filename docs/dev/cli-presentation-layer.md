@@ -214,7 +214,7 @@ same `SearchResult`. `snippetAround` moves to core (pure helper).
 ### `src/core/meetings.ts`
 
 ```ts
-export type RowStatus = "ready" | "downloading" | "processing" | "failed";
+export type RowStatus = "ready" | "downloading" | "processing" | "retrying";
 export function rowStatus(r): RowStatus            // move from dispatch:237
 
 export interface MeetingPage {

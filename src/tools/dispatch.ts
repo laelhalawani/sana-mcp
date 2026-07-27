@@ -33,6 +33,7 @@ import {
   verifyCode,
   waitForSync,
   COUNT_WAIT_MS,
+  type WaitResult,
   AuthPublicationBusyError,
   AuthTransitionIncompleteError,
   RequestCodeLocalTransitionError,
@@ -91,6 +92,43 @@ function asSentence(message: string): string {
   return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
+/** @internal Deterministic login rendering for cache-ready versus complete sync. */
+export function renderLoginWaitResult(
+  head: string,
+  result: WaitResult,
+  tail: readonly string[],
+): string {
+  if (result.done && result.phase === "synced") {
+    return [
+      head,
+      "Sync complete. Your transcripts are up to date and all tools are available.",
+      ...tail,
+    ].join("\n");
+  }
+  if (result.cacheReady) {
+    const progress =
+      result.count == null
+        ? "Remaining meetings continue syncing."
+        : `${result.count} meeting(s) remain and continue syncing.`;
+    return [
+      head,
+      `Your current meeting cache is available. ${progress}`,
+      ...tail,
+    ].join("\n");
+  }
+  const blockedLine =
+    'Meeting tools are unavailable until it completes. Check progress with meeting_transcripts("status").';
+  if (result.count != null) {
+    return [
+      head,
+      `Sync in progress: ${result.count} item(s) to download.`,
+      blockedLine,
+      ...tail,
+    ].join("\n");
+  }
+  return [head, "Sync in progress.", blockedLine, ...tail].join("\n");
+}
+
 class LocalStoreCleanupError extends Error {
   readonly code = "LOCAL_STORE_CLEANUP_FAILED";
 
@@ -130,10 +168,7 @@ export function ephemeralSyncPersistenceIssue(
 function syncBlockedMessage(
   s: Pick<
     SyncState,
-    | "transcripts_total"
-    | "transcripts_done"
-    | "auth_issue_code"
-    | "auth_issue_message"
+    "auth_issue_code" | "auth_issue_message"
   >,
 ): string {
   const persistedAuthIssue = inspectPersistedAuthIssue(s);
@@ -144,13 +179,8 @@ function syncBlockedMessage(
       `Meeting tools remain blocked; sign in again after resolving the local storage error.`
     );
   }
-  const remaining = Math.max(0, s.transcripts_total - s.transcripts_done);
-  const detail =
-    s.transcripts_total > 0
-      ? `${remaining} item(s) left`
-      : "building the meeting list";
   return (
-    `Sync in progress (${detail}). ` +
+    `Sync in progress (syncing the current meeting cache). ` +
     `Meeting tools are unavailable until it completes. ` +
     `Check progress with meeting_transcripts("status").`
   );
@@ -312,8 +342,6 @@ async function handleLogin(args: Record<string, unknown>): Promise<string> {
       `Available tools: ${toolListLine()}.`,
       `Use meeting_transcripts("help", {"tool":"<name>"}) for details.`,
     ];
-    const blockedLine = `Meeting tools are unavailable until it completes. Check progress with meeting_transcripts("status").`;
-
     if (result.kind === "sync-unavailable") {
       return [
         head,
@@ -331,18 +359,7 @@ async function handleLogin(args: Record<string, unknown>): Promise<string> {
     }
 
     const res = await waitForSync(store, COUNT_WAIT_MS);
-    if (res.done) {
-      return [head, `Sync complete. Your transcripts are up to date and all tools are available.`, ...tail].join("\n");
-    }
-    if (res.count != null) {
-      return [
-        head,
-        `Sync in progress: ${res.count} item(s) to download.`,
-        blockedLine,
-        ...tail,
-      ].join("\n");
-    }
-    return [head, `Sync in progress.`, blockedLine, ...tail].join("\n");
+    return renderLoginWaitResult(head, res, tail);
     } catch (e) {
     if (e instanceof VerifyCodePreflightError) {
       return `No sign-in code was submitted to Sana. ${asSentence(e.message)} Request a new challenge with meeting_transcripts("login", {"email":"${email}"}).`;
@@ -427,13 +444,20 @@ export function renderStatusInfo(
         : `Sync in progress: building the meeting list.`
     );
     lines.push("Meeting tools are unavailable until it completes.");
-  } else {
+  } else if (st.phase === "synced" && st.remaining === 0) {
     lines.push(
       st.meetings !== null && st.transcripts !== null
         ? `Up to date. ${st.meetings} meetings, ${st.transcripts} transcripts stored.`
         : "Up to date.",
     );
     lines.push("New meetings sync automatically shortly after they end.");
+  } else {
+    lines.push(
+      st.remaining !== null
+        ? `Sync continuing: ${st.remaining} meeting(s) pending.`
+        : "Sync continuing.",
+    );
+    lines.push("The current meeting cache is available while remaining artifacts sync.");
   }
   if (st.lastFullSyncMs) lines.push(`Last sync: ${new Date(st.lastFullSyncMs).toISOString()}.`);
   if (
@@ -768,7 +792,7 @@ function handleListMeetings(store: SanaStore, args: Record<string, unknown>): st
       : `Showing ${n} out of ${p.total} meeting transcripts.`;
 
   const table = [
-    `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | status (ready/downloading/processing/failed) | title (string) |`,
+    `| started_at (UTC, YYYY-MM-DD HH:MM) | id (string) | status (ready/downloading/processing/retrying) | title (string) |`,
     `|---|---|---|---|`,
     ...p.rows.map(
       (r) => `| ${fmtDateTime(r.created_at_ms)} | ${r.id} | ${rowStatus(r)} | ${escCell(r.name)} |`

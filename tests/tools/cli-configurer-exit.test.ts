@@ -147,7 +147,7 @@ test("non-TTY bare invocation prints guidance while explicit install remains act
   expect(bare.stderr).toBe("");
   expect(bare.stdout).toBe(
     [
-      "Run sana-mcp in a terminal to configure Sana and your AI clients.",
+      "Run sana-mcp in a terminal to open the meeting app.",
       "For one-shot commands, run: sana-mcp help",
       "",
     ].join("\n"),

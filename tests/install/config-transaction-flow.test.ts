@@ -140,7 +140,7 @@ test("interactive batch adds an explicitly selected undetected client and remove
     const wire = serializeConfigTransactionResult(result);
     assert.equal(wire.split("\n").length, 2);
     assert.equal("clientResults" in JSON.parse(wire), false);
-    assert.match(output.join("\n"), /Signed in as person@example\.test/u);
+    assert.match(output.join("\n"), /Sana account  signed in/u);
   } finally {
     fs.rmSync(root, { recursive: true });
   }
@@ -395,7 +395,7 @@ test("--yes ignores unrelated unavailable status when a positive target applies"
   }
 });
 
-test("post-apply presentation failure is not misreported as authentication", async () => {
+test("post-apply observer failure is not misreported as authentication", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-tx-flow-"));
   const file = path.join(root, "client.json");
   try {
@@ -407,8 +407,9 @@ test("post-apply presentation failure is not misreported as authentication", asy
       {
         clients: [fixture("client", file)],
         terminal: terminal(),
-        writeLine: () => {
-          if (fs.existsSync(file)) throw new Error("presentation failed");
+        writeLine: () => undefined,
+        onPhase: (phase) => {
+          if (phase === "post-apply") throw new Error("post-apply observer failed");
         },
         prompt: async () => ({
           submitted: true,
@@ -442,7 +443,8 @@ test("confirmed authentication survives post-auth presentation failure", async (
         clients: [fixture("client", file)],
         terminal: terminal(),
         writeLine: (line) => {
-          if (line.includes("Signed in as")) throw new Error("render failed");
+          if (line.includes("Sana account  signed in"))
+            throw new Error("render failed");
         },
         prompt: async () => ({
           submitted: true,
@@ -892,8 +894,8 @@ for (const batch of ["applied", "no-mutation"] as const) {
               if (
                 line.includes(
                   authCase === "confirmed"
-                    ? "Client configuration and Sana sign-in are ready"
-                    : "Client configuration complete. Sana sign-in was skipped",
+                    ? "Sana account  signed in"
+                    : "Sana account  not signed in",
                 )
               )
                 throw new Error(`${authCase} outer completion failed`);
@@ -1414,7 +1416,7 @@ for (const batch of ["applied", "no-mutation"] as const) {
 
 for (const batch of ["applied", "no-mutation"] as const) {
   for (const authCase of ["confirmed", "skipped"] as const) {
-    test(`${authCase} presentation plus cleanup failure stays authoritative for an ${batch} batch`, async () => {
+    test(`${authCase} cleanup failure stays authoritative for an ${batch} batch`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-tx-flow-"));
       const file = path.join(root, "client.json");
       if (batch === "no-mutation")
@@ -1443,13 +1445,7 @@ for (const batch of ["applied", "no-mutation"] as const) {
           {
             clients: [fixture("client", file)],
             terminal: terminal(),
-            writeLine: (line) => {
-              if (
-                (authCase === "confirmed" && line.includes("Signed in as")) ||
-                (authCase === "skipped" && line.includes("Sign-in skipped"))
-              )
-                throw new Error(`${authCase} authoritative presentation failed`);
-            },
+            writeLine: () => undefined,
             prompt: async () => ({
               submitted: true,
               desired: { client: true },
@@ -1473,7 +1469,7 @@ for (const batch of ["applied", "no-mutation"] as const) {
           result.errorCode,
           "CONFIG_TRANSACTION_AUTH_SESSION_CLEANUP_FAILED",
         );
-        assert.match(result.message!, /authoritative presentation failed/u);
+        assert.doesNotMatch(result.message!, /authoritative presentation failed/u);
         assert.match(result.message!, /authoritative cleanup failed/u);
         assert.equal(fs.existsSync(file), true);
       } finally {

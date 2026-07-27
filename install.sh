@@ -2,8 +2,8 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.10 sh
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.10/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.11 sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.11/install.sh | sh
 set -eu
 set -f
 umask 077
@@ -29,6 +29,7 @@ transaction_active=0
 committed=0
 old_present=0
 old_was_running=0
+should_run_after_install=0
 path_changed=0
 path_existed=0
 path_file=""
@@ -1315,6 +1316,10 @@ if [ -n "${HOME:-}" ]; then
 else
   current_shell_path_profile=none
 fi
+should_run_after_install=$old_was_running
+if [ "$old_present" = "1" ] && [ "${SANA_MCP_UPDATE:-0}" != "1" ]; then
+  should_run_after_install=1
+fi
 
 write_path_block "$tmp_dir/path-block"
 if [ "$path_profile" != "none" ]; then
@@ -1370,10 +1375,6 @@ if [ "$current_shell_path_profile" = "none" ]; then
 elif [ "$path_profile" != "$current_shell_path_profile" ]; then
   printf "PATH was not changed for the current shell because the installer-owned PATH block belongs to a different shell startup file.\n"
   printf "Add %s to PATH manually, or run the binary by its absolute path.\n" "$install_dir"
-elif [ "$path_changed" = "1" ]; then
-  printf 'Added %s to PATH in %s.\n' "$install_dir" "$path_file"
-else
-  printf 'Verified %s is already on PATH in %s.\n' "$install_dir" "$path_file"
 fi
 PATH="$install_dir:${PATH:-}"; export PATH
 
@@ -1412,7 +1413,6 @@ configure_status=0
 config_interactive_attempted=0
 if [ "$old_present" = "1" ]; then
   config_transaction_state=no-mutation
-  printf '%s\n' "Existing client configuration was left unchanged."
 elif [ "${SANA_MCP_YES:-0}" = "1" ]; then
   live_state_touched=1
   assert_installer_locks_owned
@@ -1519,7 +1519,7 @@ fi
 
 live_state_touched=1
 assert_installer_locks_owned
-if [ "$old_was_running" = "1" ]; then
+if [ "$should_run_after_install" = "1" ]; then
   "$dest" __lifecycle start --format properties > "$tmp_dir/lifecycle.properties" ||
     fail "new daemon could not be restarted"
   read_lifecycle "$tmp_dir/lifecycle.properties"
@@ -1555,4 +1555,4 @@ release_path_lock ||
   fail "the owned per-user installer lock could not be released"
 release_install_lock ||
   fail "the owned sana-mcp install lock could not be released"
-printf 'Installed %s\n' "$dest"
+printf '%s\n' 'sana-mcp installed.'

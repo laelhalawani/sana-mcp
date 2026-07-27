@@ -64,7 +64,8 @@ export function transcriptsDirectory(): string {
 }
 
 export const DEFAULT_BASE_URL = RUNTIME_ENV.baseUrl;
-export const MAX_TRANSCRIPT_ATTEMPTS = RUNTIME_ENV.maxTranscriptAttempts;
+// Failures after this point keep retrying at the maximum delay.
+export const MAX_RETRY_DELAY_ATTEMPTS = RUNTIME_ENV.maxRetryDelayAttempts;
 
 const originSchema = z.string().transform((raw, context) => {
   let parsed: URL;

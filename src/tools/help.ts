@@ -25,9 +25,9 @@ export const TOOLS: ToolDoc[] = [
   {
     name: "list",
     summary:
-      "List your meetings from the local store with id, timestamp, title, and transcript status (ready/downloading/failed).",
+      "List your meetings from the local store with id, timestamp, title, and artifact status (ready/downloading/processing/retrying).",
     args:
-      'page: number (default 1); limit: number (page size, default 50); query: string (title filter); sort: "newest" (default) or "oldest"; filter: {status: "ready"|"downloading"|"failed", date: {from, to}} where from/to are ISO dates ("YYYY-MM-DD") or epoch ms',
+      'page: number (default 1); limit: number (page size, default 50); query: string (title filter); sort: "newest" (default) or "oldest"; filter: {status: "ready"|"downloading"|"processing"|"retrying", date: {from, to}} where from/to are ISO dates ("YYYY-MM-DD") or epoch ms',
     example: 'meeting_transcripts("list", {"sort":"oldest", "filter":{"date":{"from":"2026-06-01","to":"2026-06-30"}}})',
   },
   {

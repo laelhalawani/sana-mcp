@@ -3,6 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import type { SanaStore } from "../../src/store/db.js";
+import { waitForSync } from "../../src/core/login.js";
+import { renderStatusInfo } from "../../src/tools/dispatch.js";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 const roots: string[] = [];
@@ -11,6 +14,45 @@ afterEach(() => {
   for (const root of roots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("cache readiness is separate from complete sync", async () => {
+  const partialStore = {
+    getSyncState: () => ({
+      phase: "downloading",
+      blocking: 0,
+      transcripts_total: 238,
+      transcripts_done: 139,
+    }),
+    countMeetings: (options?: { status?: string }) =>
+      options?.status === "ready" ? 100 : 238,
+  } as unknown as SanaStore;
+  expect(await waitForSync(partialStore, 1)).toEqual({
+    done: false,
+    cacheReady: true,
+    count: 138,
+    phase: "downloading",
+  });
+
+  const rendered = renderStatusInfo({
+    session: { hasCookie: true, loggedIn: true, expired: false },
+    blocking: false,
+    phase: "downloading",
+    transcriptsDone: 139,
+    transcriptsTotal: 238,
+    remaining: 138,
+    etaMinutes: null,
+    meetings: 238,
+    transcripts: 139,
+    lastFullSyncMs: null,
+    lastIncrementalMs: null,
+    daemonHeartbeatMs: null,
+    error: null,
+    semantic: { enabled: false, embedded: null, total: 139 },
+  });
+  expect(rendered).toContain("Sync continuing: 138 meeting(s) pending.");
+  expect(rendered).toContain("current meeting cache is available");
+  expect(rendered).not.toContain("Up to date");
 });
 
 test("status exposes and keeps a crashed authentication transition blocked", () => {

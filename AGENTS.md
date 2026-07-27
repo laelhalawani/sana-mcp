@@ -12,57 +12,21 @@ not. If a task seems to require changing `.env`, stop and ask the user first and
 do not act until they confirm. There is no fallback or "cleanup" path that
 justifies touching `.env` without this confirmation.
 
-## Required delivery framework
+## Required delivery workflow
 
-For every repository change, use this three-stage workflow. Split even a narrow
-change into independent analysis/development/review responsibilities; do not let
-the implementing agent approve its own work.
+1. Read the affected code and understand the behavior before editing.
+2. Make the smallest correct change that satisfies the request.
+3. Run the relevant tests, type checks, builds, and end-to-end checks.
+4. Have a separate read-only agent review the finished implementation for code
+   correctness. The review should look for concrete logic errors, broken API or
+   state transitions, missed error handling, regressions, and missing tests.
+5. Fix valid review findings and re-run the affected checks. Request another
+   review only when the correction is substantial enough to need one.
 
-### 1. Prep
-
-1. Analyze the affected logic, user experience, installation, build, deployment,
-   documentation, tests, workflows, and data paths.
-2. Fan planning out to separate agents with concrete, non-overlapping areas.
-3. Gather the planning results into one dependency-aware implementation plan.
-4. Send that consolidated plan to two independent review agents for
-   cross-verification.
-5. Resolve every plan-review finding and finalize file ownership, sequencing,
-   acceptance criteria, compatibility constraints, and migration strategy before
-   development begins.
-
-### 2. Development loop
-
-1. Split the finalized plan into manageable development scopes.
-2. Run non-overlapping, non-dependent scopes in parallel. Run dependent or
-   overlapping scopes consecutively.
-3. After a development agent finishes, assign a different, read-only review agent
-   to compare the implementation against the complete scope.
-4. The review must focus on logic, API correctness, state transitions, error
-   paths, security, portability, resource cleanup, compatibility, and code smells.
-   Tests may support validation, but passing tests are not a substitute for code
-   review.
-5. Send every finding back to a development agent for correction.
-6. After corrections, assign a fresh read-only review agent that has neither
-   implemented nor reviewed any earlier round of that scope to review the entire
-   scope again.
-7. Repeat development plus fresh review until the reviewer reports no findings.
-
-### 3. Cross-cutting development loop
-
-1. After all scopes in a stage are individually clean, assign one fresh,
-   adversarial review agent to trace the complete stage across scope boundaries.
-2. The review must follow real end-to-end paths and look for integration gaps,
-   mismatched assumptions, races, stale state, incompatible formats, unsafe
-   migrations, and incomplete failure handling.
-3. Split cross-cutting findings among development agents when they do not overlap;
-   otherwise fix them consecutively.
-4. Assign a fresh adversarial reviewer after every correction round. A fresh
-   reviewer has neither implemented nor reviewed an earlier round of that
-   cross-cutting scope.
-5. Repeat until the cross-cutting reviewer reports no findings.
-
-Do not declare a stage complete while any individual or cross-cutting review
-finding remains unresolved.
+Do not require planning fan-out, multiple plan reviewers, adversarial review
+rounds, fresh-review chains, or process evidence for routine work. Add extra
+review only when the user asks for it or a specific high-risk change clearly
+needs it.
 
 ## Scope and compatibility rules
 
@@ -123,17 +87,6 @@ epoch in the release manifest, standalone binary, and installer receipt.
 - Only the reviewed, serialized pre-1.0 replacement coordinator may quarantine or
   delete the canonical rebuildable live state. Ordinary agents, tests, and ad hoc
   scripts must preserve runtime data.
-
-## Review evidence
-
-Maintain an auditable review ledger for each scope and cross-cutting stage. Record:
-
-- scope and exact owned files;
-- development agent;
-- review agent for each round;
-- every finding and its resolution;
-- correction agent/round;
-- the fresh reviewer that returned zero findings.
 
 ## No hardcoded fallback values
 

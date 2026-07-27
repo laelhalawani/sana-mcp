@@ -203,13 +203,8 @@ describe("private SQLite storage", () => {
       let staleRejected = false;
       try {
         store.finishSyncCycle({
-          message: "old session cycle",
-          meetings_total: 0,
-          transcripts_total: 0,
-          transcripts_done: 0,
           last_full_sync_ms: 1002,
           last_incremental_ms: 1002,
-          workDone: true,
           cycle: { generation: 1, publicationToken: tokenA, userId: "user-a", workspaceId: "workspace-a" },
         });
       } catch (error) {
@@ -226,13 +221,8 @@ describe("private SQLite storage", () => {
       staleRejected = false;
       try {
         store.finishSyncCycle({
-          message: "new session cycle",
-          meetings_total: 0,
-          transcripts_total: 0,
-          transcripts_done: 0,
           last_full_sync_ms: 1003,
           last_incremental_ms: 1003,
-          workDone: true,
           cycle: { generation: 1, publicationToken: tokenA, userId: "user-a", workspaceId: "workspace-a" },
         });
       } catch (error) {
@@ -249,13 +239,8 @@ describe("private SQLite storage", () => {
         workspaceId: "workspace-a",
       });
       store.finishSyncCycle({
-        message: "current session cycle",
-        meetings_total: 0,
-        transcripts_total: 0,
-        transcripts_done: 0,
         last_full_sync_ms: 1004,
         last_incremental_ms: 1004,
-        workDone: true,
         cycle: { generation: 2, publicationToken: tokenB, userId: "user-a", workspaceId: "workspace-a" },
       });
       if (store.getSyncState().blocking !== 0) {
