@@ -2005,9 +2005,6 @@ try {
 
   $StagedBinary = Join-Path $InstallDir (".sana-mcp-" + [Guid]::NewGuid().ToString("N") + ".exe")
   Copy-Item -LiteralPath $Binary -Destination $StagedBinary
-  if ((Get-Sha256 $StagedBinary) -cne $Release["sha256"]) {
-    throw "Staged binary checksum changed before installation."
-  }
 
   $TransactionActive = $true
   if ($OldWasRunning) {

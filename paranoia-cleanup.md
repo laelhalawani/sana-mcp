@@ -62,19 +62,26 @@ Kept (still used by spawn/daemon/lifecycle): `observeDaemonControl`,
       touched: the publish job's descriptor-bound upload (works today; later).
       Verified: YAML parses, `tests/release/release.test.ts` green, typecheck
       clean. Full CI smoke verification pending before merge.
-- [ ] Slice 2: dead daemon-startup machinery — **assessment: keep (for now).**
-      The startup functions are confirmed unused at runtime, but they are
-      interleaved in `src/sync/control.ts` with the *active* control-file
-      functions (publish/observe/clear/stop) that the daemon depends on, and
-      `tests/sync/control.test.ts` exercises both. Surgical removal is real
-      surgery for cosmetic gain (the code is dead, not harmful). Per the cleanup
-      principles ("keep obsolete non-harmful logic when removal is riskier than
-      it is worth"), defer unless we want to invest in a careful extraction.
-- [ ] Slice 3: installer transaction overhead — `install.sh`/`install.ps1`
-      locks/journals/receipts are *active* and coupled to `sana-mcp update`
-      (receipts) and the configurer rollback (journals). Lightening them risks
-      install/update stability ("do not sacrifice features"). Needs a careful,
-      dedicated pass — not rushed.
-- [ ] Slice 4: runtime ACL receipts (`windows-acl.ts`) — provides real per-user
-      protection on shared Windows hosts; non-harmful on a single-user machine.
-      **Lean keep** per the principles.
+- [x] Slice 2: dead daemon-startup machinery — DONE. Removed ~1914 lines from
+      `src/sync/control.ts` (3114→~1200) and trimmed `tests/sync/control.test.ts`
+      (1881→~598; 20 startup tests dropped, 15 control tests kept). Kept
+      functions intact; dev agent implemented, review agent found no blockers
+      (one dangling `import type` fixed), typecheck clean, `tests/sync/` 31 pass.
+- [x] Slice 3: installer transaction overhead — DONE (targeted). An analysis
+      agent read both installers + their tests end-to-end: the complexity is
+      almost entirely FEATURES (atomic publication, receipt-bound update,
+      configurer-rollback journal, incompatible-replacement recovery, checksum
+      + __inspect identity). The only zero-cascade theater was ~7 lines: the
+      redundant manifest/binary "cross-binding" checks in `install.sh` (the
+      manifest and binary are already checksum-verified independently) and a
+      redundant staged-binary re-hash in `install.ps1` (re-hashed again one
+      statement later by `Publish-InstallerFile`). Removed those; kept
+      everything that serves a feature. Verified: installers + version-projection
+      tests green (43 pass), `install.ps1` parses clean. Everything else
+      (lock-token ceremony, PATH-block sha, `Assert-NotReparse`, retired-artifact
+      re-hash, etc.) is locked in by co-designed tests AND serves atomicity/
+      upgrade-safety — left intact per "do not sacrifice features."
+- [x] Slice 4: runtime ACL receipts — KEEP. After Slice 2 only the single
+      data-dir receipt remains (per-subdir startup receipts are gone); it is
+      non-breaking and gives real per-user protection on Windows. Genuinely
+      useful, kept per the principles.
