@@ -1097,6 +1097,84 @@ function isInteractive(
   return interaction.isInteractiveInput?.() ?? presentation.policy.interactive;
 }
 
+/**
+ * Show a brief, live-updating sync-progress display after login so the user
+ * knows their meetings are syncing and can safely close the terminal.
+ * Polls for up to ~12 seconds; prints a "you can close" message if still
+ * syncing, or a "sync complete" message if it finishes in that window.
+ */
+async function showSyncProgress(
+  presentation: ConfigurerPresentation,
+): Promise<void> {
+  const ui = presentation.ui;
+  const stream = process.stderr;
+  const maxWaitMs = 12_000;
+  const startedAt = Date.now();
+
+  let runtime: { refresh(): void; status(...args: unknown[]): unknown; close(): void } | undefined;
+  try {
+    const mod = await import("../app/runtime.js");
+    runtime = new mod.LocalAppRuntime();
+  } catch {
+    return;
+  }
+  if (!runtime) return;
+
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const s = (v: unknown): string => (typeof v === "number" ? String(v) : "?");
+
+  try {
+    stream.write("\n");
+    for (;;) {
+      runtime.refresh();
+      const status = runtime.status() as Record<string, unknown>;
+      const elapsed = Date.now() - startedAt;
+
+      if (status.phase === "synced" || !status.blocking) {
+        stream.write("\r\u001b[K");
+        presentation.print(ui.color.green("✔ "), "Meeting sync complete.");
+        presentation.print(
+          ui.color.dim("Run "),
+          ui.color.cyan("sana-mcp"),
+          ui.color.dim(
+            " to browse your meetings and transcripts, or use the meeting_transcripts tool from any registered AI client.",
+          ),
+        );
+        return;
+      }
+
+      const done = s(status.transcriptsDone);
+      const total = s(status.transcriptsTotal);
+      const eta = status.etaMinutes ? ` ~${status.etaMinutes} min` : "";
+      const dots = ".".repeat(Math.floor(elapsed / 1000) % 3 + 1);
+      stream.write(
+        `\r${ui.color.dim("Syncing")} ${done}/${total} transcripts${eta}${dots}   `,
+      );
+
+      if (elapsed >= maxWaitMs) {
+        stream.write("\r\u001b[K");
+        presentation.print(`Syncing ${done}/${total} transcripts${eta}…`);
+        presentation.blank();
+        presentation.print(
+          ui.color.dim(
+            "You can close this window or press Ctrl+C — the sync continues in the background.",
+          ),
+        );
+        presentation.print(
+          ui.color.dim("Run "),
+          ui.color.cyan("sana-mcp status"),
+          ui.color.dim(" to check progress at any time."),
+        );
+        return;
+      }
+
+      await sleep(1000);
+    }
+  } finally {
+    runtime.close();
+  }
+}
+
 async function promptWizard(
   interaction: InstallInteraction,
   presentation: ConfigurerPresentation,
@@ -1844,11 +1922,12 @@ export async function runInstall(
   }
   try {
     presentation.blank();
-    presentation.print(
-      login.outcome === "skipped"
-        ? "Client configuration complete. Sana sign-in was skipped."
-        : "Client configuration and Sana sign-in are ready.",
-    );
+    if (login.outcome === "skipped") {
+      presentation.print("Client configuration complete. Sana sign-in was skipped.");
+    } else {
+      presentation.print("Client configuration and Sana sign-in are ready.");
+      await showSyncProgress(presentation);
+    }
   } catch (presentationFailure) {
     throw postAuthPresentationError(login, presentationFailure);
   }
