@@ -943,7 +943,7 @@ test("release workflow binds every build and publish step to the authorized comm
     assert.ok(smoke, `${jobName} smoke step is required`);
     assert.match(
       smoke,
-      /EXECUTION_DIR=.*mktemp -d[\s\S]*chmod 700 "\$EXECUTION_DIR"[\s\S]*install -m 500 "\$ASSET" "\$EXECUTION_ASSET"[\s\S]*(?:exec 9<"\$EXECUTION_ASSET"|EXPECTED_SHA256)[\s\S]*EXECUTED_SHA256=.*(?:sha256sum|shasum -a 256)[\s\S]*(?:EXECUTION_HANDLE|\/execution\/artifact).*--version[\s\S]*__inspect --format json[\s\S]*--help[\s\S]*(?:POST_EXECUTION_SHA256|EXPECTED_SHA256)[\s\S]*(?:sha256sum|shasum -a 256).*"\$ASSET".*EXECUTED_SHA256[\s\S]*--executed-sha256 "\$EXECUTED_SHA256"/u,
+      /EXECUTION_DIR=.*mktemp -d[\s\S]*chmod 700 "\$EXECUTION_DIR"[\s\S]*install -m 500 "\$ASSET" "\$EXECUTION_ASSET"[\s\S]*(?:exec 9<"\$EXECUTION_ASSET"|EXPECTED_SHA256)[\s\S]*EXECUTED_SHA256=.*(?:sha256sum|shasum -a 256)[\s\S]*(?:EXECUTION_HANDLE|EXEC_COPY|\/execution\/artifact).*--version[\s\S]*__inspect --format json[\s\S]*--help[\s\S]*(?:POST_EXECUTION_SHA256|EXPECTED_SHA256)[\s\S]*(?:sha256sum|shasum -a 256).*"\$ASSET".*EXECUTED_SHA256[\s\S]*--executed-sha256 "\$EXECUTED_SHA256"/u,
     );
   }
   const macSmoke = parsedWorkflow.jobs.macos?.steps?.find(
@@ -952,7 +952,7 @@ test("release workflow binds every build and publish step to the authorized comm
   assert.ok(macSmoke);
   assert.match(
     macSmoke,
-    /reset_execution_handle\(\)[\s\S]*sysseek\(STDIN, 0, SEEK_SET\)[\s\S]*mv -f "\$EXECUTION_ASSET\.replacement" "\$EXECUTION_ASSET"[\s\S]*reset_execution_handle[\s\S]*--version[\s\S]*reset_execution_handle[\s\S]*__inspect --format json[\s\S]*reset_execution_handle[\s\S]*--help[\s\S]*reset_execution_handle[\s\S]*POST_EXECUTION_SHA256/u,
+    /reset_execution_handle\(\)[\s\S]*sysseek\(STDIN, 0, SEEK_SET\)[\s\S]*mv -f "\$EXECUTION_ASSET\.replacement" "\$EXECUTION_ASSET"[\s\S]*reset_execution_handle[\s\S]*--version[\s\S]*__inspect --format json[\s\S]*--help[\s\S]*reset_execution_handle[\s\S]*POST_EXECUTION_SHA256/u,
   );
 
   assert.deepEqual(parsedWorkflow.jobs.publish?.needs, [
