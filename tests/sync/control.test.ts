@@ -1400,7 +1400,7 @@ describe("cooperative daemon control", () => {
             "preserve hostile evidence\n",
           );
         },
-        expected: /unknown.*preserved/iu,
+        expected: /unrecognized.*preserved/iu,
       },
     ];
     for (const fixture of cases) {
