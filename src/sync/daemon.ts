@@ -1,4 +1,6 @@
 import { performance } from "node:perf_hooks";
+import fs from "node:fs";
+import path from "node:path";
 import {
   SanaStore,
   SyncGenerationChangedError,
@@ -23,6 +25,7 @@ import {
   SemanticUnavailableError,
 } from "../semantic/semantic.js";
 import { RUNTIME_ENV } from "../runtime/env.js";
+import { dataDirectory, ensureDataDir } from "../config.js";
 import {
   publishClientSession,
   requireCurrentSession,
@@ -41,8 +44,27 @@ const INCREMENTAL_INTERVAL_MS = RUNTIME_ENV.syncIntervalMs;
 const HEARTBEAT_MS = 5_000;
 const REQUEST_DELAY_MS = RUNTIME_ENV.requestDelayMs;
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+let _logStream: fs.WriteStream | undefined;
+function log(...a: unknown[]): void {
+  if (!_logStream) {
+    try {
+      ensureDataDir();
+      _logStream = fs.createWriteStream(
+        path.join(dataDirectory(), "daemon.log"),
+        { flags: "a" },
+      );
+    } catch {
+      return;
+    }
+  }
+  _logStream.write(
+    `${new Date().toISOString()} ${a
+      .map((v) => (typeof v === "string" ? v : JSON.stringify(v)))
+      .join(" ")}\n`,
+  );
+}
 
 class DaemonStopRequestedError extends Error {
   constructor() {

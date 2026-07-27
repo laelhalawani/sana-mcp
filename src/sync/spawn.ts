@@ -6,16 +6,9 @@
 // SQLite lease (see lock.ts / the store); the control record is the readiness
 // surface the launcher and installer lifecycle observe.
 import { spawn, type ChildProcess } from "node:child_process";
-import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import {
-  PROJECT_ROOT,
-  dataDirectory,
-  ensureDataDir,
-  isCompiledBinary,
-} from "../config.js";
-import { openSensitiveFile } from "../runtime/secure-files.js";
+import { PROJECT_ROOT, isCompiledBinary } from "../config.js";
 import {
   observeDaemonControl,
   type DaemonControlObservation,
@@ -68,25 +61,15 @@ export async function ensureDaemonRunning(): Promise<EnsureDaemonResult> {
     return { alreadyRunning: true, spawned: false };
   }
 
-  ensureDataDir();
-  const logDescriptor = openSensitiveFile(
-    path.join(dataDirectory(), "daemon.log"),
-    "a",
-  );
   let child: ChildProcess;
   try {
     const launch = launchCommand();
     child = spawn(launch.executable, [...launch.args], {
       detached: true,
-      stdio: ["ignore", logDescriptor, logDescriptor],
+      stdio: "ignore",
       windowsHide: true,
     });
   } catch (error) {
-    try {
-      fs.closeSync(logDescriptor);
-    } catch {
-      // best-effort
-    }
     throw error;
   }
 
@@ -130,12 +113,5 @@ export async function ensureDaemonRunning(): Promise<EnsureDaemonResult> {
     }
   } finally {
     child.off("exit", onExit);
-    // Keep the log descriptor open for the child's inherited stdio until the
-    // daemon has published readiness; only then close the launcher's copy.
-    try {
-      fs.closeSync(logDescriptor);
-    } catch {
-      // best-effort; the child owns its inherited copy regardless.
-    }
   }
 }
