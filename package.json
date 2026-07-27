@@ -1,13 +1,13 @@
 {
   "name": "sana-mcp",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "private": true,
   "description": "Sync and read your Sana.AI meeting transcripts (CLI + MCP server)",
   "license": "GPL-3.0",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "bun run typecheck && bun test",
+    "check": "bun run typecheck && bun test --parallel=1 --timeout 20000",
     "cli": "bun src/cli.ts",
     "login": "bun src/cli.ts login",
     "mcp": "bun src/mcp.ts",

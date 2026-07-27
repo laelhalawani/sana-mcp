@@ -1,7 +1,7 @@
 ---
 status: active
 scope: implementation and review evidence
-last_verified: 2026-07-25
+last_verified: 2026-07-26
 ---
 
 # Review ledger
@@ -1876,3 +1876,652 @@ Final validation evidence:
 - the post-release main workflow authorized the existing `v0.4.5` and skipped
   every build/publication job successfully; final local cleanup reported zero
   isolated test roots and zero test Sana processes.
+
+## v0.4.6 targeted CLI and installer repair
+
+This stage starts from the clean `v0.4.5` release commit `31fafce`. The broader
+working-tree redesign is preserved outside this isolated worktree and is not
+part of this repair.
+
+### Prep and finalized ownership
+
+Read-only diagnosis was split between:
+
+- `/root/minimal_config_cli_trace`: PowerShell installer, client discovery,
+  ownership, planning, publication, uninstall, and directly matching tests;
+- `/root/minimal_auth_cli_trace`: sign-in request, cookie/session publication,
+  durable auth transition, retry, configurer inspection, and matching tests.
+
+The consolidated plan received two independent full-path reviews. Both found
+that the initial auth plan missed the deterministic `sana-ai-session` origin
+binding failure and that the speculative secure-session rename retry was not
+causal. Their remaining config and auth findings were incorporated. Each
+reviewer then re-read the corrected consolidated plan and returned a separate
+zero-finding approval.
+
+| Plan review / round | Findings | Resolution | Result |
+|---|---|---|---|
+| `/root/minimal_plan_review_1`, initial | missing request-code origin binding; unrelated auth issue could be overwritten; path aliases were not fully Windows-aware; Windows directory flush suppression omitted an ambiguous post-publication branch | added exact same-origin cookie provenance, request-code issue gating, resolved/case-folded Windows path identity, and every post-mutation Windows flush branch; deferred the non-causal secure-file retry | correction required |
+| `/root/minimal_plan_review_2`, initial | same deterministic origin failure; future request-code failures should not manufacture a cache block; speculative rename retry was non-causal; absent-client interactive discovery had to retain the existing nonblocking UX | added pid-less request-code recovery plus exact v0.4.5 poison compatibility, preserved unrelated issues, retained the established interactive/uninstall policy, and deferred the non-causal secure-file retry | correction required |
+| `/root/minimal_plan_review_1`, corrected plan | none | n/a | APPROVED - zero findings |
+| `/root/minimal_plan_review_2`, corrected plan | none | n/a | APPROVED - zero findings |
+
+Development scope `V046-CONFIG` exclusively owns:
+
+- `src/install/clients.ts`
+- `src/install/config-formats.ts`
+- `src/install/writers.ts`
+- `src/install/apply.ts`
+- `src/install/install.ts`
+- `src/install/status.ts`
+- `src/install/atomic-config.ts`
+- directly matching tests under `tests/install/`
+
+Development scope `V046-AUTH` initially owned:
+
+- `src/sana/client.ts`
+- `src/store/db.ts`
+- `tests/sana/client.test.ts`
+- `tests/sana/auth-request.test.ts`
+- `tests/sana/auth.test.ts`
+- `tests/sana/session-publication.test.ts`
+- `tests/runtime/secure-session.test.ts`
+- `tests/runtime/secure-store.test.ts`
+
+Reviewed correction rounds explicitly extended `V046-AUTH` ownership to:
+
+- `src/core/status.ts`
+- the auth/configurer portions of `src/install/install.ts`, owned sequentially
+  only after `V046-CONFIG` finished its whole-file work and review
+- `src/sync/daemon.ts`
+- `src/tools/dispatch.ts`
+- `src/app/runtime.ts`
+- `tests/core/status-auth.test.ts`
+- the auth/configurer portions of `tests/install/configurer-flow.test.ts`,
+  owned sequentially only after `V046-CONFIG`
+- `tests/sync/daemon.test.ts`
+- `tests/tools/dispatch-auth.test.ts`
+- `tests/app/runtime.test.ts`
+- the pending-challenge contract-double changes in
+  `tests/fixtures/contracts/auth-client.ts` and
+  `tests/fixtures/contracts/semantic-client.ts`
+
+`V046-AUTH` does not own `src/runtime/secure-files.ts`; the unproven rename
+hardening is explicitly deferred. Installer scripts, CLI routing, transaction
+protocol/schema, cookies, the state epoch, update/reset, daemon behavior,
+direct AppRuntime cache gating, and agent-facing dispatch output were initially
+outside the auth scope. The review findings made the daemon, cache
+authorization, AppRuntime, configurer-auth, and dispatch gates explicit,
+sequentially owned correction work. Meeting/cache contents and schemas remained
+out of scope. Agent-facing byte contracts were preserved: no public wording or
+output fixture changed, and the contract fixture edits only added the explicit
+nonpending client method required by the production interface.
+
+Baseline evidence before development: 74 targeted config, atomic publication,
+secure-session, auth-request, and session-publication tests passed; no tracked
+source file differed from `31fafce`.
+
+### Development and scope-review lineage
+
+| Scope / round | Development | Review | Findings | Resolution / next gate |
+|---|---|---|---|---|
+| `V046-CONFIG` initial | `/root/v046_config_dev` | `/root/v046_config_review_1` | none | CLEAN - zero findings; reviewer read the complete owned production/test scope plus CLI and hidden transaction callers; 88 targeted and 125 caller/transaction tests, typecheck, and diff-check passed |
+| `V046-AUTH` initial | `/root/v046_auth_dev` | `/root/v046_auth_review_1` | request-stage `sana-ai-session` remained indistinguishable from verified login readiness in core status/cache, restarted configurer, and daemon paths; an origin-change request could expose an old unblocked cache before code verification | correction round assigned to `/root/v046_auth_dev`; pending challenge will become explicit read-only client state consumed by all readiness gates, configurer retry, and daemon waiting; requires a fresh reviewer |
+| `V046-AUTH` correction 1 | `/root/v046_auth_dev` | `/root/v046_auth_review_2` | a confirmed request-code challenge blocked status/tool paths but did not durably set the store cache block, allowing direct app-runtime access to an old matching cache; tool dispatch also mislabeled pending as expired | correction round 2 assigned to `/root/v046_auth_dev`: request-code confirmation/target recovery will set the durable block while source abort preserves its pre-publication value, and dispatch will route pending to existing signed-out guidance; requires store/AppRuntime/dispatch regressions and another fresh reviewer |
+| `V046-AUTH` correction 2 | `/root/v046_auth_dev` | `/root/v046_auth_review_3` | if a challenge became pending after dispatch's initial check but before daemon startup, the status-only path safely hid metrics but rendered sync-in-progress rather than signed-out guidance | correction round 3 assigned to `/root/v046_auth_dev`: recheck the stable pre-daemon client for a pending challenge and return the existing byte-exact signed-out guidance before daemon startup/status rendering; requires deterministic race regression and another fresh reviewer |
+| `V046-AUTH` correction 3 | `/root/v046_auth_dev` | `/root/v046_auth_review_4` | none | CLEAN - zero findings; fresh reviewer traced the complete auth scope plus publication/login callers and verified pending publication, durable blocking, recovery, configurer, daemon, dispatch races, status, and direct runtime; 112 focused tests, typecheck, and diff-check passed |
+
+### Cross-cutting stage review
+
+| Round | Review | Findings | Resolution / next gate |
+|---|---|---|---|
+| cross-cutting 1 | `/root/v046_crosscut_review_1` | an in-memory pending challenge could precede publication of the durable store block, while an existing `LocalAppRuntime` authorized only against the still-ready store | correction assigned to `/root/v046_auth_dev`: `LocalAppRuntime` will reject pending client state before its store guard, with separate pre-publication and confirmed-block coverage across all cache-backed methods; requires a fresh adversarial stage reviewer |
+| cross-cutting correction 1 | `/root/v046_crosscut_review_2` | none | CLEAN - zero findings; fresh reviewer traced both transcripts through unchanged installer/CLI/hidden transaction/release callers and the complete config/auth/runtime diff; 168 focused tests, typecheck, and diff-check passed |
+
+### Deployment prep and release-quality boundary
+
+Release preparation was independently traced by:
+
+- `/root/v046_crosscut_review_1`: complete release workflow, authorization,
+  build, publication, and post-publication path;
+- `/root/v046_crosscut_review_2`: every `0.4.6` version projection and the
+  positive state-compatibility epoch;
+- `/root/v046_auth_dev`: local Git state and public GitHub branch, workflow,
+  check, tag, release, and asset readiness.
+
+Remote preparation found no enforced branch protection, ruleset, required
+status check, or pull-request workflow. The active release workflow publishes
+from `main` only when the package-matching tag is absent. The finalized plan
+therefore froze a two-PR sequence: merge the repair while `v0.4.5` already
+exists and prove that publication skips, then merge the independently reviewed
+`0.4.6` release-quality projection to trigger publication.
+
+| Release plan review / round | Findings | Resolution | Result |
+|---|---|---|---|
+| `/root/v046_release_plan_review_1`, initial | The contract-quality scope did not own the temporary-only forbidden-data harness or exact `bun run check`; merge evidence did not freeze base/head SHA and merged-tree identity; the public installer could run under the real Windows user and mutate PATH/config; the native Windows file list and timeout were not exact | Froze dual-SHA/tree evidence and the two-PR sequence; assigned the disposable data guard and full Linux quality gate; prohibited real-user public-installer execution in favor of read-only post-publication verification; froze the historical candidate's exact 19-file native Windows command and timeout | correction required |
+| `/root/v046_release_plan_review_2`, initial | The exact native Windows test list and 20-second timeout were not frozen; post-publication isolated installation lacked explicit User PATH isolation; mismatched draft assets needed an immutable fail-closed rule | Added the exact native command, `pathManaged=false` and byte-exact User PATH assertions, read-only remote verification, and mandatory refusal of an immutable draft whose asset tuple mismatches | correction required |
+| `/root/v046_release_plan_review_1`, corrected plan | none | n/a | APPROVED - zero findings |
+| `/root/v046_release_plan_review_2`, corrected plan | none | n/a | APPROVED - zero findings |
+
+The `0.4.6` release retains positive state-compatibility epoch `1`. No state
+schema or incompatible replacement boundary changed. A receipt-backed
+`v0.4.5` epoch-1 installation is therefore a compatible update and must retain
+authentication, meeting/cache state, transcripts, and User PATH without
+destructive replacement authority.
+
+#### Repair PR evidence
+
+Repair PR **#1** was reviewed at head
+`a1eb4ba98b3151d6897e760c0935143787567f75` and merged as
+`2ce8942c6829fd0a432685cb909a51d72f278edd`. Both commits resolve to the exact
+tree `d98261d5a7426d58bfe37d293876b9f3f0031147`; the merge introduced no
+unreviewed tree change. Workflow run **30195759438** completed the `authorize`
+job successfully and skipped every build and publication job because the
+package-matching `v0.4.5` tag already existed.
+
+The release branch is based exactly on
+`2ce8942c6829fd0a432685cb909a51d72f278edd`.
+
+#### Release-quality development ownership and review lineage
+
+`V046-RELEASE-PROJECTION` development was owned by
+`/root/v046_auth_dev` for exactly:
+
+- `package.json`;
+- `README.md`;
+- `install.sh`;
+- `docs/dev/cli-specs.md`;
+- `tests/fixtures/manifest/invalid-unknown-field.json`;
+- `tests/fixtures/manifest/valid-all-targets.json`;
+- `tests/install/atomic-config.test.ts`;
+- `tests/install/installers.test.ts`;
+- `tests/install/manifest.test.ts`.
+
+`V046-RELEASE-CI` development was owned by
+`/root/v046_release_ci_dev` for exactly:
+
+- `.github/workflows/release.yml`;
+- `tests/release/release.test.ts`;
+- the later dual live-data guard correction in
+  `tests/contracts/mcp-stdio.test.ts` and
+  `tests/fixtures/contracts/block-network.ts`.
+
+`V046-UNINSTALL-NONTY` was a later quality correction owned by
+`/root/v046_auth_dev` for exactly:
+
+- `src/install/install.ts`;
+- `tests/install/configurer-flow.test.ts`;
+- validation-only inspection of the unchanged
+  `tests/tools/cli-configurer-exit.test.ts`.
+
+| Scope / round | Development | Review | Findings | Resolution / result |
+|---|---|---|---|---|
+| `V046-RELEASE-PROJECTION` initial | `/root/v046_auth_dev` | `/root/v046_release_projection_review_1` | The native `v0.4.5` to `v0.4.6` compatible-update gate lacked persistent state sentinels and asserted only part of the final receipt | Added exact byte/text sentinels under isolated data and transcript roots; asserted predecessor and current epoch/protocol identity; asserted the complete ten-field receipt, final binary digest, and unchanged User PATH | correction required fresh review |
+| `V046-RELEASE-PROJECTION` correction 1 | `/root/v046_auth_dev` | `/root/v046_release_projection_review_2` | The full quality harness did not have a dual lexical/canonical live-data guard, and the native installer child inherited host destructive-replacement authority | Split the data guard into a lexical repository-data prohibition and a canonical disposable-alias prohibition; explicitly removed `SANA_MCP_REPLACE_INCOMPATIBLE` and `SANA_MCP_INCOMPATIBLE_RESET` before assigning the isolated installer environment | correction required fresh reviews |
+| `V046-RELEASE-PROJECTION` correction 2 | `/root/v046_auth_dev` plus the independently owned data-guard correction by `/root/v046_release_ci_dev` | `/root/v046_release_projection_review_3` | none | CLEAN - zero findings; 79 scoped tests, typecheck, and diff-check passed |
+| `V046-RELEASE-CI` initial | `/root/v046_release_ci_dev` | `/root/v046_release_ci_review` | The serialized fake-GitHub publication harness had a deterministic 20-second full-suite timeout | Raised only that test's harness timeout to 60 seconds; release retry and production timeout semantics were unchanged | correction required fresh review |
+| `V046-RELEASE-CI` correction 1 | `/root/v046_release_ci_dev` | `/root/v046_release_ci_review_2` | none | CLEAN - zero findings |
+| dual live-data guard correction | `/root/v046_release_ci_dev` | `/root/v046_release_data_guard_review` | none | CLEAN - zero findings; 22 contract tests passed |
+| `V046-UNINSTALL-NONTY` correction | `/root/v046_auth_dev` | `/root/v046_uninstall_nontty_review` | Full POSIX quality exposed mixed unknown-client discovery plus an owned candidate on non-TTY input: uninstall promoted the unrelated discovery error before returning the established interaction-required guidance | Reordered only preselection state handling: unknown-only, interactive, and `--yes` remain fatal before mutation; mixed candidates on non-TTY/no-`--yes` return interaction-unavailable without prompt or write | CLEAN - zero findings; 41 configurer/CLI tests passed |
+
+#### Mandatory release gates
+
+Publication depends on a Linux `quality` job that checks out the authorized SHA,
+installs the frozen lockfile with Bun `1.3.14`, and runs the complete
+`bun run check`. `publish` requires `quality` as well as the authorized Linux,
+macOS, and Windows build jobs.
+
+The release-quality candidate that later failed in run 30196966752 used this
+historical exact 19-file native Windows suite with a 20-second per-test timeout:
+
+```text
+bun test --timeout 20000 tests/app/runtime.test.ts tests/core/status-auth.test.ts tests/install/apply.test.ts tests/install/atomic-config.test.ts tests/install/clients.test.ts tests/install/config-formats.test.ts tests/install/configurer-flow.test.ts tests/install/status.test.ts tests/install/writers.test.ts tests/runtime/secure-session.test.ts tests/runtime/secure-store.test.ts tests/sana/client.test.ts tests/sana/auth-request.test.ts tests/sana/auth.test.ts tests/sana/session-publication.test.ts tests/sync/daemon.test.ts tests/tools/dispatch-auth.test.ts tests/install/config-transaction.test.ts tests/install/config-transaction-flow.test.ts
+```
+
+It is not the corrected release gate. The serialized 20-file command, including
+`tests/runtime/windows-acl.test.ts`, is recorded under Scope C below.
+
+After the historical suite, Windows built the canonical `bun-windows-x64`
+standalone and executed the filtered official `v0.4.5` to candidate `v0.4.6`
+installer gate. That candidate gate was designed to prove:
+
+- predecessor manifest and candidate standalone installer, lifecycle, inspect,
+  and state-compatibility values are all exactly `1`;
+- exact byte/text sentinels in isolated data and transcript directories survive
+  the compatible update unchanged;
+- the published binary and complete ten-field epoch-1 installer receipt match
+  the authorized candidate tuple;
+- `pathManaged=false`, the isolated User PATH is byte-for-byte unchanged, and
+  no incompatible-replacement authority is inherited by the installer child;
+- only the proven old installed-path MCP process is retired, while an unrelated
+  same-name process survives.
+
+The contract gate independently blocks repository `data/` and every descendant
+lexically before canonical filesystem inspection, then blocks a separate
+disposable symlink/junction target canonically. Required guard environment
+variables fail closed, and cleanup is limited to exact temporary roots.
+
+The subsequent failed-run correction recorded below fixes the WSL extracted
+PowerShell helper's omitted `Assert-NotReparse` dependency and adds that helper
+to the native Windows release gate. The earlier release-quality review did not
+claim a broad WSL installer-suite pass before that correction.
+
+#### Release-quality merge and failed-run evidence
+
+Release-quality PR **#2** was reviewed at head
+`17aecc53b31ae96e90e328880c2b82200829fe90`. Its reviewed tree and the merge
+tree are both exactly `0fce21681f511ba9ccbaaefb3827278ea4f2e808`.
+It merged as `22c9d3f09ec6ffafff19b834a8b3c2241d3c8369`, so the merge introduced no
+unreviewed tree change. Release workflow run **30196966752** failed as recorded
+below. The `v0.4.6` tag was absent and no `v0.4.6` release was created;
+successful tag, release, and complete asset evidence remained pending.
+
+Repair validation remains:
+
+- exact applied changed-scope and transitive suite: 327 passed, 0 failed;
+- `bun run typecheck` and `git diff --check`: passed;
+- native Windows Bun config/auth/runtime coverage: 114 effective tests passed
+  after applying a longer timeout to one UNC-hosted child-process test;
+- native Windows config coverage exercised actual atomic publication, exact
+  predecessor ownership, alias rejection, full-set preplanning, and zero
+  directory-flush calls; one POSIX-only injected durability test is not
+  portable to a Windows filesystem and is not product-path evidence;
+- a natively built Windows standalone passed inspect/help and an isolated
+  end-to-end config scenario: the historical Claude entry stayed byte-exact, a
+  later foreign Gemini entry caused zero writes, retry registered Cursor
+  without durability warnings, uninstall removed both managed registrations,
+  and no temporary config artifact remained;
+- validation used only isolated temporary roots and mocked auth network paths;
+  it did not touch live installation, client config, Sana state, or send a real
+  sign-in code.
+
+## v0.4.6 failed production run and release-gate correction
+
+GitHub Actions run **30196966752** executed the `main` merge commit
+`22c9d3f09ec6ffafff19b834a8b3c2241d3c8369`. Authorization and all six
+non-Windows platform build jobs succeeded. The full Linux quality job failed
+with **533 passed, 1 skipped, 10 failed, and 3 errors across 544 tests**. The
+Windows job failed with **231 passed, 8 skipped, 51 failed, and 1 error across
+290 tests**. `publish` was therefore skipped, and no `v0.4.6` tag or release
+was created.
+
+Authenticated read-only preflight inspected the Actions run and repository
+administration/visibility boundary before planning. It confirmed that the
+repository is private, the existing `v0.4.5` release is accessible and verified
+through authenticated repository access, and its exact predecessor Windows
+fixture assets are present:
+
+- `manifest.json`;
+- `manifest.json.sha256`;
+- `sana-mcp-windows-x64.exe`;
+- `sana-mcp-windows-x64.exe.sha256`.
+
+The public browser download URLs used by the failed native test cannot be an
+acceptance oracle for a private release. Future `v0.4.6` release acceptance and
+asset verification must likewise use authenticated repository access. Within
+the Windows job, `GH_TOKEN` is provided only to the dedicated predecessor-fetch
+step; the installer test process receives no token.
+
+### Prep diagnosis and corrected plan
+
+Three independent read-only analyses traced the failures:
+
+- `/root/v046_ci_ubuntu_analysis` found shared Bun-realm mock poisoning, a
+  five-second PowerShell failure cascade, incorrect activation of a native
+  Windows process harness under Ubuntu `pwsh`, and extraction that stopped
+  before the required `Assert-NotReparse` helper. It recommended serialized
+  `--parallel=1` execution with the existing 20-second test timeout, exact host
+  gating, complete helper extraction, and an explicit native Windows gate.
+- `/root/v046_ci_windows_analysis` traced 51 Windows ACL-related failures to a
+  PowerShell 7 `PSModulePath` inherited by nested Windows PowerShell 5.1, plus
+  a shared semantic mock leak. It also identified the product defect beneath
+  the CI symptom: shipped private-root setup depended on the autoloaded
+  `Get-Acl` cmdlet.
+- `/root/v046_ci_contract_analysis` traced the workflow, release-contract,
+  token, fixture-isolation, cleanup, and retry boundaries. It found that the
+  private repository makes all four unauthenticated `v0.4.5` asset fetches
+  invalid and required a product correction rather than CI-only
+  `PSModulePath` repair.
+
+| Plan review / round | Findings | Resolution / result |
+|---|---|---|
+| `/root/v046_ci_plan_review_a`, initial | ACL verification had to prove the entire exact access rule; native Windows versus WSL host detection, path conversion, temporary-root authority, and cleanup were underspecified; ledger scope/review evidence was incomplete; private authenticated release acceptance and immutable absent-tag versus existing-tag retry rules were missing | Required exact SID/type/rights/inheritance/propagation verification, precise native/WSL gates and native `.NET` temp ownership, guaranteed cleanup, exact ledger ownership, authenticated private-release acceptance, and separate immutable retry paths |
+| `/root/v046_ci_plan_review_b`, initial | A private repository breaks the four unauthenticated predecessor fetches; the workflow needed token-scoped `gh` prefetch, a local fixture, no token inheritance, and authenticated-only private-release verification | Added an exact four-asset authenticated prefetch under a proven runner-temp child, passed only its local directory to the tokenless test, required exact cleanup, and made release verification authenticated |
+| `/root/v046_ci_plan_review_a`, corrected plan | none | CLEAN - zero findings |
+| `/root/v046_ci_plan_review_b`, corrected plan | none | CLEAN - zero findings |
+
+The finalized correction has three non-overlapping development scopes.
+The current correction stage modifies exactly seven files: the six
+implementation, test, package, and workflow files owned by Scopes A-C plus this
+review ledger.
+
+### Scope A: module-independent exact Windows ACL
+
+Development agent `/root/v046_ci_acl_dev` owned exactly:
+
+- `src/runtime/windows-acl.ts`;
+- `tests/runtime/windows-acl.test.ts`.
+
+The shipped helper now uses the .NET file/directory access-control APIs rather
+than `Get-Acl`, and verifies the complete published rule: protected ACL, one
+explicit non-inherited allow rule, current-user SID, full control, exact
+directory/file inheritance, and no propagation flags.
+
+| Round | Development | Review | Findings | Resolution / result |
+|---|---|---|---|---|
+| initial | `/root/v046_ci_acl_dev` | `/root/v046_ci_acl_review1` | The inherited environment spread retained case variants and could create ambiguous duplicate Windows keys, so attacker-controlled lowercase `sana_acl_setup` or `systemroot` could collide with the authoritative values | Rebuilt the child environment while filtering both reserved names case-insensitively, then published only authoritative `SystemRoot` and `SANA_ACL_SETUP` values |
+| correction 1 | `/root/v046_ci_acl_dev` | `/root/v046_ci_acl_review2` | none | CLEAN - zero findings |
+
+Native Windows evidence passed **3 tests, 0 failures, 17 assertions**. It used
+an intentionally incompatible/empty `PSModulePath`, proved the exact root and
+file ACLs, proved lowercase collision attempts cannot redirect setup, preserved
+the outside sentinel's exact content bytes and access-control SDDL string,
+published the exact receipt, and removed the isolated sandbox. Typecheck and
+diff checks also passed.
+
+### Scope B: deterministic and authoritative test harness
+
+Development agent `/root/v046_ci_harness_dev` owned exactly:
+
+- `package.json`;
+- `tests/install/installers.test.ts`.
+
+The repository quality command now runs Bun tests serially with
+`--parallel=1 --timeout 20000`. The extracted exact-path PowerShell harness
+runs only on native Windows or on Linux with a proven WSL Windows PowerShell
+Desktop path, includes the complete helper dependency range, uses the native
+rooted `.NET` temporary directory, and makes process/root cleanup failures
+observable. The compatible-update test consumes an exact local predecessor
+fixture rather than making network requests.
+
+| Round | Development | Review | Findings | Resolution / result |
+|---|---|---|---|---|
+| initial | `/root/v046_ci_harness_dev` | `/root/v046_ci_harness_review1` | Partially configured or explicitly empty native-E2E environment values could silently take the same skip path as a completely unconfigured host | Skip is now permitted only when all three exact keys are absent; any partial, present-empty, or blank configuration fails explicitly before the test can claim success |
+| correction 1 | `/root/v046_ci_harness_dev` | `/root/v046_ci_harness_review2` | none | CLEAN - zero findings |
+
+The corrected complete local quality run reported **604 passed, 2 intentional
+platform skips, 0 failed**. The configuration regression separately proves
+all-absent skip, partial failure, blank failure, and complete typed adoption.
+
+### Scope C: authenticated workflow integration
+
+Development agent `/root` owned exactly:
+
+- `.github/workflows/release.yml`;
+- `tests/release/release.test.ts`.
+
+The Windows job now serializes its native suite, includes the Windows ACL test,
+and executes the exact-path replacement harness directly. It then builds the
+candidate, uses `github.token` only in one authenticated `gh release download`
+step, requires exactly the four proven `v0.4.5` fixture leaves under an exact
+non-reparse runner-temp child, passes that directory but no token to the native
+compatible-update test, and always removes only that derived fixture path.
+
+The corrected exact serialized 20-file native command is:
+
+```text
+bun test --parallel=1 --timeout 20000 tests/app/runtime.test.ts tests/core/status-auth.test.ts tests/install/apply.test.ts tests/install/atomic-config.test.ts tests/install/clients.test.ts tests/install/config-formats.test.ts tests/install/configurer-flow.test.ts tests/install/status.test.ts tests/install/writers.test.ts tests/runtime/secure-session.test.ts tests/runtime/secure-store.test.ts tests/runtime/windows-acl.test.ts tests/sana/client.test.ts tests/sana/auth-request.test.ts tests/sana/auth.test.ts tests/sana/session-publication.test.ts tests/sync/daemon.test.ts tests/tools/dispatch-auth.test.ts tests/install/config-transaction.test.ts tests/install/config-transaction-flow.test.ts
+```
+
+| Round | Development | Review | Findings | Resolution / result |
+|---|---|---|---|---|
+| initial | `/root` | `/root/v046_ci_workflow_review1` | none | CLEAN - zero findings |
+
+The release workflow contract test freezes serialized quality/native commands,
+the ACL and exact-path gates, authenticated four-asset fetch, token confinement,
+fixture identity and ordering, tokenless installer execution, and exact cleanup.
+Both new inline PowerShell blocks also passed Windows PowerShell AST parsing.
+
+### Evidence-ledger correction scope
+
+Development agent `/root/v046_auth_dev` owns only:
+
+- `docs/dev/review-ledger.md`.
+
+Read-only review `/root/v046_ci_ledger_review` returned seven evidence
+findings:
+
+1. the former 19-file command was presented as the current gate rather than the
+   historical failed-run gate, and the corrected serialized 20-file command was
+   absent;
+2. release-quality PR #2, reviewed head/tree, merge/tree, and failed workflow
+   evidence were still labeled `TBD`;
+3. the evidence-ledger development scope and reviewer lineage were absent;
+4. the ACL review finding incorrectly said reserved variables were removed
+   case-sensitively instead of saying the inherited spread retained case
+   variants and ambiguous Windows duplicates;
+5. the native sentinel claim said its ACL bytes were unchanged even though the
+   evidence compares exact content bytes and the access-control SDDL string;
+6. the failed quality and Windows test totals/results were omitted;
+7. the private `v0.4.5` release wording did not state that authenticated access
+   successfully reached and verified it.
+
+Correction round 1 by `/root/v046_auth_dev` resolves all seven findings in this
+section and the directly stale release-gate statements above. This correction
+still requires a fresh read-only ledger review; no clean result is claimed yet.
+
+Fresh reviewer `/root/v046_ci_ledger_review2` found one round-2 evidence issue:
+the token sentence was unqualified and therefore contradicted the legitimate
+`GH_TOKEN` use in the separate authorize and publish jobs. Correction round 2
+by `/root/v046_auth_dev` limits the claim exactly to the Windows job: only its
+dedicated predecessor-fetch step receives `GH_TOKEN`, while its installer test
+process receives no token. Authorize and publish token authority remains
+unchanged. This correction requires another fresh read-only ledger review; no
+clean result is claimed yet.
+
+Fresh reviewer `/root/v046_ci_ledger_review3` then returned CLEAN - zero
+findings for the complete ledger after the round-2 token wording correction.
+That verdict closed the individual evidence-ledger scope at that reviewed
+state.
+
+### Cross-cutting correction round
+
+Cross-cutting reviewer `/root/v046_ci_crosscut_review1` traced the complete
+failed-run correction across ACL setup, deterministic test execution, native
+Windows/WSL harness selection, authenticated predecessor-fixture handling,
+workflow ordering, release authorization, and publication. It found exactly one
+issue: the publication simulator's outer test-only timeout remained 60 seconds
+and was demonstrably flaky under full-suite load. One execution exceeded 60
+seconds, while observed 56.8-second and 47.55-second executions left
+insufficient cleanup/scheduling margin. The production release retry count,
+sleep, lookup, identity, and fail-closed semantics were clean and required no
+change. The reviewer reported no other integration defect.
+
+Correction development by `/root` changes only
+`tests/release/release.test.ts`, raising that publication simulator's outer
+test timeout to `120_000`. It does not change the production workflow or any
+production retry bound. The complete evidence run reported **604 passed, 2
+intentional skips, 0 failed, 1664 assertions, in 237.34 seconds**.
+
+A fresh cross-cutting read-only review of this corrected state is still
+required and remains **TBD**; no clean cross-cutting result is claimed here.
+
+Fresh cross-cutting reviewer `/root/v046_ci_crosscut_review2` identified three
+ledger evidence/temporal gaps before completing its review: the current stage
+did not state its exact seven-file modified inventory, the clean
+`/root/v046_ci_ledger_review3` individual verdict was absent, and the
+repository-transfer note described a future redirect condition as current.
+Correction by `/root/v046_auth_dev` records the exact inventory and clean
+individual lineage above and corrects the temporal statement below. These
+ledger changes require a fresh ledger review. The cross-cutting review is not
+clean and no completed verdict from `/root/v046_ci_crosscut_review2` is
+claimed.
+
+The repository-transfer boundary remains explicit. CI and the authenticated
+private predecessor fixture derive repository identity dynamically from
+`GITHUB_REPOSITORY`. The preserved public installer and update URLs currently
+resolve directly under `Etals-AiApp`. Only after a future repository transfer
+may those URLs rely on GitHub redirects until a reviewed version projection
+updates them. This is not a current correction-stage defect.
+
+### Immutable retry and pending evidence
+
+Because failed run 30196966752 created neither tag nor release, it must not be
+rerun as the release candidate after source correction. The authorized retry is
+a newly reviewed correction PR merged to `main`; that new immutable merge SHA
+may create `v0.4.6`. If an exact tag is created and a later job fails,
+`workflow_dispatch` may only resume that existing package-matching tag at its
+unchanged commit. A tag must never be moved, an existing mismatched draft/asset
+tuple must fail closed, and any authoritative source change requires a new
+candidate rather than mutation of an existing release identity.
+
+The following evidence remains deliberately unresolved:
+
+- correction PR number, reviewed head commit, and tree: **TBD**;
+- correction merge commit and tree: **TBD**;
+- fresh cross-cutting review after the test-timeout correction: **TBD**;
+- corrected deployment workflow run and complete job results: **TBD**;
+- `v0.4.6` tag and immutable target: **TBD**;
+- authenticated `v0.4.6` release and complete asset verification: **TBD**.
+
+## v0.4.6 workspace-null and release/native remediation
+
+This section records the later uncommitted remediation state as of
+2026-07-26. It supplements rather than replaces the failed-run history above.
+Passing tests are evidence only; they do not replace the pending read-only
+reviews identified below.
+
+### Exact current inventory and sequential ownership
+
+At this ledger update, the complete current worktree inventory for this
+remediation is exactly:
+
+- `.github/workflows/release.yml`;
+- `README.md`;
+- `docs/dev/bun-port.md`;
+- `docs/dev/review-ledger.md`;
+- `package.json`;
+- `scripts/release.ts`;
+- `src/runtime/build-info.ts`;
+- `src/runtime/windows-acl.ts`;
+- `src/sana/client.ts`;
+- `tests/install/installers.test.ts`;
+- `tests/release/release.test.ts`;
+- `tests/runtime/build-info.test.ts`;
+- `tests/runtime/windows-acl.test.ts`;
+- `tests/sana/client.test.ts`;
+- `tests/fixtures/release/fake-github.sh`;
+- `tests/fixtures/release/fake-github.ts`;
+- `tests/fixtures/sana/fake-sana-server.ts`;
+- `tests/fixtures/sana/user-me-workspace-null.json`;
+- `tests/sana/auth-e2e.test.ts`.
+
+Ownership is sequential where scopes share a file:
+
+| Scope | Exact owned files | Development |
+|---|---|---|
+| retained deterministic quality command | `package.json` | `/root/v046_ci_harness_dev` |
+| module-independent Windows ACL | `src/runtime/windows-acl.ts`; `tests/runtime/windows-acl.test.ts` | `/root/v046_ci_acl_dev` |
+| nullable `user.me` workspace and login publication regression | `src/sana/client.ts`; `tests/sana/client.test.ts`; `tests/sana/auth-e2e.test.ts`; `tests/fixtures/sana/fake-sana-server.ts`; `tests/fixtures/sana/user-me-workspace-null.json` | exact development-task ID unavailable in the retained coordinator evidence; **TBD**, not inferred |
+| initial matching-host build guard | `src/runtime/build-info.ts`; `tests/runtime/build-info.test.ts`; `scripts/release.ts` | exact development-task ID unavailable in the retained coordinator evidence; **TBD**, not inferred |
+| UNC/native-filesystem build-guard correction | `src/runtime/build-info.ts`; `tests/runtime/build-info.test.ts`; `scripts/release.ts` after the initial guard review | `/root` |
+| build-host documentation | `README.md`; `docs/dev/bun-port.md` | exact development-task ID unavailable in the retained coordinator evidence; **TBD**, not inferred |
+| release simulator and workflow contract | `.github/workflows/release.yml`; `tests/release/release.test.ts`; `tests/fixtures/release/fake-github.sh`; `tests/fixtures/release/fake-github.ts` | `/root/release_sim_redesign_dev` |
+| initial native integration | `.github/workflows/release.yml`; `tests/install/installers.test.ts`; `tests/release/release.test.ts`, sequentially after the simulator work | `/root/release_sim_redesign_dev/native_integration_dev` |
+| current release/native correction | `.github/workflows/release.yml`; `tests/install/installers.test.ts`; `tests/release/release.test.ts`, sequentially after the initial native round | `/root/release_sim_redesign_dev` |
+| this evidence correction | `docs/dev/review-ledger.md` only | `/root/final_crosscut_review` |
+
+No other current scope owns this ledger file. The ledger developer must not
+review this documentation change.
+
+### Individual development and review lineage
+
+| Scope / round | Development | Review | Findings | Resolution / result |
+|---|---|---|---|---|
+| nullable-workspace authentication | development-task ID unavailable/TBD | `/root/auth_fresh_review_r9` | none | CLEAN - zero findings for the complete nullable-workspace authentication scope; the reviewer traced `workspace: null` through validated `lastUsedWorkspaceId`, login publication, and daemon synchronization |
+| Windows ACL initial | `/root/v046_ci_acl_dev` | `/root/v046_ci_acl_review1` | inherited environment keys were retained case-variant, allowing ambiguous duplicate Windows `sana_acl_setup` or `systemroot` entries | filtered both reserved names case-insensitively and published only the authoritative values |
+| Windows ACL correction 1 | `/root/v046_ci_acl_dev` | `/root/v046_ci_acl_review2` | none | CLEAN - zero findings; this is the same completed ACL lineage recorded above |
+| initial matching-host build guard | development-task ID unavailable/TBD | `/root/build_guard_plan_review_b/core_build_guard_review1` | none within the then-defined platform/architecture guard | CLEAN - zero findings for that narrower scope only; the later UNC execution evidence below reopened the broader build-host gate |
+| build-host documentation | development-task ID unavailable/TBD | `/root/build_guard_plan_review_b/core_build_guard_review1` | none for the reviewed documentation state | CLEAN - zero findings for that state; the later UNC correction requires the documentation to remain aligned with the corrected product guard |
+| release simulator | `/root/release_sim_redesign_dev` | `/root/build_guard_plan_review_b/core_build_guard_review1` | none | CLEAN - zero findings for the simulator scope before the later native/workflow correction |
+| initial native integration | `/root/release_sim_redesign_dev/native_integration_dev` | `/root/release_sim_redesign_dev/docs_provenance_correction` | the retained coordinator evidence identifies the review and correction lineage but does not preserve exact finding text | correction returned to the same native developer; no zero-finding result is inferred |
+| current release/native correction | `/root/release_sim_redesign_dev` | **pending fresh reviewer** | the live database acceptance probe and workflow/attestation integration findings recorded below remain the correction scope | **pending**; no clean result claimed |
+| UNC build-host correction | `/root` | **pending fresh reviewer** | native Windows Bun running from a UNC/WSL source root passed the platform/architecture guard but emitted an artifact that failed the native lifecycle path | guard now rejects UNC source working directories before output mutation; focused evidence passed, but fresh review remains pending |
+| evidence-ledger correction | `/root/final_crosscut_review` | **pending fresh reviewer** | the prior ledger inventory was stale and omitted the current auth, build-guard, simulator, native, and cross-cutting lineage | this section records the exact known scope and pending gates; no self-approval or fresh clean result is claimed |
+
+The purported final approval of the initial native integration is deliberately
+not recorded as clean. Subsequent identical native compatible-update runs
+produced fail/pass/fail results and reopened that gate.
+
+### Fresh original-state cross-cutting findings
+
+Read-only reviewer `/root/final_crosscut_review` traced the original
+uncommitted state across nullable-workspace authentication, login publication,
+daemon synchronization, Windows ACL setup, release builds, attestations,
+simulated publication, native replacement, and update/uninstall preservation.
+It returned four findings, not a clean verdict:
+
+1. **HIGH - Windows attestation field mismatch.** The workflow validated a
+   root `target` property, while the generated attestation stores the target at
+   `inspect.target`. A valid generated attestation was rejected. The workflow
+   now reads `inspect.target`, but this correction is part of the changing
+   release/native scope and still requires fresh review.
+2. **HIGH - invasive and nondeterministic live database oracle.** The native
+   integration repeatedly opened the daemon's live WAL-mode SQLite database
+   directly. Identical runs produced fail/pass/fail, including `disk I/O
+   error` during lifecycle stop. The current correction is replacing this with
+   a post-stop audit and corrected lifecycle evidence; its final implementation
+   and cleanup behavior remain pending fresh review.
+3. **HIGH - incomplete Windows build-host proof.** The initial guard accepted
+   native Windows Bun running from a UNC/WSL checkout. That environment emitted
+   a valid-looking artifact which failed the lifecycle path. `/root` added a
+   pre-output UNC source-root rejection and aligned the build-host
+   documentation. Focused and direct rejection evidence passed, but a fresh
+   independent review remains pending.
+4. **PROCESS BLOCKER - stale review ledger.** The previous current-stage
+   inventory described seven files while the actual remediation spanned the
+   nineteen paths listed above, and it omitted the current scope/review
+   lineage. This documentation correction resolves the recorded omission but
+   itself requires a different fresh reviewer.
+
+The reviewer found no additional original-state defect in the corrected
+nullable-workspace authentication logic, Windows ACL implementation,
+release-simulator fail-closed boundary, installer/update/uninstall state
+preservation, or incompatible-replacement coordinator. That statement is not
+an approval of the files changed after the review began.
+
+### Fixture provenance
+
+No tracked captured Sana response fixture was modified. Both
+`tests/fixtures/sana/user-me-workspace-null.json` and its supporting fake server
+are new untracked test material in this stage. The JSON fixture truthfully
+classifies itself as an observed-shape regression fixture: only the
+`workspace: null` response shape came from the reported failure. No raw
+`user.me` response was captured; the envelope and all user, workspace, and
+email values are synthetic. Tests assert that limitation rather than
+representing the fixture as a verbatim production capture.
+
+### Current validation evidence
+
+The following evidence was reported for the current remediation. The native
+compatible-update variability is retained rather than averaged away:
+
+- full WSL check: **618 passed, 2 intentional platform skips, 0 failed, 1827
+  expectations, 57.49 seconds**;
+- native Windows CI suite: **305 passed, 8 intentional platform skips, 0
+  failed, 67.26 seconds**;
+- native compatible-update integration: earlier individual passes were
+  followed by **fail/pass/fail** on the same gate, correctly reopening it;
+- focused build-host guard: **14 passed, 0 failed, 164 expectations**;
+- a native Windows build launched from the UNC/WSL checkout was rejected
+  before its output file or parent directory was created.
+
+These results do not supersede the open native correction. In particular, a
+green broad suite does not convert the observed native fail/pass/fail sequence
+into a clean release gate.
+
+### Pending completion gates
+
+The following remain explicitly unresolved:
+
+- fresh independent review of the current three-file release/native correction:
+  **pending**;
+- fresh independent review of the UNC build-host correction and its
+  documentation alignment: **pending**;
+- fresh independent review of this ledger-only correction: **pending**;
+- fresh adversarial cross-cutting review of the complete frozen corrected
+  stage, after all individual reviews are clean: **pending**;
+- corrected merge, deployment workflow run, immutable `v0.4.6` tag, and
+  authenticated complete release-asset verification: **TBD**.
+
+No release or deployment approval is claimed by this entry.

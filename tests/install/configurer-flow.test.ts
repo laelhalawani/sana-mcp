@@ -90,7 +90,8 @@ function syncState(
 
 function sessionClient(
   version: SessionVersion,
-  hasCookie = true
+  hasCookie = true,
+  pendingChallenge: Readonly<{ email: string }> | null = null,
 ) {
   const fullVersion: SessionVersion = {
     ...version,
@@ -100,6 +101,7 @@ function sessionClient(
   return {
     sessionVersion: () => fullVersion,
     hasAuthCookie: () => hasCookie,
+    pendingSignInChallenge: () => pendingChallenge,
   };
 }
 
@@ -916,6 +918,65 @@ test("stable authentication inspection reloads and requires an exact confirmed t
   assert.equal(inspected.state.kind, "ready");
   if (inspected.state.kind === "ready")
     assert.equal(inspected.state.generation, 1);
+});
+
+test("persisted pending challenge is signed-out and resumable with a fresh request", async () => {
+  const version = {
+    generation: 1,
+    publicationToken: "11111111-1111-4111-8111-111111111111",
+    userId: "user-1",
+    workspaceId: "workspace-1",
+  };
+  const pending = { email: "prior@example.test" };
+  const inspected = inspectStableConfigurerAuthState(
+    {
+      reconcileAuthState() {
+        return { kind: "current", generation: 1 };
+      },
+      getSyncState() {
+        return syncState();
+      },
+    },
+    () => sessionClient(version, true, pending),
+  );
+  assert.equal(inspected.state.kind, "signed-out");
+  if (inspected.state.kind !== "signed-out") return;
+  assert.deepEqual(inspected.state.session, {
+    hasCookie: true,
+    loggedIn: false,
+    expired: false,
+  });
+
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-pending-retry-"),
+  );
+  const client = fixture("present", path.join(root, "client.json"), {
+    state: "present",
+    evidence: [root],
+  });
+  const output: string[] = [];
+  const auth = fakeAuth({
+    loggedIn: false,
+    authState: inspected.state,
+  });
+  const answers = ["fresh@example.test", "123456"];
+  try {
+    const result = await runInstall(
+      {},
+      interaction([client], output, {
+        openAuthSession: () => auth.session,
+        confirm: async () => true,
+        input: async () => answers.shift() ?? "",
+      }),
+    );
+    assert.deepEqual(auth.calls.request, ["fresh@example.test"]);
+    assert.deepEqual(auth.calls.verify, [
+      ["fresh@example.test", "123456"],
+    ]);
+    assert.equal(result.authentication, "ready");
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
 });
 
 test("authentication inspection returns typed churn instead of stale readiness", () => {
@@ -1882,6 +1943,64 @@ test("uninstall never claims no registrations when config ownership is unavailab
   }
 });
 
+test("noninteractive uninstall reports required interaction before unrelated discovery issues", async () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-uninstall-nontty-"),
+  );
+  const unknownFile = path.join(root, "unknown.json");
+  const ownedFile = path.join(root, "owned.json");
+  const unknownContents = "{broken";
+  const ownedContents = `${JSON.stringify({
+    mcpServers: { "sana-mcp": serverTarget() },
+    unrelated: true,
+  })}\n`;
+  fs.writeFileSync(unknownFile, unknownContents);
+  fs.writeFileSync(ownedFile, ownedContents);
+  const unknownMtime = fs.statSync(unknownFile, { bigint: true }).mtimeNs;
+  const ownedMtime = fs.statSync(ownedFile, { bigint: true }).mtimeNs;
+  const clients = [
+    fixture("unknown", unknownFile, { state: "absent" }),
+    fixture("owned", ownedFile, { state: "absent" }),
+  ];
+  const output: string[] = [];
+  let promptCalls = 0;
+  try {
+    const result = await runUninstall(
+      {},
+      interaction(clients, output, {
+        terminal: terminal({}, true, false),
+        chooseClients: async () => {
+          promptCalls += 1;
+          return ["owned"];
+        },
+      }),
+    );
+    assert.deepEqual(result, {
+      disposition: "interaction-unavailable",
+      selectedCount: 0,
+    });
+    assert.equal(promptCalls, 0);
+    assert.equal(fs.readFileSync(unknownFile, "utf8"), unknownContents);
+    assert.equal(fs.readFileSync(ownedFile, "utf8"), ownedContents);
+    assert.equal(
+      fs.statSync(unknownFile, { bigint: true }).mtimeNs,
+      unknownMtime,
+    );
+    assert.equal(
+      fs.statSync(ownedFile, { bigint: true }).mtimeNs,
+      ownedMtime,
+    );
+    const plain = stripTerminalSequences(output.join("\n"));
+    assert.match(
+      plain,
+      /An interactive terminal is required to choose clients/u,
+    );
+    assert.doesNotMatch(plain, /Configuration is incomplete/u);
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
 test("uninstall never offers or auto-selects present foreign and unreadable registrations", async () => {
   for (const unattended of [false, true]) {
     const root = fs.mkdtempSync(
@@ -1927,11 +2046,11 @@ test("uninstall never offers or auto-selects present foreign and unreadable regi
         ),
         ClientConfigurationIncompleteError
       );
-      if (!unattended) assert.deepEqual(offered, ["safe"]);
+      assert.equal(offered, undefined);
       assert.equal(fs.readFileSync(foreignPath, "utf8"), foreignRaw);
       assert.equal(fs.readFileSync(brokenPath, "utf8"), "{broken");
       assert.deepEqual(JSON.parse(fs.readFileSync(safePath, "utf8")), {
-        mcpServers: {},
+        mcpServers: { "sana-mcp": serverTarget() },
       });
       const plain = stripTerminalSequences(output.join("\n"));
       assert.match(plain, /Client foreign: configuration unavailable/u);
@@ -2006,6 +2125,177 @@ test("--yes is prompt-free, auth-free, and registers only detected clients", asy
     assert.equal(fs.existsSync(absentFile), false);
     assert.doesNotMatch(output.join("\n"), /\u001b\[/u);
     assert.match(output.join("\n"), /Client configuration complete/u);
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("--yes plans every detected client before writing any config", async () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-yes-plan-all-"),
+  );
+  const firstFile = path.join(root, "first.json");
+  const secondFile = path.join(root, "second.json");
+  const first = fixture("first", firstFile, {
+    state: "present",
+    evidence: [root],
+  });
+  const second: ClientDef = {
+    ...fixture("second", secondFile, {
+      state: "present",
+      evidence: [root],
+    }),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () => {
+        throw new Error("second config path failed");
+      },
+      topKey: "mcpServers",
+    },
+  };
+  const output: string[] = [];
+  try {
+    await assert.rejects(
+      runInstall(
+        { yes: true },
+        interaction([first, second], output),
+      ),
+      ClientConfigurationIncompleteError,
+    );
+    assert.equal(fs.existsSync(firstFile), false);
+    assert.equal(fs.existsSync(secondFile), false);
+    const plain = stripTerminalSequences(output.join("\n"));
+    assert.match(plain, /Client first: would register/u);
+    assert.match(plain, /Client second: unavailable/u);
+    assert.match(plain, /Configuration is incomplete/u);
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("--yes preserves all-ready result and presentation order", async () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-yes-order-"),
+  );
+  const firstFile = path.join(root, "first.json");
+  const secondFile = path.join(root, "second.json");
+  const clients = [
+    fixture("first", firstFile, {
+      state: "present",
+      evidence: [root],
+    }),
+    fixture("second", secondFile, {
+      state: "present",
+      evidence: [root],
+    }),
+  ];
+  const output: string[] = [];
+  try {
+    const result = await runInstall(
+      { yes: true },
+      interaction(clients, output),
+    );
+    assert.deepEqual(result, {
+      disposition: "configured",
+      authentication: "not-attempted",
+    });
+    assert.equal(fs.existsSync(firstFile), true);
+    assert.equal(fs.existsSync(secondFile), true);
+    const plain = stripTerminalSequences(output.join("\n"));
+    assert.ok(
+      plain.indexOf("Client first: registered") <
+        plain.indexOf("Client second: registered"),
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("interactive install stops before prompting when a detected config is blocked", async () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-detected-block-"),
+  );
+  const firstFile = path.join(root, "first.json");
+  const blockedFile = path.join(root, "blocked.json");
+  fs.writeFileSync(
+    blockedFile,
+    '{"mcpServers":{"sana-mcp":{"command":"foreign","args":[]}}}\n',
+  );
+  const clients = [
+    fixture("first", firstFile, {
+      state: "present",
+      evidence: [root],
+    }),
+    fixture("blocked", blockedFile, {
+      state: "present",
+      evidence: [root],
+    }),
+  ];
+  let promptCalls = 0;
+  try {
+    await assert.rejects(
+      runInstall(
+        {},
+        interaction(clients, [], {
+          prompt: async () => {
+            promptCalls += 1;
+            return { submitted: true, desired: {} };
+          },
+        }),
+      ),
+      ClientConfigurationIncompleteError,
+    );
+    assert.equal(promptCalls, 0);
+    assert.equal(fs.existsSync(firstFile), false);
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("uninstall plans every selected removal before writing any config", async () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "sana-configurer-uninstall-plan-all-"),
+  );
+  const firstFile = path.join(root, "first.json");
+  const secondFile = path.join(root, "second.json");
+  const owned = `${JSON.stringify({
+    mcpServers: { "sana-mcp": serverTarget() },
+  })}\n`;
+  fs.writeFileSync(firstFile, owned);
+  fs.writeFileSync(secondFile, owned);
+  const first = fixture("first", firstFile, {
+    state: "present",
+    evidence: [root],
+  });
+  let secondPathCalls = 0;
+  const second: ClientDef = {
+    ...fixture("second", secondFile, {
+      state: "present",
+      evidence: [root],
+    }),
+    install: {
+      kind: "file",
+      format: "json",
+      path: () => {
+        secondPathCalls += 1;
+        if (secondPathCalls === 1)
+          return { state: "available", path: secondFile };
+        throw new Error("second config path changed");
+      },
+      topKey: "mcpServers",
+    },
+  };
+  try {
+    await assert.rejects(
+      runUninstall(
+        { yes: true },
+        interaction([first, second], []),
+      ),
+      ClientConfigurationIncompleteError,
+    );
+    assert.equal(fs.readFileSync(firstFile, "utf8"), owned);
+    assert.equal(fs.readFileSync(secondFile, "utf8"), owned);
   } finally {
     fs.rmSync(root, { recursive: true });
   }

@@ -21,6 +21,10 @@ interface SessionData {
   pendingLogin?: { email: string; csrfToken: string } | null;
 }
 
+export interface PendingSignInChallenge {
+  readonly email: string;
+}
+
 const authoritativeIdSchema = z
   .string()
   .refine(
@@ -439,6 +443,12 @@ export class SanaClient {
     return this.jar.has(AUTH_COOKIE);
   }
 
+  pendingSignInChallenge(): Readonly<PendingSignInChallenge> | null {
+    return this.pendingLogin === null || this.pendingLogin === undefined
+      ? null
+      : Object.freeze({ email: this.pendingLogin.email });
+  }
+
   // ---- low-level fetch (cookie-aware, manual redirects) ------------------
 
   private commonHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -697,6 +707,13 @@ export class SanaClient {
       body,
       z.unknown(),
     );
+    // Sana may establish the request-code session during the CSRF/sign-in-link
+    // exchange. raw() has already constrained every request and redirect to
+    // this exact, transport-approved origin, so bind that cookie before the
+    // pending challenge is made durable.
+    if (this.jar.has(AUTH_COOKIE)) {
+      this.authenticatedOrigin = new URL(this.baseUrl).origin;
+    }
     this.pendingLogin = { email: normalizedEmail, csrfToken };
     this.email = normalizedEmail;
   }
@@ -755,16 +772,21 @@ export class SanaClient {
         z
           .object({
             user: sanaUserSchema,
-            workspace: workspaceSchema.optional(),
+            workspace: workspaceSchema.nullable().optional(),
           })
           .passthrough(),
       );
-      if (!data.workspace) {
+      const workspaceId =
+        data.workspace?.id ?? data.user.lastUsedWorkspaceId;
+      if (workspaceId === undefined) {
         throw new AuthoritativeWorkspaceUnavailableError();
       }
-      // Adopt only the workspace selected by the authenticated response.
+      // Both candidates come from the fully validated authenticated response.
+      // The active workspace wins when Sana supplies it; Sana's validated
+      // last-used workspace is the routing identity when that projection is
+      // explicitly null or absent.
       this.userId = data.user.id;
-      this.workspaceId = data.workspace.id;
+      this.workspaceId = workspaceId;
       this.email = data.user.email;
       return data.user;
     } catch (error) {

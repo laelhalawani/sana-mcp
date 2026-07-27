@@ -18,16 +18,21 @@ export interface SessionInfo {
 
 export function sessionInfo(client: SanaClient, s: SyncState): SessionInfo {
   const hasCookie = client.hasAuthCookie();
+  const hasPendingChallenge = client.pendingSignInChallenge() !== null;
   const needsLogin = s.phase === "needs_login";
   return {
     hasCookie,
-    loggedIn: hasCookie && !needsLogin,
-    expired: hasCookie && needsLogin,
+    loggedIn: hasCookie && !hasPendingChallenge && !needsLogin,
+    expired: hasCookie && !hasPendingChallenge && needsLogin,
   };
 }
 
 export function sessionUsable(client: SanaClient, s: SyncState): boolean {
-  return client.hasAuthCookie() && s.phase !== "needs_login";
+  return (
+    client.hasAuthCookie() &&
+    client.pendingSignInChallenge() === null &&
+    s.phase !== "needs_login"
+  );
 }
 
 export function isBlocking(s: SyncState): boolean {
@@ -100,10 +105,7 @@ export function captureStatusSnapshot(
     const status = store.readConsistent(() => {
       const secondState = store.getSyncState();
       if (
-        !sameSessionVersion(
-          firstClient.sessionVersion(),
-          secondClient.sessionVersion(),
-        ) ||
+        !sameSessionClient(firstClient, secondClient) ||
         JSON.stringify(firstState) !== JSON.stringify(secondState)
       ) {
         return null;
@@ -184,6 +186,7 @@ function buildStatus(
             }
           : undefined;
   const activeCacheBlocked =
+    client.pendingSignInChallenge() !== null ||
     s.blocking === 1 ||
     s.auth_user_id === null ||
     s.auth_workspace_id === null ||
@@ -263,6 +266,16 @@ function sameSessionVersion(
     left.publicationToken === right.publicationToken &&
     (left.userId ?? null) === (right.userId ?? null) &&
     (left.workspaceId ?? null) === (right.workspaceId ?? null)
+  );
+}
+
+function sameSessionClient(left: SanaClient, right: SanaClient): boolean {
+  const leftPending = left.pendingSignInChallenge();
+  const rightPending = right.pendingSignInChallenge();
+  return (
+    sameSessionVersion(left.sessionVersion(), right.sessionVersion()) &&
+    left.hasAuthCookie() === right.hasAuthCookie() &&
+    leftPending?.email === rightPending?.email
   );
 }
 
