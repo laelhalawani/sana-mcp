@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # Install the latest sana-mcp release:
-#   sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   SANA_MCP_VERSION=v0.4.6 sh -c 't=$(mktemp) && curl -fsSL "$1" -o "$t" && sh "$t"; s=$?; [ -z "${t:-}" ] || rm -f "$t"; exit "$s"' sh https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.6/install.sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.6/install.sh | sh
 set -eu
 set -f
 umask 077
