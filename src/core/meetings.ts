@@ -329,7 +329,7 @@ export function getSummaryView(store: SanaStore, id: string): SummaryResult {
 
 export interface Participant {
   displayName: string;
-  email: string;
+  email?: string | null;
   isHost: boolean;
 }
 

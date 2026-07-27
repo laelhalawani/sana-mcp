@@ -589,6 +589,25 @@ export class SanaStore {
     ).map((r) => r.id);
   }
 
+  /**
+   * Meetings that have no metadata row despite being processed — these may
+   * have exhausted the retry budget before a fix. Returns them regardless of
+   * failure count so the daemon can backfill metadata on the next cycle.
+   */
+  meetingsMissingMetadata(): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT m.id FROM meetings m
+           LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
+           WHERE mm.meeting_id IS NULL
+             AND (m.processing_phase IS NULL OR m.processing_phase = 'done')
+           ORDER BY m.created_at_ms DESC`
+        )
+        .all() as { id: string }[]
+    ).map((r) => r.id);
+  }
+
   /** Meetings that have both a transcript and metadata. */
   countComplete(): number {
     return (

@@ -257,49 +257,70 @@ export async function syncOnce(
   let done = 0;
   let failed = 0;
   for (const id of incomplete) {
-    try {
-      let transcript:
-        | Omit<import("../store/db.js").TranscriptRow, "fetched_ms">
-        | undefined;
-      if (!store.getTranscript(id)) {
+    let anySuccess = false;
+    let lastError: Error | undefined;
+
+    // Transcript — fetched and saved independently.
+    if (!store.getTranscript(id)) {
+      try {
         const segs = await client.getTranscription(id);
-        transcript = {
-          meeting_id: id,
-          text: renderTranscript(segs),
-          json: JSON.stringify(segs),
-          word_count: countWords(segs),
-          segment_count: segs.length,
-        };
+        write(() =>
+          store.saveTranscript({
+            meeting_id: id,
+            text: renderTranscript(segs),
+            json: JSON.stringify(segs),
+            word_count: countWords(segs),
+            segment_count: segs.length,
+          }),
+        );
+        anySuccess = true;
+        done++;
+      } catch (e) {
+        if (e instanceof SessionExpiredError) throw e;
+        if (e instanceof SyncGenerationChangedError) throw e;
+        lastError = e as Error;
       }
-      let metadata:
-        | Parameters<SanaStore["saveMetadata"]>[0]
-        | undefined;
-      if (!store.getMetadata(id)) {
+    } else {
+      anySuccess = true;
+    }
+
+    // Metadata (summary, notes, participants) — fetched and saved independently
+    // so a participant-validation error never discards the transcript.
+    if (!store.getMetadata(id)) {
+      try {
         const meta = await client.getMeetingById(id);
         const participants = await client.getMeetingParticipants(id);
-        metadata = {
-          meeting_id: id,
-          summary: (meta?.summary ?? null) as string | null,
-          summary_short: (meta?.summaryShort ?? null) as string | null,
-          notes_json: meta
-            ? JSON.stringify({ notes: meta.notes ?? null, actionItems: meta.actionItems ?? null })
-            : null,
-          participants_json: JSON.stringify(participants),
-          has_recording: meta?.recordingUrl || meta?.fallbackRecordingUrl ? 1 : 0,
-        };
+        write(() =>
+          store.saveMetadata({
+            meeting_id: id,
+            summary: (meta?.summary ?? null) as string | null,
+            summary_short: (meta?.summaryShort ?? null) as string | null,
+            notes_json: meta
+              ? JSON.stringify({
+                  notes: meta.notes ?? null,
+                  actionItems: meta.actionItems ?? null,
+                })
+              : null,
+            participants_json: JSON.stringify(participants),
+            has_recording:
+              meta?.recordingUrl || meta?.fallbackRecordingUrl ? 1 : 0,
+          }),
+        );
+        anySuccess = true;
+      } catch (e) {
+        if (e instanceof SessionExpiredError) throw e;
+        if (e instanceof SyncGenerationChangedError) throw e;
+        if (!lastError) lastError = e as Error;
       }
-      write(() => {
-        if (transcript) store.saveTranscript(transcript);
-        if (metadata) store.saveMetadata(metadata);
-        store.clearFailure(id);
-      });
-      done++;
-    } catch (e) {
-      if (e instanceof SessionExpiredError) throw e; // abort the whole cycle
-      if (e instanceof SyncGenerationChangedError) throw e;
-      write(() => {
-        store.recordFailure(id, (e as Error).message);
-      });
+    } else {
+      anySuccess = true;
+    }
+
+    if (anySuccess) {
+      write(() => store.clearFailure(id));
+    }
+    if (lastError && !anySuccess) {
+      write(() => store.recordFailure(id, lastError.message));
       failed++;
     }
     if ((done + failed) % 3 === 0 || done + failed === incomplete.length) {
