@@ -1053,8 +1053,8 @@ verify_or_apply_path_block() {
   [ ! -e "$path_file" ] || [ -f "$path_file" ] ||
     fail "shell startup path is not a regular file: $path_file"
   write_path_block "$tmp_dir/path-block"
-  begin_count=$(grep -cF '# >>> sana-mcp installer >>>' "$path_file" 2>/dev/null || true)
-  end_count=$(grep -cF '# <<< sana-mcp installer <<<' "$path_file" 2>/dev/null || true)
+  begin_count=$(grep -cF '# >>> sana-mcp installer >>>' "$path_file" 2>/dev/null) || begin_count=0
+  end_count=$(grep -cF '# <<< sana-mcp installer <<<' "$path_file" 2>/dev/null) || end_count=0
   if [ "$begin_count" -gt 1 ] || [ "$end_count" -gt 1 ] ||
     [ "$begin_count" -ne "$end_count" ]; then
     fail "the managed sana-mcp PATH block in $path_file is malformed"
@@ -1118,8 +1118,8 @@ revalidate_path_block_for_commit() {
   commit_path_file=$(profile_file "$selected_profile")
   [ ! -L "$commit_path_file" ] && [ -f "$commit_path_file" ] ||
     fail "shell startup file became unavailable before receipt commit"
-  begin_count=$(grep -cF '# >>> sana-mcp installer >>>' "$commit_path_file" 2>/dev/null || true)
-  end_count=$(grep -cF '# <<< sana-mcp installer <<<' "$commit_path_file" 2>/dev/null || true)
+  begin_count=$(grep -cF '# >>> sana-mcp installer >>>' "$commit_path_file" 2>/dev/null) || begin_count=0
+  end_count=$(grep -cF '# <<< sana-mcp installer <<<' "$commit_path_file" 2>/dev/null) || end_count=0
   [ "$begin_count" -eq 1 ] && [ "$end_count" -eq 1 ] ||
     fail "managed sana-mcp PATH block changed before receipt commit"
   awk '
