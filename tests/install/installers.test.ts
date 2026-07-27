@@ -3147,9 +3147,9 @@ test("advertised install commands stay concise and match installer headers", asy
   const windowsInstaller = await readFile(path.join(root, "install.ps1"), "utf8");
 
   const posixCommand =
-    "sh -c 't=$(mktemp) && curl -fsSL \"$1\" -o \"$t\" && sh \"$t\"; s=$?; [ -z \"${t:-}\" ] || rm -f \"$t\"; exit \"$s\"' sh https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.sh";
+    "sh -c 't=$(mktemp) && curl -fsSL \"$1\" -o \"$t\" && sh \"$t\"; s=$?; [ -z \"${t:-}\" ] || rm -f \"$t\"; exit \"$s\"' sh https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh";
   const windowsCommand =
-    "irm https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.ps1 | iex";
+    "irm https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.ps1 | iex";
 
   assert.ok(readme.split("\n").includes(posixCommand));
   assert.ok(readme.split("\n").includes(windowsCommand));
@@ -3172,7 +3172,7 @@ test("advertised POSIX install command fails when curl fails", async () => {
   await chmod(path.join(commands, "curl"), 0o755);
   try {
     const command =
-      "sh -c 't=$(mktemp) && curl -fsSL \"$1\" -o \"$t\" && sh \"$t\"; s=$?; [ -z \"${t:-}\" ] || rm -f \"$t\"; exit \"$s\"' sh https://github.com/Lumen-AiApp/sana-ai-mcp/releases/latest/download/install.sh";
+      "sh -c 't=$(mktemp) && curl -fsSL \"$1\" -o \"$t\" && sh \"$t\"; s=$?; [ -z \"${t:-}\" ] || rm -f \"$t\"; exit \"$s\"' sh https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh";
     const result = spawnSync("/bin/sh", ["-c", command], {
       encoding: "utf8",
       env: {

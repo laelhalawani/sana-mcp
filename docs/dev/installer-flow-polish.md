@@ -37,8 +37,8 @@ Installed -> C:\Users\lael\AppData\Local\sana-mcp\sana-mcp.exe
   + Gemini CLI: registered -> ...(restart Gemini CLI sessions)
   + VS Code (Copilot): registered -> ...(reload VS Code (or restart Copilot chat))
 ✔ Sign in to Sana now? ... Yes
-✔ Email for your Sana account: lael@lumen.com
-A 6-digit sign-in code was just emailed to lael@lumen.com.
+✔ Email for your Sana account: you@example.com
+A 6-digit sign-in code was just emailed to you@example.com.
 
 Next: get that code, then call
   meeting_transcripts("login", {"email":..., "confirmation_code": <the 6 digits>})
@@ -213,7 +213,7 @@ This step must NOT print any MCP/LLM string. It calls the structured login core
 Already-signed-in short-circuit (dim, then straight to Screen 4):
 
 ```
-   Already signed in to Sana as lael@lumen.com.
+   Already signed in to Sana as you@example.com.
 ```
 
 Not signed in:
@@ -225,13 +225,13 @@ Not signed in:
    first time you ask it about a meeting.
 
    ? Sign in now?  Yes
-   ? Email         lael@lumen.com
+   ? Email         you@example.com
 
-   Sent a 6-digit code to lael@lumen.com.
+   Sent a 6-digit code to you@example.com.
 
    ? Code          481567
 
-   Signed in as lael@lumen.com.
+   Signed in as you@example.com.
 ```
 
 Copy for the branches:
@@ -263,7 +263,7 @@ this run.
 
    Configured   Claude Desktop, Cursor, VS Code (Copilot),
                 Claude Code (CLI), Gemini CLI
-   Signed in    lael@lumen.com
+   Signed in    you@example.com
 
    One more step - restart these so they load sana-mcp:
      Quit and reopen   Claude Desktop, Cursor, VS Code

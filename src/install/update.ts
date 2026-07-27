@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { BUILD_INFO } from "../runtime/build-info.js";
 import { isReleaseSemver, isReleaseTag } from "../release/contract.js";
 
-const REPOSITORY = "Lumen-AiApp/sana-ai-mcp";
+const REPOSITORY = "laelhalawani/sana-mcp";
 const RECEIPT_NAME = ".sana-mcp-install-v1";
 const CHECKSUM = /^([a-f0-9]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)$/;
 const RECEIPT_KEYS = new Set([
