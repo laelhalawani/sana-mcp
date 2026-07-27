@@ -12,6 +12,12 @@ not. If a task seems to require changing `.env`, stop and ask the user first and
 do not act until they confirm. There is no fallback or "cleanup" path that
 justifies touching `.env` without this confirmation.
 
+Before creating `.env`, always check whether it already exists. If it exists,
+never recreate, replace, or truncate it; edit the existing file in place and
+preserve every unrelated key and value exactly. When adding or updating one
+requested variable, change only that variable. Create a new `.env` only when no
+file exists and the user has explicitly requested values to be stored there.
+
 ## Store credentials when explicitly requested
 
 When the user provides a credential and explicitly asks to store it, save it in
