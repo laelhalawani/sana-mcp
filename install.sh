@@ -2,6 +2,7 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.6 sh
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.6/install.sh | sh
 set -eu
 set -f
