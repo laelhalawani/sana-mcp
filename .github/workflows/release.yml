@@ -344,18 +344,22 @@ jobs:
           reset_execution_handle
           EXECUTED_SHA256="$(shasum -a 256 "$EXECUTION_HANDLE" | awk '{print $1}')"
           # Replace the private snapshot pathname after acquiring its descriptor.
-          # Every consumer below must continue to observe the descriptor-bound
-          # executable, never the replacement pathname.
           install -m 500 /usr/bin/false "$EXECUTION_ASSET.replacement"
           mv -f "$EXECUTION_ASSET.replacement" "$EXECUTION_ASSET"
           test "$(shasum -a 256 "$EXECUTION_ASSET" | awk '{print $1}')" != "$EXECUTED_SHA256"
           PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
+          # macOS blocks execve via /dev/fd (SIP), so materialize the
+          # descriptor-bound bytes into a fresh executable copy and prove it is
+          # byte-identical to the descriptor before executing it. The executed
+          # bytes are still bound to the open descriptor via this verified copy.
           reset_execution_handle
-          [ "$("$EXECUTION_HANDLE" --version)" = "$PACKAGE_VERSION" ]
-          reset_execution_handle
-          "$EXECUTION_HANDLE" __inspect --format json > "inspect-$TARGET.json"
-          reset_execution_handle
-          "$EXECUTION_HANDLE" --help >/dev/null
+          EXEC_COPY="$EXECUTION_DIR/exec"
+          cp "$EXECUTION_HANDLE" "$EXEC_COPY"
+          chmod 500 "$EXEC_COPY"
+          [ "$(shasum -a 256 "$EXEC_COPY" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
+          [ "$("$EXEC_COPY" --version)" = "$PACKAGE_VERSION" ]
+          "$EXEC_COPY" __inspect --format json > "inspect-$TARGET.json"
+          "$EXEC_COPY" --help >/dev/null
           reset_execution_handle
           POST_EXECUTION_SHA256="$(shasum -a 256 "$EXECUTION_HANDLE" | awk '{print $1}')"
           if [ "$POST_EXECUTION_SHA256" != "$EXECUTED_SHA256" ]; then
