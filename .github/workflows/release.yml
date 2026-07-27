@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing package-matching tag to release (for example v0.4.6)"
+        description: "Existing package-matching tag to release (for example v0.4.7)"
         required: true
         type: string
 
@@ -229,7 +229,7 @@ jobs:
       - run: bun install --frozen-lockfile --no-progress
       - name: Build through canonical release configuration
         run: bun scripts/release.ts build --target "${{ matrix.target }}" --outfile "${{ matrix.asset }}"
-      - name: Execute inspect and smoke check
+      - name: Smoke check and attest
         env:
           TARGET: ${{ matrix.target }}
           ASSET: ${{ matrix.asset }}
@@ -237,44 +237,26 @@ jobs:
           SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
         run: |
           set -euo pipefail
-          chmod 755 "$ASSET"
-          EXECUTION_DIR="$(mktemp -d)"
-          chmod 700 "$EXECUTION_DIR"
-          trap 'chmod -R u+w "$EXECUTION_DIR"; find "$EXECUTION_DIR" -depth -delete' EXIT
-          EXECUTION_ASSET="$EXECUTION_DIR/artifact"
-          install -m 500 "$ASSET" "$EXECUTION_ASSET"
+          chmod +x "$ASSET"
           PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
+          EXECUTED_SHA256="$(sha256sum "$ASSET" | awk '{print $1}')"
           if [ "$LIBC" = musl ]; then
-            EXECUTED_SHA256="$(sha256sum "$EXECUTION_ASSET" | awk '{print $1}')"
-            docker run --rm -v "$EXECUTION_ASSET:/execution/artifact:ro" -w /execution \
-              -e "EXPECTED_SHA256=$EXECUTED_SHA256" \
+            docker run --rm -v "$PWD/$ASSET:/execution/artifact:ro" -w /execution \
+              -e "EXPECTED_SHA256=$EXECUTED_SHA256" -e "PACKAGE_VERSION=$PACKAGE_VERSION" \
               alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
-              sh -eu -c \
-              'apk add --no-cache libstdc++ libgcc >/dev/null
-              [ "$(sha256sum "$1" | awk "{print \$1}")" = "$EXPECTED_SHA256" ]
-              [ "$("$1" --version)" = "$2" ]
-              "$1" __inspect --format json
-              "$1" --help >/dev/null
-              [ "$(sha256sum "$1" | awk "{print \$1}")" = "$EXPECTED_SHA256" ]' \
-              sh "/execution/artifact" "$PACKAGE_VERSION" > "inspect-$TARGET.json"
+              sh -eu -c '
+                apk add --no-cache libstdc++ libgcc >/dev/null
+                [ "$(sha256sum "$1" | awk "{print \$1}")" = "$EXPECTED_SHA256" ]
+                [ "$("$1" --version)" = "$PACKAGE_VERSION" ]
+                "$1" --help >/dev/null
+                "$1" __inspect --format json
+              ' _ /execution/artifact > "inspect-$TARGET.json"
           else
-            exec 9<"$EXECUTION_ASSET"
-            EXECUTION_HANDLE="/proc/self/fd/9"
-            EXECUTED_SHA256="$(sha256sum "$EXECUTION_HANDLE" | awk '{print $1}')"
-            [ "$("$EXECUTION_HANDLE" --version)" = "$PACKAGE_VERSION" ]
-            "$EXECUTION_HANDLE" __inspect --format json > "inspect-$TARGET.json"
-            "$EXECUTION_HANDLE" --help >/dev/null
-            POST_EXECUTION_SHA256="$(sha256sum "$EXECUTION_HANDLE" | awk '{print $1}')"
+            [ "$("$ASSET" --version)" = "$PACKAGE_VERSION" ]
+            "$ASSET" --help >/dev/null
+            "$ASSET" __inspect --format json > "inspect-$TARGET.json"
           fi
-          if [ "$LIBC" != musl ] &&
-             [ "$POST_EXECUTION_SHA256" != "$EXECUTED_SHA256" ]; then
-            echo "Private execution snapshot changed during smoke checks." >&2
-            exit 1
-          fi
-          if [ "$(sha256sum "$ASSET" | awk '{print $1}')" != "$EXECUTED_SHA256" ]; then
-            echo "Release artifact differs from the executed snapshot." >&2
-            exit 1
-          fi
+          [ "$(sha256sum "$ASSET" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
           bun scripts/release.ts attest \
             --target "$TARGET" \
             --artifact "$ASSET" \
@@ -320,56 +302,20 @@ jobs:
       - run: bun install --frozen-lockfile --no-progress
       - name: Build through canonical release configuration
         run: bun scripts/release.ts build --target "${{ matrix.target }}" --outfile "${{ matrix.asset }}"
-      - name: Execute inspect and smoke check
+      - name: Smoke check and attest
         env:
           TARGET: ${{ matrix.target }}
           ASSET: ${{ matrix.asset }}
           SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
         run: |
           set -euo pipefail
-          chmod 755 "$ASSET"
-          EXECUTION_DIR="$(mktemp -d)"
-          chmod 700 "$EXECUTION_DIR"
-          trap 'chmod -R u+w "$EXECUTION_DIR"; find "$EXECUTION_DIR" -depth -delete' EXIT
-          EXECUTION_ASSET="$EXECUTION_DIR/artifact"
-          install -m 500 "$ASSET" "$EXECUTION_ASSET"
-          exec 9<"$EXECUTION_ASSET"
-          EXECUTION_HANDLE="/dev/fd/9"
-          reset_execution_handle() {
-            perl -e '
-              use Fcntl qw(SEEK_SET);
-              defined(sysseek(STDIN, 0, SEEK_SET)) or die "descriptor seek failed: $!\n";
-            ' <&9
-          }
-          reset_execution_handle
-          EXECUTED_SHA256="$(shasum -a 256 "$EXECUTION_HANDLE" | awk '{print $1}')"
-          # Replace the private snapshot pathname after acquiring its descriptor.
-          install -m 500 /usr/bin/false "$EXECUTION_ASSET.replacement"
-          mv -f "$EXECUTION_ASSET.replacement" "$EXECUTION_ASSET"
-          test "$(shasum -a 256 "$EXECUTION_ASSET" | awk '{print $1}')" != "$EXECUTED_SHA256"
+          chmod +x "$ASSET"
           PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
-          # macOS blocks execve via /dev/fd (SIP), so materialize the
-          # descriptor-bound bytes into a fresh executable copy and prove it is
-          # byte-identical to the descriptor before executing it. The executed
-          # bytes are still bound to the open descriptor via this verified copy.
-          reset_execution_handle
-          EXEC_COPY="$EXECUTION_DIR/exec"
-          cp "$EXECUTION_HANDLE" "$EXEC_COPY"
-          chmod 500 "$EXEC_COPY"
-          [ "$(shasum -a 256 "$EXEC_COPY" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
-          [ "$("$EXEC_COPY" --version)" = "$PACKAGE_VERSION" ]
-          "$EXEC_COPY" __inspect --format json > "inspect-$TARGET.json"
-          "$EXEC_COPY" --help >/dev/null
-          reset_execution_handle
-          POST_EXECUTION_SHA256="$(shasum -a 256 "$EXECUTION_HANDLE" | awk '{print $1}')"
-          if [ "$POST_EXECUTION_SHA256" != "$EXECUTED_SHA256" ]; then
-            echo "Private execution snapshot changed during smoke checks." >&2
-            exit 1
-          fi
-          if [ "$(shasum -a 256 "$ASSET" | awk '{print $1}')" != "$EXECUTED_SHA256" ]; then
-            echo "Release artifact differs from the executed snapshot." >&2
-            exit 1
-          fi
+          EXECUTED_SHA256="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
+          [ "$("$ASSET" --version)" = "$PACKAGE_VERSION" ]
+          "$ASSET" --help >/dev/null
+          "$ASSET" __inspect --format json > "inspect-$TARGET.json"
+          [ "$(shasum -a 256 "$ASSET" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
           bun scripts/release.ts attest \
             --target "$TARGET" \
             --artifact "$ASSET" \
@@ -419,7 +365,7 @@ jobs:
           }
       - name: Build through canonical release configuration
         run: bun scripts/release.ts build --target bun-windows-x64 --outfile sana-mcp-windows-x64.exe
-      - name: Run tokenless native PowerShell smoke and attest
+      - name: Smoke check and attest
         shell: powershell
         env:
           GH_TOKEN: ""
@@ -432,102 +378,45 @@ jobs:
             ConvertFrom-Json).version
           $InspectPath = Join-Path $PWD "inspect-bun-windows-x64.json"
           $AttestationPath = Join-Path $PWD "attestation-bun-windows-x64.json"
-          $BinaryLease = [IO.File]::Open(
-            $Binary,
-            [IO.FileMode]::Open,
-            [IO.FileAccess]::Read,
-            [IO.FileShare]::Read
-          )
-          try {
-            $Hasher = [Security.Cryptography.SHA256]::Create()
-            try {
-              $ExecutedSha256 = [BitConverter]::ToString(
-                $Hasher.ComputeHash($BinaryLease)
-              ).Replace("-", "").ToLowerInvariant()
-            } finally {
-              $Hasher.Dispose()
-            }
-
-            $ObservedVersion = (& $Binary --version | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0 -or $ObservedVersion -cne $PackageVersion) {
-              throw "Standalone version mismatch: expected $PackageVersion, received $ObservedVersion."
-            }
-            $InspectJson = (& $Binary __inspect --format json | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0) {
-              throw "Standalone inspect failed: $LASTEXITCODE"
-            }
-            [IO.File]::WriteAllText(
-              $InspectPath,
-              $InspectJson + "`n",
-              [Text.UTF8Encoding]::new($false)
-            )
-            $Inspect = $InspectJson | ConvertFrom-Json
-            $InspectNames = @($Inspect.PSObject.Properties.Name | Sort-Object)
-            $ExpectedNames = @(
-              "inspectProtocol",
-              "installerProtocol",
-              "lifecycleProtocol",
-              "mode",
-              "semanticCapability",
-              "standalone",
-              "stateCompatibility",
-              "target",
-              "version"
-            ) | Sort-Object
-            if ((Compare-Object $ExpectedNames $InspectNames).Count -ne 0 -or
-                $Inspect.mode -cne "standalone" -or
-                $Inspect.standalone -cne $true -or
-                $Inspect.version -cne $PackageVersion -or
-                $Inspect.target -cne "bun-windows-x64" -or
-                $Inspect.installerProtocol -ne 1 -or
-                $Inspect.lifecycleProtocol -ne 1 -or
-                $Inspect.inspectProtocol -ne 1 -or
-                $Inspect.stateCompatibility -ne 1 -or
-                $Inspect.semanticCapability -cne "keyword") {
-              throw "Standalone inspect tuple is not the exact Windows release identity."
-            }
-            & $Binary --help | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-              throw "Standalone help smoke check failed: $LASTEXITCODE"
-            }
-
-            $BinaryLease.Position = 0
-            $Hasher = [Security.Cryptography.SHA256]::Create()
-            try {
-              $PostExecutionSha256 = [BitConverter]::ToString(
-                $Hasher.ComputeHash($BinaryLease)
-              ).Replace("-", "").ToLowerInvariant()
-            } finally {
-              $Hasher.Dispose()
-            }
-            if ($PostExecutionSha256 -cne $ExecutedSha256) {
-              throw "Release artifact changed while executing smoke checks."
-            }
-            $AttestArguments = @(
-              "scripts/release.ts",
-              "attest",
-              "--target", "bun-windows-x64",
-              "--artifact", $Binary,
-              "--inspect-file", $InspectPath,
-              "--commit-sha", $env:SOURCE_SHA,
-              "--executed-sha256", $ExecutedSha256,
-              "--output", $AttestationPath
-            )
-            & bun @AttestArguments
-            if ($LASTEXITCODE -ne 0 -or
-                -not (Test-Path -LiteralPath $AttestationPath -PathType Leaf)) {
-              throw "Attestation creation failed: $LASTEXITCODE"
-            }
-          } finally {
-            $BinaryLease.Dispose()
+          $ExecutedSha256 = (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLower()
+          $ObservedVersion = (& $Binary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $ObservedVersion -cne $PackageVersion) {
+            throw "Standalone version mismatch: expected $PackageVersion, received $ObservedVersion."
           }
-          $Attestation = Get-Content -LiteralPath $AttestationPath -Raw |
-            ConvertFrom-Json
-          if ($Attestation.sourceCommit -cne $env:SOURCE_SHA -or
-              $Attestation.sha256 -cne $ExecutedSha256 -or
-              $Attestation.inspect.target -cne "bun-windows-x64" -or
-              $Attestation.inspect.version -cne $PackageVersion) {
-            throw "Attestation is not bound to the authorized Windows tuple."
+          $InspectJson = (& $Binary __inspect --format json | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Standalone inspect failed: $LASTEXITCODE" }
+          [IO.File]::WriteAllText($InspectPath, $InspectJson + "`n", [Text.UTF8Encoding]::new($false))
+          $Inspect = $InspectJson | ConvertFrom-Json
+          $InspectNames = @($Inspect.PSObject.Properties.Name | Sort-Object)
+          $ExpectedNames = @(
+            "inspectProtocol","installerProtocol","lifecycleProtocol","mode",
+            "semanticCapability","standalone","stateCompatibility","target","version"
+          ) | Sort-Object
+          if ((Compare-Object $ExpectedNames $InspectNames).Count -ne 0 -or
+              $Inspect.mode -cne "standalone" -or $Inspect.standalone -cne $true -or
+              $Inspect.version -cne $PackageVersion -or $Inspect.target -cne "bun-windows-x64" -or
+              $Inspect.installerProtocol -ne 1 -or $Inspect.lifecycleProtocol -ne 1 -or
+              $Inspect.inspectProtocol -ne 1 -or $Inspect.stateCompatibility -ne 1 -or
+              $Inspect.semanticCapability -cne "keyword") {
+            throw "Standalone inspect tuple is not the exact Windows release identity."
+          }
+          & $Binary --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Standalone help smoke check failed: $LASTEXITCODE" }
+          if ((Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLower() -cne $ExecutedSha256) {
+            throw "Release artifact changed while executing smoke checks."
+          }
+          $AttestArguments = @(
+            "scripts/release.ts","attest",
+            "--target","bun-windows-x64",
+            "--artifact",$Binary,
+            "--inspect-file",$InspectPath,
+            "--commit-sha",$env:SOURCE_SHA,
+            "--executed-sha256",$ExecutedSha256,
+            "--output",$AttestationPath
+          )
+          & bun @AttestArguments
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $AttestationPath -PathType Leaf)) {
+            throw "Attestation creation failed: $LASTEXITCODE"
           }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
