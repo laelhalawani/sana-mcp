@@ -46,24 +46,18 @@ const REQUEST_DELAY_MS = RUNTIME_ENV.requestDelayMs;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-let _logStream: fs.WriteStream | undefined;
 function log(...a: unknown[]): void {
-  if (!_logStream) {
-    try {
-      ensureDataDir();
-      _logStream = fs.createWriteStream(
-        path.join(dataDirectory(), "daemon.log"),
-        { flags: "a" },
-      );
-    } catch {
-      return;
-    }
+  try {
+    ensureDataDir();
+    fs.appendFileSync(
+      path.join(dataDirectory(), "daemon.log"),
+      `${new Date().toISOString()} ${a
+        .map((v) => (typeof v === "string" ? v : JSON.stringify(v)))
+        .join(" ")}\n`,
+    );
+  } catch {
+    // best-effort logging
   }
-  _logStream.write(
-    `${new Date().toISOString()} ${a
-      .map((v) => (typeof v === "string" ? v : JSON.stringify(v)))
-      .join(" ")}\n`,
-  );
 }
 
 class DaemonStopRequestedError extends Error {
