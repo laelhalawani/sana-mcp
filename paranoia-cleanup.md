@@ -62,6 +62,19 @@ Kept (still used by spawn/daemon/lifecycle): `observeDaemonControl`,
       touched: the publish job's descriptor-bound upload (works today; later).
       Verified: YAML parses, `tests/release/release.test.ts` green, typecheck
       clean. Full CI smoke verification pending before merge.
-- [ ] Slice 2: dead daemon-startup machinery
-- [ ] Slice 3: installer transaction overhead
-- [ ] Slice 4: runtime ACL receipts
+- [ ] Slice 2: dead daemon-startup machinery — **assessment: keep (for now).**
+      The startup functions are confirmed unused at runtime, but they are
+      interleaved in `src/sync/control.ts` with the *active* control-file
+      functions (publish/observe/clear/stop) that the daemon depends on, and
+      `tests/sync/control.test.ts` exercises both. Surgical removal is real
+      surgery for cosmetic gain (the code is dead, not harmful). Per the cleanup
+      principles ("keep obsolete non-harmful logic when removal is riskier than
+      it is worth"), defer unless we want to invest in a careful extraction.
+- [ ] Slice 3: installer transaction overhead — `install.sh`/`install.ps1`
+      locks/journals/receipts are *active* and coupled to `sana-mcp update`
+      (receipts) and the configurer rollback (journals). Lightening them risks
+      install/update stability ("do not sacrifice features"). Needs a careful,
+      dedicated pass — not rushed.
+- [ ] Slice 4: runtime ACL receipts (`windows-acl.ts`) — provides real per-user
+      protection on shared Windows hosts; non-harmful on a single-user machine.
+      **Lean keep** per the principles.
