@@ -6,11 +6,7 @@ import { EventEmitter } from "node:events";
 import { spawnSync, type ChildProcess } from "node:child_process";
 import type { SanaClient } from "../../src/sana/client.js";
 import type { SyncState } from "../../src/store/db.js";
-import type {
-  DaemonControlObservation,
-  DaemonStartupClaim,
-  DaemonStartupObservation,
-} from "../../src/sync/control.js";
+import type { DaemonControlObservation } from "../../src/sync/control.js";
 
 const embedCalls: Array<{ meetingId: string; createdAtMs: number }> = [];
 const embeddedWrites: string[] = [];
