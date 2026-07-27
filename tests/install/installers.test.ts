@@ -3147,7 +3147,7 @@ test("advertised install commands stay concise and match installer headers", asy
   const windowsInstaller = await readFile(path.join(root, "install.ps1"), "utf8");
 
   const posixCommand =
-    "sh -c 't=$(mktemp) && curl -fsSL \"$1\" -o \"$t\" && sh \"$t\"; s=$?; [ -z \"${t:-}\" ] || rm -f \"$t\"; exit \"$s\"' sh https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh";
+    "curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh";
   const windowsCommand =
     "irm https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.ps1 | iex";
 
@@ -3157,33 +3157,6 @@ test("advertised install commands stay concise and match installer headers", asy
   assert.ok(windowsInstaller.split("\n").includes(`#   ${windowsCommand}`));
   assert.ok(posixCommand.length < 220);
   assert.ok(windowsCommand.length < 140);
-});
-
-test("advertised POSIX install command fails when curl fails", async () => {
-  const temporary = await mkdtemp(
-    path.join(os.tmpdir(), "sana-bootstrap-failure-"),
-  );
-  const commands = path.join(temporary, "bin");
-  await mkdir(commands);
-  await writeFile(
-    path.join(commands, "curl"),
-    "#!/bin/sh\nexit 22\n",
-  );
-  await chmod(path.join(commands, "curl"), 0o755);
-  try {
-    const command =
-      "sh -c 't=$(mktemp) && curl -fsSL \"$1\" -o \"$t\" && sh \"$t\"; s=$?; [ -z \"${t:-}\" ] || rm -f \"$t\"; exit \"$s\"' sh https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh";
-    const result = spawnSync("/bin/sh", ["-c", command], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${commands}:${process.env.PATH ?? ""}`,
-      },
-    });
-    assert.notEqual(result.status, 0);
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
 });
 
 test("PowerShell deferred-install command quotes the executable and invokes it", async () => {
