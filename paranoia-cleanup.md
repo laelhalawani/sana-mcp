@@ -52,7 +52,16 @@ Kept (still used by spawn/daemon/lifecycle): `observeDaemonControl`,
 
 ## Progress
 
-- [ ] Slice 1: release descriptor attestation
+- [x] Slice 1: release descriptor attestation — removed the descriptor-bound
+      execution circus (`exec 9<` / `/proc/self/fd/9`, macOS `/dev/fd/9` + perl
+      seek + path-swap proof + `EXEC_COPY`, Windows `[IO.File]::Open` lease +
+      crypto re-hash) from all three smoke jobs. Each smoke now does a plain
+      `--version` / `--help` / `__inspect` run, a sha256, and the existing
+      `attest` (sha256+inspect tuple). Kept: the manifest + sha256 sidecars the
+      installer uses, and the reasonable inspect-tuple identity check. Not yet
+      touched: the publish job's descriptor-bound upload (works today; later).
+      Verified: YAML parses, `tests/release/release.test.ts` green, typecheck
+      clean. Full CI smoke verification pending before merge.
 - [ ] Slice 2: dead daemon-startup machinery
 - [ ] Slice 3: installer transaction overhead
 - [ ] Slice 4: runtime ACL receipts
