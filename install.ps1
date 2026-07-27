@@ -1918,8 +1918,8 @@ try {
     throw "The user PATH contains duplicate entries for $InstallDir; remove the duplicates before installing."
   }
   if ($OldPresent -and -not $LegacyInstall) {
-    if ($NewPathManaged -and $MatchingEntries.Count -ne 1) {
-      throw "The installer-owned PATH entry recorded by the receipt is missing."
+    if ($NewPathManaged -and $MatchingEntries.Count -gt 1) {
+      throw "Multiple installer-owned PATH entries; remove duplicates manually."
     }
   } else {
     $NewPathManaged = $MatchingEntries.Count -eq 0
