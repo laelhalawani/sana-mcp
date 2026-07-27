@@ -164,11 +164,12 @@ export function parseFilters(args: Record<string, unknown>): ParsedFilters {
     if (
       filter.status !== "ready" &&
       filter.status !== "downloading" &&
-      filter.status !== "failed"
+      filter.status !== "processing" &&
+      filter.status !== "retrying"
     ) {
       throw new ArgumentValidationError(
         "filter.status",
-        'must be "ready", "downloading", or "failed"',
+        'must be "ready", "downloading", "processing", or "retrying"',
       );
     }
     status = filter.status;

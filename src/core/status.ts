@@ -195,12 +195,15 @@ function buildStatus(
   const exposeMetrics = !activeCacheBlocked && authTransition === undefined;
   const transcripts = exposeMetrics ? store.countTranscripts() : null;
   const meetings = exposeMetrics ? store.countMeetings() : null;
-  const transcriptsDone = exposeMetrics ? s.transcripts_done : null;
-  const transcriptsTotal = exposeMetrics ? s.transcripts_total : null;
+  const transcriptsDone = transcripts;
+  const transcriptsTotal = meetings;
+  const complete = exposeMetrics ? store.countMeetings({ status: "ready" }) : null;
   const remaining =
-    transcriptsDone !== null && transcriptsTotal !== null
-      ? Math.max(0, transcriptsTotal - transcriptsDone)
-      : null;
+    meetings !== null && complete !== null ? meetings - complete : null;
+  const phase =
+    exposeMetrics && remaining !== null && remaining > 0 && s.phase === "synced"
+      ? "downloading"
+      : s.phase;
   const durableSyncUnavailable =
     s.sync_issue_code !== null &&
     s.sync_issue_cause !== null &&
@@ -216,7 +219,7 @@ function buildStatus(
   return {
     session: sessionInfo(client, s),
     blocking: activeCacheBlocked || authTransition !== undefined,
-    phase: s.phase,
+    phase,
     transcriptsDone,
     transcriptsTotal,
     remaining,

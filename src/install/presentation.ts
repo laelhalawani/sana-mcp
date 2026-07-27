@@ -23,6 +23,7 @@ export interface ConfigurerPresentationOptions {
 export interface ConfigurerPromptContext {
   input: NodeJS.ReadableStream;
   output: NodeJS.WritableStream;
+  clearPromptOnDone: boolean;
 }
 
 function processTerminal(): ConfigurerTerminal {
@@ -74,6 +75,7 @@ export class ConfigurerPresentation {
     return {
       input: this.terminal.input as NodeJS.ReadableStream,
       output: this.terminal.output as NodeJS.WritableStream,
+      clearPromptOnDone: true,
     };
   }
 

@@ -45,26 +45,158 @@ const {
   DaemonResourceFinalizationError,
   daemonSessionPreflight,
   finalizeDaemonResources,
+  prepareDaemonRetryState,
   retireDeadForegroundControl,
   syncOnce,
 } = await import(
   "../../src/sync/daemon.js"
 );
 const { DaemonStaleOwnerError } = await import("../../src/sync/lock.js");
-const { SyncGenerationChangedError } = await import("../../src/store/db.js");
+const { SanaStore, SyncGenerationChangedError } = await import(
+  "../../src/store/db.js"
+);
 
-afterEach(() => {
+async function removeTemporaryRoot(root: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fs.promises.rm(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if ((code !== "EBUSY" && code !== "EPERM") || attempt >= 49) throw error;
+      await Bun.sleep(100);
+    }
+  }
+}
+
+afterEach(async () => {
   embedCalls.length = 0;
   embeddedWrites.length = 0;
   beforeEmbedCommit = undefined;
   for (const root of temporaryRoots.splice(0)) {
-    fs.rmSync(root, {
-      recursive: true,
-      force: true,
-      maxRetries: 10,
-      retryDelay: 100,
-    });
+    await removeTemporaryRoot(root);
   }
+});
+
+test("daemon startup resets retry history exactly once", () => {
+  let resets = 0;
+  prepareDaemonRetryState({
+    resetFailures: () => {
+      resets++;
+    },
+  });
+  expect(resets).toBe(1);
+});
+
+test("partial artifact success remains retrying and avoids transcript redownload", async () => {
+  let transcript: ReturnType<SanaStore["getTranscript"]> = null;
+  let metadata: ReturnType<SanaStore["getMetadata"]> = null;
+  let transcriptRequests = 0;
+  let detailsRequests = 0;
+  let participantRequests = 0;
+  let failures = 0;
+  let clears = 0;
+  let listedPages = 0;
+  const state = syncState({
+    auth_generation: 1,
+    auth_publication_token: "11111111-1111-4111-8111-111111111111",
+    auth_user_id: "user-a",
+    auth_workspace_id: "workspace-a",
+    cache_user_id: "user-a",
+    cache_workspace_id: "workspace-a",
+  });
+  const store = {
+    db: {},
+    getSyncState: () => state,
+    writeSyncGeneration: (_cycle: unknown, operation: () => unknown) => operation(),
+    writeCacheGeneration: (_cycle: unknown, operation: () => unknown) => operation(),
+    assertSyncGeneration: () => {},
+    updateSyncState: (patch: Partial<SyncState>) => Object.assign(state, patch),
+    renewDaemonLease: () => "renewed",
+    getMeeting: (id: string) => ({ id, created_at_ms: 1 }),
+    upsertMeeting: () => {},
+    countMeetings: () => 1,
+    meetingsDue: () => (metadata === null ? ["meeting-a"] : []),
+    countIncomplete: () => (metadata === null ? 1 : 0),
+    countComplete: () => (transcript !== null && metadata !== null ? 1 : 0),
+    countTranscripts: () => (transcript === null ? 0 : 1),
+    getTranscript: () => transcript,
+    saveTranscript: () => {
+      transcript = {
+        meeting_id: "meeting-a",
+        text: "Hello",
+        json: "[]",
+        word_count: 1,
+        segment_count: 0,
+        fetched_ms: 1,
+      };
+    },
+    getMetadata: () => metadata,
+    saveMetadata: () => {
+      metadata = {
+        summary: null,
+        summary_short: null,
+        notes_json: null,
+        participants_json: "[]",
+        has_recording: 0,
+      };
+    },
+    recordFailure: () => {
+      failures++;
+    },
+    clearFailure: () => {
+      clears++;
+    },
+    meetingsMissingEmbedding: () => [],
+    releaseCurrentCache: () => {},
+    finishSyncCycle: () => {},
+  } as unknown as SanaStore;
+  const client = {
+    walkMeetings: async (page: (assets: unknown[]) => unknown) => {
+      listedPages++;
+      expect(page([])).not.toBe(false);
+      listedPages++;
+      expect(page([])).not.toBe(false);
+    },
+    getTranscription: async () => {
+      transcriptRequests++;
+      return [];
+    },
+    getMeetingById: async () => {
+      detailsRequests++;
+      return {};
+    },
+    getMeetingParticipants: async () => {
+      participantRequests++;
+      if (participantRequests === 1) throw new Error("participants temporary");
+      return [];
+    },
+  } as unknown as SanaClient;
+  const cycle = {
+    generation: 1,
+    publicationToken: "11111111-1111-4111-8111-111111111111",
+    userId: "user-a",
+    workspaceId: "workspace-a",
+  };
+
+  await syncOnce(store, client, cycle, TEST_DAEMON_INSTANCE);
+  expect({ transcriptRequests, detailsRequests, participantRequests }).toEqual({
+    transcriptRequests: 1,
+    detailsRequests: 1,
+    participantRequests: 1,
+  });
+  expect(failures).toBe(1);
+  expect(clears).toBe(0);
+
+  await syncOnce(store, client, cycle, TEST_DAEMON_INSTANCE);
+  expect({ transcriptRequests, detailsRequests, participantRequests }).toEqual({
+    transcriptRequests: 1,
+    detailsRequests: 2,
+    participantRequests: 2,
+  });
+  expect(failures).toBe(1);
+  expect(clears).toBe(1);
+  expect(listedPages).toBe(4);
 });
 
 function runLeaseScenario(source: string) {
@@ -174,7 +306,7 @@ function fakeChild(pid: number): ChildProcess {
   return child;
 }
 
-test("missing meeting creation time fails only that embedding", async () => {
+test("embedding errors are retried without mutating artifact failures", async () => {
   const failures: Array<{ meetingId: string; message: string }> = [];
   const marked: string[] = [];
   const cleared: string[] = [];
@@ -216,8 +348,10 @@ test("missing meeting creation time fails only that embedding", async () => {
     updateSyncState: () => {},
     renewDaemonLease: () => "renewed",
     countMeetings: () => 2,
-    meetingsIncomplete: () => [],
+    meetingsDue: () => [],
+    countIncomplete: () => 0,
     countComplete: () => 2,
+    countTranscripts: () => 2,
     meetingsMissingEmbedding: () => {
       missingEmbeddingCalls.count++;
       return ["meeting-missing-date", "meeting-valid"];
@@ -243,26 +377,34 @@ test("missing meeting creation time fails only that embedding", async () => {
     clearFailure: (meetingId: string) => {
       cleared.push(meetingId);
     },
+    releaseCurrentCache: () => {},
     finishSyncCycle: () => {},
   } as unknown as SanaStore;
   const client = {
     walkMeetings: async () => {},
   } as unknown as SanaClient;
 
-  await syncOnce(store, client, {
-    generation: 1,
-    publicationToken: "11111111-1111-4111-8111-111111111111",
-    userId: "user-a",
-    workspaceId: "workspace-a",
-  }, "00000000-0000-4000-8000-000000000010");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-daemon-log-"));
+  temporaryRoots.push(root);
+  const previousDataDir = process.env.SANA_DATA_DIR;
+  const previousTranscriptsDir = process.env.SANA_TRANSCRIPTS_DIR;
+  process.env.SANA_DATA_DIR = path.join(root, "data");
+  process.env.SANA_TRANSCRIPTS_DIR = path.join(root, "transcripts");
+  try {
+    await syncOnce(store, client, {
+      generation: 1,
+      publicationToken: "11111111-1111-4111-8111-111111111111",
+      userId: "user-a",
+      workspaceId: "workspace-a",
+    }, "00000000-0000-4000-8000-000000000010");
+  } finally {
+    if (previousDataDir === undefined) delete process.env.SANA_DATA_DIR;
+    else process.env.SANA_DATA_DIR = previousDataDir;
+    if (previousTranscriptsDir === undefined) delete process.env.SANA_TRANSCRIPTS_DIR;
+    else process.env.SANA_TRANSCRIPTS_DIR = previousTranscriptsDir;
+  }
 
-  expect(failures).toEqual([
-    {
-      meetingId: "meeting-missing-date",
-      message:
-        "Cannot create a semantic embedding because the meeting has no authoritative creation timestamp; refresh the meeting list before retrying.",
-    },
-  ]);
+  expect(failures).toEqual([]);
   expect(embedCalls).toEqual([
     {
       meetingId: "meeting-valid",
@@ -270,8 +412,8 @@ test("missing meeting creation time fails only that embedding", async () => {
     },
   ]);
   expect(marked).toEqual(["meeting-valid"]);
-  expect(cleared).toEqual(["meeting-valid"]);
-  expect(missingEmbeddingCalls.count).toBe(2);
+  expect(cleared).toEqual([]);
+  expect(missingEmbeddingCalls.count).toBe(1);
 });
 
 test("stale cycle cannot commit vector rows after embedding await", async () => {
@@ -347,8 +489,10 @@ test("stale cycle cannot commit vector rows after embedding await", async () => 
     }),
     upsertMeeting: () => {},
     countMeetings: () => 1,
-    meetingsIncomplete: () => [],
+    meetingsDue: () => [],
+    countIncomplete: () => 0,
     countComplete: () => 1,
+    countTranscripts: () => 1,
     meetingsMissingEmbedding: () => ["meeting-a"],
     getTranscript: () => ({
       meeting_id: "meeting-a",
@@ -361,6 +505,7 @@ test("stale cycle cannot commit vector rows after embedding await", async () => 
     markEmbedded: (id: string) => marked.push(id),
     clearFailure: () => {},
     recordFailure: () => {},
+    releaseCurrentCache: () => {},
     finishSyncCycle: () => {},
   } as unknown as SanaStore;
   const client = {
@@ -377,6 +522,72 @@ test("stale cycle cannot commit vector rows after embedding await", async () => 
   ).rejects.toBeInstanceOf(SyncGenerationChangedError);
   expect(embeddedWrites).toEqual([]);
   expect(marked).toEqual([]);
+});
+
+test("complete listing releases the cache before artifact requests", async () => {
+  let released = false;
+  let transcriptSaved = false;
+  const cycle = {
+    generation: 1,
+    publicationToken: "11111111-1111-4111-8111-111111111111",
+    userId: "user-a",
+    workspaceId: "workspace-a",
+  };
+  const store = {
+    db: {},
+    getSyncState: () =>
+      syncState({
+        last_full_sync_ms: 1,
+        auth_generation: cycle.generation,
+        auth_publication_token: cycle.publicationToken,
+        auth_user_id: cycle.userId,
+        auth_workspace_id: cycle.workspaceId,
+        cache_user_id: cycle.userId,
+        cache_workspace_id: cycle.workspaceId,
+      }),
+    writeSyncGeneration: (_cycle: unknown, operation: () => unknown) => operation(),
+    writeCacheGeneration: (_cycle: unknown, operation: () => unknown) => operation(),
+    updateSyncState: () => {},
+    assertSyncGeneration: () => {},
+    activateCacheIdentity: () => "unchanged",
+    upsertMeeting: () => {},
+    countMeetings: () => 1,
+    countTranscripts: () => (transcriptSaved ? 1 : 0),
+    countIncomplete: () => (transcriptSaved ? 0 : 1),
+    meetingsDue: () => ["meeting-a"],
+    releaseCurrentCache: () => {
+      released = true;
+    },
+    getTranscript: () =>
+      transcriptSaved
+        ? { meeting_id: "meeting-a", text: "", json: "[]", word_count: 0, segment_count: 0, fetched_ms: 1 }
+        : null,
+    getMetadata: () => ({
+      summary: null,
+      summary_short: null,
+      notes_json: null,
+      participants_json: "[]",
+      has_recording: 0,
+    }),
+    saveTranscript: () => {
+      transcriptSaved = true;
+    },
+    clearFailure: () => {},
+    recordFailure: () => {},
+    renewDaemonLease: () => "renewed",
+    meetingsMissingEmbedding: () => [],
+    finishSyncCycle: () => {},
+  } as unknown as SanaStore;
+  const client = {
+    walkMeetings: async () => {},
+    getTranscription: async () => {
+      expect(released).toBe(true);
+      return [];
+    },
+  } as unknown as SanaClient;
+
+  await syncOnce(store, client, cycle, TEST_DAEMON_INSTANCE);
+  expect(released).toBe(true);
 });
 
 test("daemon finalization preserves execution and cleanup errors", () => {

@@ -221,14 +221,10 @@ opts = { query, sort, status, limit: pageSize, offset: (page-1)*pageSize }
 rows  = store.listMeetings(opts)          // MeetingListRow[]
 total = store.countMeetings({ query, sort, status })
 ```
-`pageSize` = `min(terminal rows - chrome, 20)`. Status per row is derived
-exactly as the dispatcher's `rowStatus`: `has_transcript` -> `ready`; else
-`processing_phase && !== "done"` -> `processing`; else `attempts >=
-MAX_TRANSCRIPT_ATTEMPTS` -> `failed`; else `downloading`. (Note: `listMeetings`
-does not return `processing_phase`/`has_recording` today; the data-split agent
-should extend the row select to include `processing_phase` so the status column
-and the `processing` state are accurate. Until then, treat non-ready as
-`downloading`/`failed` by `attempts`.)
+`pageSize` = `min(terminal rows - chrome, 20)`. Status per row matches the
+dispatcher's `rowStatus`: transcript plus metadata -> `ready`; otherwise an
+unfinished Sana phase -> `processing`; otherwise attempts greater than zero ->
+`retrying`; otherwise `downloading`.
 
 Date filter (from/to) is supported by the store but is a secondary control (see
 below); title filter and status filter are primary.
@@ -243,7 +239,7 @@ below); title filter and status filter are primary.
    2026-06-03 09:00   ready        Weekly sync
  > 2026-06-02 14:30   ready        Pricing review with Acme
    2026-06-01 11:15   downloading  1:1 Dana / Sam
-   2026-05-30 16:00   failed       Board prep
+   2026-05-30 16:00   retrying     Board prep
    2026-05-29 10:00   processing   Design critique
    ...
 
@@ -255,7 +251,7 @@ below); title filter and status filter are primary.
 
 - Columns: date `YYYY-MM-DD HH:MM` (local or UTC - match STATUS; use UTC to
   align with the store), status (colored: ready=green, downloading=cyan,
-  processing=yellow, failed=red), title (truncated with ellipsis to fit width;
+  processing=yellow, retrying=yellow), title (truncated with ellipsis to fit width;
   never wraps).
 - `>` cursor + cyan active row, same visual language as `wizard-prompt.ts`.
 
@@ -268,7 +264,7 @@ below); title filter and status filter are primary.
 | printable     | Append to the filter buffer; debounce ~120ms then re-query, reset to page 1 |
 | `Backspace`   | Delete last filter char; re-query                               |
 | `s`           | Toggle sort newest <-> oldest; reset to page 1                   |
-| `f`           | Cycle status filter: all -> ready -> downloading -> failed -> all; reset to page 1 |
+| `f`           | Cycle status filter: all -> ready -> downloading -> retrying -> all; reset to page 1 |
 | `n` / `p` or PageDn/PageUp | Next / previous page (clamped)                     |
 | `c`           | Clear filter buffer + status filter, back to page 1             |
 | `r`           | Re-read current page (picks up newly synced rows)               |
@@ -289,7 +285,7 @@ list mode and `[Esc] done filtering` in filter mode.
   Subsequent re-queries are fast (local SQLite) - no spinner, just swap rows.
 - **Empty (no meetings at all)**: "No meetings synced yet." + `[Esc] back`.
 - **Empty (filter/status matches nothing)**: keep the Filter line and controls,
-  body shows "No meetings match "pri" with status = failed." + hint to `c` clear.
+  body shows "No meetings match "pri" with status = retrying." + hint to `c` clear.
 - **Page overflow**: if a refresh shrinks total below the current page, clamp
   `page` and re-query.
 - Gates from 0.4 apply on entry.

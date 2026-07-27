@@ -6,6 +6,11 @@ import {
   type TerminalInput,
   type TerminalOutput,
 } from "./ui.js";
+import {
+  meetingBrowserPrompt,
+  type MeetingBrowserResult,
+} from "./browser-prompt.js";
+import type { AppRuntime } from "./runtime.js";
 
 export interface AppPromptChoice<Value extends string> {
   readonly name: string;
@@ -20,6 +25,7 @@ export interface AppPrompts {
     pageSize?: number;
   }): Promise<Value>;
   input(message: string): Promise<string>;
+  meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult>;
 }
 
 /** Apply the shared terminal policy to every interactive app prompt. */
@@ -28,6 +34,7 @@ export class TerminalAppPrompts implements AppPrompts {
   private readonly inputStream: TerminalInput;
   private readonly outputStream: TerminalOutput;
   private readonly theme: ReturnType<TerminalAppPrompts["createTheme"]>;
+  private readonly ui: TerminalUi;
 
   constructor(
     terminal: {
@@ -46,8 +53,8 @@ export class TerminalAppPrompts implements AppPrompts {
     this.outputStream = terminal.output;
     const policy = createTerminalPolicy(terminal);
     this.interactive = policy.interactive;
-    const ui = new TerminalUi(policy);
-    this.theme = this.createTheme(ui);
+    this.ui = new TerminalUi(policy);
+    this.theme = this.createTheme(this.ui);
   }
 
   private createTheme(ui: TerminalUi) {
@@ -100,6 +107,16 @@ export class TerminalAppPrompts implements AppPrompts {
   input(message: string): Promise<string> {
     return input(
       { message, theme: this.theme },
+      {
+        input: this.inputStream as NodeJS.ReadableStream,
+        output: this.outputStream as NodeJS.WritableStream,
+      },
+    );
+  }
+
+  meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult> {
+    return meetingBrowserPrompt(
+      { runtime, output: this.outputStream, ui: this.ui },
       {
         input: this.inputStream as NodeJS.ReadableStream,
         output: this.outputStream as NodeJS.WritableStream,

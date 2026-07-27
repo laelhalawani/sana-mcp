@@ -120,6 +120,23 @@ describe("terminal policy", () => {
       }).wsl
     ).toBe(true);
   });
+
+  test("uses neutral no-op glyphs that cannot look like key-value output", () => {
+    const base = {
+      input: { isTTY: true },
+      output: { isTTY: true, write() {} },
+      platform: "linux" as const,
+    };
+    expect(
+      new TerminalUi(
+        createTerminalPolicy({ ...base, env: { LANG: "C.UTF-8" } }),
+      ).glyphs.noop,
+    ).toBe("·");
+    expect(
+      new TerminalUi(createTerminalPolicy({ ...base, env: { LANG: "C" } }))
+        .glyphs.noop,
+    ).toBe(".");
+  });
 });
 
 describe("human UI sanitization", () => {

@@ -54,7 +54,7 @@ not launch the configurer. A compatible Windows updater is silent about setup an
 preserves registrations and local state; only an incompatible Windows updater
 prints the deferred command to configure clients and sign in.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.10` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.11` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
 `apk add --no-cache libstdc++ libgcc`; the installer detects and reports this
@@ -105,8 +105,8 @@ headless on macOS, Linux, Windows, and WSL.
   whole-word matching, phrase, date-range, and sort options.
 - **Optional semantic / hybrid search** - keyword + vector results fused by
   Reciprocal Rank Fusion (RRF). Off by default; no cost until you enable it.
-- **Automatic sync** - the daemon polls for new meetings and pulls them in the
-  background; failed downloads are retried then marked, never blocking the rest.
+- **Automatic sync** - the daemon polls for new meetings and keeps retrying
+  incomplete downloads in the background without blocking ready meetings.
 - **Works with your client** - auto-registers with Claude Desktop, Claude Code,
   Cursor, VS Code, Codex, Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q,
   Continue, opencode.
@@ -137,7 +137,7 @@ meeting_transcripts("<tool>", { ...args })
 Notes:
 
 - `list.sort` is `"newest"` (default) or `"oldest"`; `list.filter` is
-  `{status: "ready"|"downloading"|"failed", date: {from, to}}` with ISO dates
+  `{status: "ready"|"downloading"|"processing"|"retrying", date: {from, to}}` with ISO dates
   (`"YYYY-MM-DD"`) or epoch ms.
 - `read.lines` is a 1-based `[start, end]` range. With no selection it reports
   the line count and your options; `full: true` returns everything.
@@ -233,15 +233,14 @@ progress, then ask your agent to search, read, or summarize your meetings.
 
 ## How sync works
 
-- **On every login**, a fresh catch-up sync runs and the meeting tools are held
-  until it finishes, so a returning user always sees current content. `status`
-  reports authoritative completed and total counts until the remaining work is
-  finished.
+- **On every login**, a fresh catch-up sync runs. Meeting tools remain blocked
+  only until the current account's cache is safe to read; ready meetings can be
+  used while remaining transcripts and metadata continue syncing.
 - **Between logins**, the daemon checks periodically for new meetings and pulls
   them in the background without interrupting anything. A meeting still
   downloading shows as `downloading` in `list`.
-- Downloads that fail are retried and, after several attempts, marked `failed`
-  so they never block the rest. A fresh login resets the counter and retries.
+- Downloads that fail remain `retrying` with increasing delays. They are never
+  abandoned, and restarting or reinstalling sana-mcp retries them immediately.
 
 ## Search
 
@@ -278,8 +277,8 @@ All environment variables are optional.
 |-----|---------|---------|
 | `SANA_SEMANTIC`            | off             | `1` to enable semantic / hybrid search                       |
 | `SANA_SYNC_INTERVAL_MS`    | `600000`        | how often the daemon checks for new meetings                  |
-| `SANA_REQUEST_DELAY_MS`    | `150`           | delay between transcript downloads                            |
-| `SANA_MAX_ATTEMPTS`        | `5`             | download retries before a meeting is marked `failed`          |
+| `SANA_REQUEST_DELAY_MS`    | `150`           | delay between Sana artifact requests                          |
+| `SANA_MAX_ATTEMPTS`        | `5`             | failures before the retry delay stops increasing              |
 | `SANA_EMBED_MODEL`         | `Xenova/all-MiniLM-L6-v2` | embedding model id                                 |
 | `SANA_EMBED_DIM`           | `384`           | embedding vector dimension                                    |
 | `SANA_EMBED_IDLE_MS`       | `60000`         | unload the embedding model after this idle time               |

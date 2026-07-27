@@ -406,7 +406,8 @@ test("human manual-result rendering sanitizes hostile reasons and paths", () => 
   for (const result of successful) {
     const rendered = describeApplyResult(result);
     assert.doesNotMatch(rendered, /[\n\r\u001b\u202e]/u);
-    assert.match(rendered, /\[config: /u);
+    assert.doesNotMatch(rendered, /\[config: /u);
+    assert.equal(rendered.includes(hostilePath), false);
   }
 
   const unavailable: ApplyResult = {

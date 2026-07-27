@@ -174,11 +174,11 @@ export class TerminalUi {
   constructor(readonly policy: TerminalPolicy, private readonly owner: object = {}) {
     this.glyphs = policy.unicode
       ? {
-          ok: "✔", disable: "−", noop: "=", skip: "·", fail: "✖",
+          ok: "✔", disable: "−", noop: "·", skip: "·", fail: "✖",
           pending: "·", pointer: "❯", check: "◉", uncheck: "◯",
         }
       : {
-          ok: "+", disable: "-", noop: "=", skip: "~", fail: "x",
+          ok: "+", disable: "-", noop: ".", skip: "~", fail: "x",
           pending: ".", pointer: ">", check: "[x]", uncheck: "[ ]",
         };
     this.spinnerFrames = policy.unicode

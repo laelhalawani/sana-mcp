@@ -18,7 +18,10 @@ import {
   releaseTargetForRuntime,
   type ReleaseTarget,
 } from "../../src/release/contract.js";
-import { renderStatusInfo } from "../../src/tools/dispatch.js";
+import {
+  renderLoginWaitResult,
+  renderStatusInfo,
+} from "../../src/tools/dispatch.js";
 import packageInfo from "../../package.json" with { type: "json" };
 
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -1792,6 +1795,22 @@ describe.serial("MCP stdio contract", () => {
         expected.durableSyncUnavailableStatus,
       );
       expect(
+        renderLoginWaitResult(
+          "Logged in as auth@example.invalid (workspace workspace-contract).",
+          {
+            done: false,
+            cacheReady: true,
+            count: 138,
+            phase: "downloading",
+          },
+          [
+            "",
+            "Available tools: login, status, list, read, search, summary, participants, recording, help.",
+            'Use meeting_transcripts("help", {"tool":"<name>"}) for details.',
+          ],
+        ),
+      ).toBe(expected.verifyPartialCache);
+      expect(
         await runAuthDispatch(
           dispatcher,
           dataDir,
@@ -1997,9 +2016,13 @@ describe.serial("MCP stdio contract", () => {
       dataDir
     );
     expect(progress).toEqual({ code: 0, signal: null, stdout: "", stderr: "" });
-    const result = await mcpExchange(dataDir, [{ id: 60, tool: "status" }]);
+    const result = await mcpExchange(dataDir, [
+      { id: 60, tool: "status" },
+      { id: 61, tool: "list" },
+    ]);
     const expected = JSON.parse(fixture("representative-outputs.json")) as Record<string, string>;
     expect(toolText(result.messages, 60)).toBe(expected.statusSyncing);
+    expect(toolText(result.messages, 61)).toBe(expected.blockedSync);
   }, outerTestBudget(2, 1));
 
   test("freezes truthful read guidance while the meeting list is incomplete", async () => {
@@ -2155,7 +2178,7 @@ describe.serial("MCP stdio contract", () => {
         { id: 41, tool: "list", args: { sort: "oldest", limit: 1 } },
         { id: 42, tool: "list", args: { filter: { status: "ready" }, sort: "oldest" } },
         { id: 43, tool: "list", args: { filter: { status: "downloading" } } },
-        { id: 44, tool: "list", args: { filter: { status: "failed" } } },
+        { id: 44, tool: "list", args: { filter: { status: "retrying" } } },
         {
           id: 45,
           tool: "list",
@@ -2202,7 +2225,7 @@ describe.serial("MCP stdio contract", () => {
       expect(toolText(result.messages, 41)).toBe(expected.listOldest);
       expect(toolText(result.messages, 42)).toBe(expected.listReady);
       expect(toolText(result.messages, 43)).toBe(expected.listDownloading);
-      expect(toolText(result.messages, 44)).toBe(expected.listFailed);
+      expect(toolText(result.messages, 44)).toBe(expected.listRetrying);
       expect(toolText(result.messages, 45)).toBe(expected.listDate);
       expect(toolText(result.messages, 46)).toBe(expected.listDate);
       expect(toolText(result.messages, 55)).toBe(expected.listPageTwo);

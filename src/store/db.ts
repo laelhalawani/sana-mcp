@@ -4,7 +4,7 @@ import path from "node:path";
 import {
   dataDirectory,
   ensureDataDir,
-  MAX_TRANSCRIPT_ATTEMPTS,
+  MAX_RETRY_DELAY_ATTEMPTS,
 } from "../config.js";
 import {
   ensureSecureDirectory,
@@ -24,16 +24,35 @@ export interface MeetingListOpts {
   offset?: number;
   query?: string;
   sort?: "newest" | "oldest";
-  status?: "ready" | "downloading" | "failed";
+  status?: "ready" | "downloading" | "processing" | "retrying";
   dateFrom?: number; // epoch ms, inclusive
   dateTo?: number; // epoch ms, inclusive
 }
 
 export type MeetingListRow = MeetingRow & {
   has_transcript: number;
+  has_metadata: number;
   word_count: number | null;
   attempts: number;
 };
+
+const RETRY_BASE_DELAY_MS = 10 * 60_000;
+const RETRY_MAX_DELAY_MS = 6 * 60 * 60_000;
+
+/** Delay after an artifact failure; the attempt setting caps growth, not retries. */
+export function retryDelayMs(attempts: number): number {
+  const cappedAttempts = Math.min(
+    Math.max(attempts, 1),
+    MAX_RETRY_DELAY_ATTEMPTS,
+  );
+  // The six-hour ceiling is reached at attempt seven, so larger exponents never
+  // need to be evaluated and cannot overflow.
+  const safeExponent = Math.min(cappedAttempts - 1, 6);
+  return Math.min(
+    RETRY_BASE_DELAY_MS * 2 ** safeExponent,
+    RETRY_MAX_DELAY_MS,
+  );
+}
 
 export function databaseFile(): string {
   return path.join(dataDirectory(), "sana.db");
@@ -521,13 +540,24 @@ export class SanaStore {
       params.dateTo = opts.dateTo;
     }
     if (opts.status === "ready") {
-      clauses.push("t.meeting_id IS NOT NULL");
+      clauses.push("t.meeting_id IS NOT NULL AND mm.meeting_id IS NOT NULL");
+    } else if (opts.status === "processing") {
+      clauses.push(
+        "(t.meeting_id IS NULL OR mm.meeting_id IS NULL) " +
+          "AND m.processing_phase IS NOT NULL AND m.processing_phase <> 'done'",
+      );
+    } else if (opts.status === "retrying") {
+      clauses.push(
+        "(t.meeting_id IS NULL OR mm.meeting_id IS NULL) " +
+          "AND (m.processing_phase IS NULL OR m.processing_phase = 'done') " +
+          "AND COALESCE(ff.attempts, 0) > 0",
+      );
     } else if (opts.status === "downloading") {
-      clauses.push("t.meeting_id IS NULL AND COALESCE(ff.attempts, 0) < @maxAtt");
-      params.maxAtt = MAX_TRANSCRIPT_ATTEMPTS;
-    } else if (opts.status === "failed") {
-      clauses.push("t.meeting_id IS NULL AND COALESCE(ff.attempts, 0) >= @maxAtt");
-      params.maxAtt = MAX_TRANSCRIPT_ATTEMPTS;
+      clauses.push(
+        "(t.meeting_id IS NULL OR mm.meeting_id IS NULL) " +
+          "AND (m.processing_phase IS NULL OR m.processing_phase = 'done') " +
+          "AND COALESCE(ff.attempts, 0) = 0",
+      );
     }
     return { where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", params };
   }
@@ -542,10 +572,12 @@ export class SanaStore {
     const { where, params } = this.meetingFilter(opts);
     return this.db
       .prepare(
-        `SELECT m.*, (t.meeting_id IS NOT NULL) AS has_transcript, t.word_count,
-                COALESCE(ff.attempts, 0) AS attempts
+        `SELECT m.*, (t.meeting_id IS NOT NULL) AS has_transcript,
+                (mm.meeting_id IS NOT NULL) AS has_metadata, t.word_count,
+                 COALESCE(ff.attempts, 0) AS attempts
          FROM meetings m
          LEFT JOIN transcripts t ON t.meeting_id = m.id
+         LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
          LEFT JOIN fetch_failures ff ON ff.meeting_id = m.id
          ${where}
          ORDER BY m.created_at_ms ${order}
@@ -558,8 +590,9 @@ export class SanaStore {
     const { where, params } = this.meetingFilter(opts);
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) n FROM meetings m
+         `SELECT COUNT(*) n FROM meetings m
          LEFT JOIN transcripts t ON t.meeting_id = m.id
+         LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
          LEFT JOIN fetch_failures ff ON ff.meeting_id = m.id
          ${where}`
       )
@@ -567,45 +600,82 @@ export class SanaStore {
     return row.n;
   }
 
-  /**
-   * Meeting ids that are incomplete (missing transcript OR metadata) and still
-   * retriable, newest first. A complete meeting has both a transcript and its
-   * metadata.
-   */
-  meetingsIncomplete(): string[] {
-    return (
-      this.db
-        .prepare(
-          `SELECT m.id FROM meetings m
-           LEFT JOIN transcripts t ON t.meeting_id = m.id
-           LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
-           LEFT JOIN fetch_failures ff ON ff.meeting_id = m.id
-           WHERE (t.meeting_id IS NULL OR mm.meeting_id IS NULL)
-             AND COALESCE(ff.attempts, 0) < @maxAtt
-             AND (m.processing_phase IS NULL OR m.processing_phase = 'done')
-           ORDER BY m.created_at_ms DESC`
-        )
-        .all({ maxAtt: MAX_TRANSCRIPT_ATTEMPTS }) as { id: string }[]
-    ).map((r) => r.id);
+  /** Source-ready incomplete meetings whose retry delay has elapsed. */
+  meetingsDue(now: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT m.id, m.created_at_ms, m.first_seen_ms,
+                ff.meeting_id AS failure_id,
+                COALESCE(ff.attempts, 0) AS attempts, ff.last_attempt_ms
+         FROM meetings m
+         LEFT JOIN transcripts t ON t.meeting_id = m.id
+         LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
+         LEFT JOIN fetch_failures ff ON ff.meeting_id = m.id
+         WHERE (t.meeting_id IS NULL OR mm.meeting_id IS NULL)
+           AND (m.processing_phase IS NULL OR m.processing_phase = 'done')`,
+      )
+      .all() as Array<{
+      id: string;
+      created_at_ms: number;
+      first_seen_ms: number;
+      failure_id: string | null;
+      attempts: number;
+      last_attempt_ms: number | null;
+    }>;
+    return rows
+      .filter(
+        (row) =>
+          row.failure_id === null ||
+          (row.last_attempt_ms !== null &&
+            row.last_attempt_ms <= now - retryDelayMs(row.attempts)),
+      )
+      .sort((left, right) => {
+        const leftDue =
+          left.last_attempt_ms === null
+            ? left.first_seen_ms
+            : left.last_attempt_ms + retryDelayMs(left.attempts);
+        const rightDue =
+          right.last_attempt_ms === null
+            ? right.first_seen_ms
+            : right.last_attempt_ms + retryDelayMs(right.attempts);
+        return (
+          leftDue - rightDue ||
+          left.created_at_ms - right.created_at_ms ||
+          left.id.localeCompare(right.id)
+        );
+      })
+      .map((row) => row.id);
   }
 
-  /**
-   * Meetings that have no metadata row despite being processed — these may
-   * have exhausted the retry budget before a fix. Returns them regardless of
-   * failure count so the daemon can backfill metadata on the next cycle.
-   */
-  meetingsMissingMetadata(): string[] {
+  /** All meetings missing a transcript or metadata, regardless of readiness. */
+  countIncomplete(): number {
     return (
       this.db
         .prepare(
-          `SELECT m.id FROM meetings m
+          `SELECT COUNT(*) n FROM meetings m
+           LEFT JOIN transcripts t ON t.meeting_id = m.id
            LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
-           WHERE mm.meeting_id IS NULL
-             AND (m.processing_phase IS NULL OR m.processing_phase = 'done')
-           ORDER BY m.created_at_ms DESC`
+           WHERE t.meeting_id IS NULL OR mm.meeting_id IS NULL`,
         )
-        .all() as { id: string }[]
-    ).map((r) => r.id);
+        .get() as { n: number }
+    ).n;
+  }
+
+  /** Source-ready incomplete meetings currently carrying retry history. */
+  countRetrying(): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) n FROM meetings m
+           LEFT JOIN transcripts t ON t.meeting_id = m.id
+           LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
+           JOIN fetch_failures ff ON ff.meeting_id = m.id
+           WHERE (t.meeting_id IS NULL OR mm.meeting_id IS NULL)
+             AND (m.processing_phase IS NULL OR m.processing_phase = 'done')
+             AND ff.attempts > 0`,
+        )
+        .get() as { n: number }
+    ).n;
   }
 
   /** Meetings that have both a transcript and metadata. */
@@ -650,11 +720,10 @@ export class SanaStore {
           `SELECT t.meeting_id AS id FROM transcripts t
            LEFT JOIN line_embeddings e ON e.meeting_id = t.meeting_id
            JOIN meetings m ON m.id = t.meeting_id
-           LEFT JOIN fetch_failures ff ON ff.meeting_id = t.meeting_id
-           WHERE e.meeting_id IS NULL AND COALESCE(ff.attempts, 0) < @maxAtt
+           WHERE e.meeting_id IS NULL
            ORDER BY m.created_at_ms DESC`
-        )
-        .all({ maxAtt: MAX_TRANSCRIPT_ATTEMPTS }) as { id: string }[]
+         )
+        .all() as { id: string }[]
     ).map((r) => r.id);
   }
 
@@ -758,7 +827,7 @@ export class SanaStore {
     this.db.prepare(`DELETE FROM fetch_failures WHERE meeting_id = ?`).run(meetingId);
   }
 
-  /** Reset all failure counters so failed items are retried (used on login). */
+  /** Reset retry history so incomplete items are immediately eligible. */
   resetFailures(): void {
     this.db.prepare(`DELETE FROM fetch_failures`).run();
   }
@@ -1562,6 +1631,38 @@ export class SanaStore {
     this.writeSyncGeneration(cycle, () => {});
   }
 
+  releaseCurrentCache(cycle: SyncCycleIdentity): void {
+    this.writeCacheGeneration(cycle, () => {
+      this.db
+        .prepare(
+          `UPDATE sync_state
+           SET blocking = 0,
+               updated_ms = @updated_ms
+           WHERE id = 1
+             AND auth_generation = @cycle_auth_generation
+             AND auth_publication_token = @cycle_publication_token
+             AND auth_user_id = @cycle_user_id
+             AND auth_workspace_id = @cycle_workspace_id
+             AND cache_user_id = @cycle_user_id
+             AND cache_workspace_id = @cycle_workspace_id
+             AND auth_pending = 0
+             AND auth_transition_token IS NULL
+             AND auth_issue_code IS NULL
+             AND (
+               catchup_generation IS NULL OR
+               catchup_generation <= @cycle_auth_generation
+             )`,
+        )
+        .run({
+          cycle_auth_generation: cycle.generation,
+          cycle_publication_token: cycle.publicationToken,
+          cycle_user_id: cycle.userId,
+          cycle_workspace_id: cycle.workspaceId,
+          updated_ms: Date.now(),
+        });
+    });
+  }
+
   captureCacheOperation(
     tuple: ConfirmedAuthTuple,
   ): CacheOperationGuard {
@@ -1746,26 +1847,24 @@ export class SanaStore {
   }
 
   /**
-   * Finalize a sync cycle and, atomically, clear the login block ONLY if the
-   * cycle both finished its work and used the currently confirmed session
-   * generation. This prevents an older-account cycle from unblocking a newer
-   * login regardless of wall-clock movement.
+   * Finalize from artifact counts read inside the current generation's write
+   * transaction. A safe current cache is browsable while pending artifacts keep
+   * syncing; stale generations can never release a newer login's cache.
    */
   finishSyncCycle(patch: {
-    message: string;
-    meetings_total: number;
-    transcripts_total: number;
-    transcripts_done: number;
     last_full_sync_ms: number | null;
     last_incremental_ms: number;
-    workDone: boolean;
     cycle: SyncCycleIdentity;
   }): void {
-    const result = this.writeSyncGeneration(patch.cycle, () =>
-      this.db
+    const result = this.writeSyncGeneration(patch.cycle, () => {
+      const meetings = this.countMeetings();
+      const transcripts = this.countTranscripts();
+      const complete = this.countComplete();
+      const pending = this.countIncomplete();
+      return this.db
         .prepare(
         `UPDATE sync_state SET
-           phase = 'synced',
+           phase = @phase,
            message = @message,
            meetings_total = @meetings_total,
            transcripts_total = @transcripts_total,
@@ -1773,9 +1872,8 @@ export class SanaStore {
            last_full_sync_ms = @last_full_sync_ms,
            last_incremental_ms = @last_incremental_ms,
            blocking = CASE
-             WHEN @workDone = 1
-               AND auth_pending = 0
-               AND auth_issue_code IS NULL
+              WHEN auth_pending = 0
+                AND auth_issue_code IS NULL
                AND auth_transition_token IS NULL
                AND auth_generation = @cycle_auth_generation
                AND auth_publication_token = @cycle_publication_token
@@ -1800,20 +1898,23 @@ export class SanaStore {
            AND auth_issue_code IS NULL`
         )
         .run({
-          message: patch.message,
-          meetings_total: patch.meetings_total,
-          transcripts_total: patch.transcripts_total,
-          transcripts_done: patch.transcripts_done,
+          phase: pending === 0 ? "synced" : "downloading",
+          message:
+            pending === 0
+              ? `Up to date - ${meetings} meetings, ${complete} complete.`
+              : `Sync continuing - ${complete}/${meetings} meetings complete; ${pending} pending.`,
+          meetings_total: meetings,
+          transcripts_total: meetings,
+          transcripts_done: transcripts,
           last_full_sync_ms: patch.last_full_sync_ms,
           last_incremental_ms: patch.last_incremental_ms,
-          workDone: patch.workDone ? 1 : 0,
           cycle_auth_generation: patch.cycle.generation,
           cycle_publication_token: patch.cycle.publicationToken,
           cycle_user_id: patch.cycle.userId,
           cycle_workspace_id: patch.cycle.workspaceId,
           updated_ms: Date.now(),
-        }),
-    );
+        });
+    });
     if (result.changes !== 1) throw new SyncGenerationChangedError();
   }
 

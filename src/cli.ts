@@ -49,7 +49,7 @@ function humanErrorText(error: unknown): string {
 
 function bareHint(): string {
   return [
-    "Run sana-mcp in a terminal to configure Sana and your AI clients.",
+    "Run sana-mcp in a terminal to open the meeting app.",
     "For one-shot commands, run: sana-mcp help",
   ].join("\n");
 }
@@ -372,7 +372,7 @@ program
   .option("--query <q>", "filter meetings by title")
   .option("--no-timestamps", "omit timestamps in transcript")
   .action(async (tool: string | undefined, json: string | undefined, opts: Record<string, unknown>) => {
-    // Bare `sana-mcp` (no tool, no flags) opens the interactive configurer.
+    // Bare `sana-mcp` (no tool, no flags) opens the interactive meeting app.
     const bareInvocation =
       !tool &&
       !json &&

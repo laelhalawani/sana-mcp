@@ -42,6 +42,7 @@ test("configurer prompt runtime uses injected streams and shared ASCII/no-color 
   const context = presentation.promptContext();
   assert.equal(context.input, input);
   assert.equal(context.output, output);
+  assert.equal(context.clearPromptOnDone, true);
 
   const theme = presentation.promptTheme();
   assert.deepEqual(theme.spinner.frames, ["-", "\\", "|", "/"]);

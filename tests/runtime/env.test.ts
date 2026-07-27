@@ -14,7 +14,7 @@ describe("runtime environment", () => {
       dataDir: undefined,
       transcriptsDir: undefined,
       baseUrl: RUNTIME_DEFAULTS.baseUrl,
-      maxTranscriptAttempts: RUNTIME_DEFAULTS.maxTranscriptAttempts,
+      maxRetryDelayAttempts: RUNTIME_DEFAULTS.maxRetryDelayAttempts,
       countWaitMs: RUNTIME_DEFAULTS.countWaitMs,
       syncIntervalMs: RUNTIME_DEFAULTS.syncIntervalMs,
       requestDelayMs: RUNTIME_DEFAULTS.requestDelayMs,

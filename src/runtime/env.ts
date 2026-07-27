@@ -8,7 +8,7 @@ import { resolveCanonicalAbsoluteDirectory } from "./home.js";
  */
 export const RUNTIME_DEFAULTS = Object.freeze({
   baseUrl: "https://sana.ai",
-  maxTranscriptAttempts: 5,
+  maxRetryDelayAttempts: 5,
   countWaitMs: 30_000,
   syncIntervalMs: 10 * 60_000,
   requestDelayMs: 150,
@@ -34,7 +34,8 @@ export class EnvironmentConfigError extends Error {
 
 export interface RuntimeSettings {
   readonly baseUrl: string;
-  readonly maxTranscriptAttempts: number;
+  /** Number of failures before the retry delay stops increasing. */
+  readonly maxRetryDelayAttempts: number;
   readonly countWaitMs: number;
   readonly syncIntervalMs: number;
   readonly requestDelayMs: number;
@@ -232,10 +233,10 @@ function parseRuntimeSettings(
   const embedModel = nonEmpty(source, "SANA_EMBED_MODEL") ?? RUNTIME_DEFAULTS.embedModel;
   return Object.freeze({
     baseUrl: origin(source),
-    maxTranscriptAttempts: integer(
+    maxRetryDelayAttempts: integer(
       source,
       "SANA_MAX_ATTEMPTS",
-      RUNTIME_DEFAULTS.maxTranscriptAttempts,
+      RUNTIME_DEFAULTS.maxRetryDelayAttempts,
       1,
       100,
     ),

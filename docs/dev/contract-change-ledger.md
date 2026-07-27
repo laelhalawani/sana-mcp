@@ -48,6 +48,34 @@ Accepted argument aliases are `login.code` → `login.confirmation_code` and
 
 ## Approved changes
 
+### 2026-07-27 — truthful artifact retry and sync status
+
+- Affected surface: `list`, `login`, and `status`; list help, documented list
+  semantics, representative outputs, and authentication-transition fixtures.
+- Old list behavior: `ready` required only a transcript, `failed` represented a
+  terminal attempt cap, and source processing was not an accepted filter even
+  though it could appear in rows.
+- New list behavior: `ready` requires transcript and metadata; the explicit
+  meeting status and filter `failed` becomes `retrying`; `processing` is an
+  accepted status and filter; `downloading` identifies source-ready incomplete
+  meetings without retry history. Attempt history changes retry delay only and
+  never makes a meeting terminal.
+- Old status behavior: a cleared cache block was rendered as fully up to date,
+  persisted progress could count complete meetings instead of actual transcript
+  rows, and login could call a safe partial cache complete.
+- New status behavior: only phase `synced` with no pending artifacts says up to
+  date or complete. A current partial cache is explicitly available while its
+  remaining meetings continue syncing. Transcript progress uses actual stored
+  transcript rows, while pending work includes every meeting missing transcript
+  or metadata, including source-processing meetings.
+- Reason: retry timing, cache safety, artifact completeness, and full sync
+  completion are distinct states. Combining them hid indefinitely retryable
+  work and overstated both meeting readiness and login completion.
+- Approval: approved minimal sync/retry/status contract scope.
+- Reverified unchanged: public tool names and aliases; meeting identifiers;
+  date, pagination, and sort meanings; Markdown table columns; read/search
+  navigation; and Markdown/free-text with optional YAML frontmatter.
+
 ### 2026-07-25 — separate human one-shot CLI presentation from agent output
 
 - Affected surface: human `sana-mcp <command>` output only.
@@ -328,7 +356,7 @@ separate margin. A focused timeout probe freezes this cancellation path, so an
 in-process build cannot outlive test cleanup.
 
 The behavioral baseline covers deterministic status; list query, ready,
-downloading and failed filters, ISO/epoch date bounds, pagination, and oldest
+downloading and retrying filters, ISO/epoch date bounds, pagination, and oldest
 sort; read full/range/no-selection/timestamp behavior; search best/oldest sorts,
 pagination/navigation, and ISO/epoch date bounds; summary; participants;
 recording failure/missing-ID handling; tool aliases; meeting-ID argument

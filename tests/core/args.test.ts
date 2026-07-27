@@ -45,6 +45,12 @@ describe("open-record MCP argument validation", () => {
       dateFrom: Date.parse("2026-01-03T00:00:00Z"),
       dateTo: Date.parse("2026-01-04T00:00:00Z") - 1,
     });
+    expect(parseFilters({ filter: { status: "processing" } })).toEqual({
+      status: "processing",
+    });
+    expect(parseFilters({ filter: { status: "retrying" } })).toEqual({
+      status: "retrying",
+    });
     expect(
       parseFilters({
         filter: {
@@ -56,7 +62,7 @@ describe("open-record MCP argument validation", () => {
     invalid(() => parseFilters({ filter: null }), "filter");
     invalid(() => parseFilters({ filter: [] }), "filter");
     invalid(
-      () => parseFilters({ filter: { status: "processing" } }),
+      () => parseFilters({ filter: { status: "failed" } }),
       "filter.status",
     );
     invalid(
