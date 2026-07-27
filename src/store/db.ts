@@ -1047,8 +1047,6 @@ export class SanaStore {
         };
       }
       if (current.auth_transition_token !== null) {
-        const observedPending =
-          pendingTupleMatches(current, source);
         if (
           current.auth_transition_pid !== null &&
           ownerAlive(current.auth_transition_pid)
@@ -1057,14 +1055,20 @@ export class SanaStore {
             kind: "busy",
             ownerPid: current.auth_transition_pid,
           };
-        } else if (observedPending) {
+        }
+        const recovery = interruptedPublicationRecovery(current, source);
+        if (recovery === "target") {
           // Recovery is allowed only after the recorded owner is absent/dead.
           // A live publisher is the only actor allowed to explicitly confirm.
           this.confirmAuthPublicationRow(current, Date.now());
           current = this.getSyncState();
         } else if (
-          confirmedTupleMatches(current, source)
+          recovery === "source" &&
+          current.auth_transition_kind === "request-code"
         ) {
+          this.abortRequestCodePublicationRow(current, Date.now());
+          current = this.getSyncState();
+        } else if (recovery === "source") {
           const abandonedLogin = current.auth_transition_kind === "login";
           this.db
             .prepare(
@@ -1120,6 +1124,18 @@ export class SanaStore {
         }
       }
 
+      if (
+        publicationKind === "request-code" &&
+        current.auth_issue_code !== null
+      ) {
+        return {
+          kind: "incomplete",
+          code: current.auth_issue_code,
+          message:
+            current.auth_issue_message ??
+            "Authentication transition is incomplete",
+        };
+      }
       if (
         source.generation < current.auth_generation
       ) {
@@ -1279,6 +1295,38 @@ export class SanaStore {
   ): "released" | "not-current" {
     validateIssue(code, message);
     assertNonNegativeSafeInteger(now, "now");
+    if (intent.kind === "request-code") {
+      const result = this.db
+        .prepare(
+          `UPDATE sync_state
+           SET auth_transition_pid = NULL,
+               updated_ms = @updated_ms
+           WHERE id = 1
+             AND auth_transition_token = @operation_token
+             AND auth_transition_generation = @target_generation
+             AND auth_transition_pid = @owner_pid
+             AND auth_transition_kind = 'request-code'
+             AND auth_transition_user_id IS @transition_user_id
+             AND auth_transition_workspace_id IS @transition_workspace_id
+             AND auth_generation = @source_generation
+             AND auth_publication_token IS @source_publication_token
+             AND auth_user_id IS @source_user_id
+             AND auth_workspace_id IS @source_workspace_id`,
+        )
+        .run({
+          updated_ms: now,
+          operation_token: intent.operationToken,
+          target_generation: intent.targetGeneration,
+          owner_pid: intent.ownerPid,
+          transition_user_id: intent.userId,
+          transition_workspace_id: intent.workspaceId,
+          source_generation: intent.sourceGeneration,
+          source_publication_token: intent.sourcePublicationToken,
+          source_user_id: intent.sourceUserId,
+          source_workspace_id: intent.sourceWorkspaceId,
+        });
+      return result.changes === 1 ? "released" : "not-current";
+    }
     const result = this.db
       .prepare(
         `UPDATE sync_state
@@ -1353,13 +1401,19 @@ export class SanaStore {
             code: "AUTH_PUBLICATION_IN_PROGRESS",
             message: "Another local session publication is still in progress",
           };
-        } else if (pendingTupleMatches(state, observed)) {
+        }
+        const recovery = interruptedPublicationRecovery(state, observed);
+        if (recovery === "target") {
           // Only a dead/absent owner's durable file may be recovered here.
           this.confirmAuthPublicationRow(state, Date.now());
           state = this.getSyncState();
         } else if (
-          confirmedTupleMatches(state, observed)
+          recovery === "source" &&
+          state.auth_transition_kind === "request-code"
         ) {
+          this.abortRequestCodePublicationRow(state, Date.now());
+          state = this.getSyncState();
+        } else if (recovery === "source") {
           const message =
             "A session publication stopped before persistence; sign in again.";
           this.db
@@ -1774,6 +1828,7 @@ export class SanaStore {
       throw new Error("Authentication publication transition is incomplete");
     }
     const login = state.auth_transition_kind === "login";
+    const requestCode = state.auth_transition_kind === "request-code";
     const clearsOwnIssue =
       state.auth_issue_operation_token === state.auth_transition_token &&
       state.auth_issue_generation === state.auth_transition_generation &&
@@ -1798,7 +1853,7 @@ export class SanaStore {
                ELSE message END,
              error = CASE WHEN @login = 1 THEN NULL ELSE error END,
              blocking = CASE
-               WHEN @login = 1
+               WHEN @login = 1 OR @request_code = 1
                  OR auth_transition_user_id IS NOT cache_user_id
                  OR auth_transition_workspace_id IS NOT cache_workspace_id
                THEN 1 ELSE blocking END,
@@ -1823,7 +1878,53 @@ export class SanaStore {
         confirmed_generation: state.auth_transition_generation,
         confirmed_token: state.auth_transition_token,
         login: login ? 1 : 0,
+        request_code: requestCode ? 1 : 0,
         clears_issue: clearsIssue ? 1 : 0,
+        updated_ms: now,
+      });
+  }
+
+  private abortRequestCodePublicationRow(state: SyncState, now: number): void {
+    if (
+      state.auth_transition_token === null ||
+      state.auth_transition_generation === null ||
+      state.auth_transition_kind !== "request-code"
+    ) {
+      throw new Error("Request-code publication transition is incomplete");
+    }
+    const clearsOwnIssue =
+      state.auth_issue_code !== null &&
+      state.auth_issue_operation_token === state.auth_transition_token &&
+      state.auth_issue_generation === state.auth_transition_generation &&
+      state.auth_issue_kind === "request-code";
+    this.db
+      .prepare(
+        `UPDATE sync_state
+         SET auth_transition_pid = NULL,
+             auth_transition_token = NULL,
+             auth_transition_generation = NULL,
+             auth_transition_kind = NULL,
+             auth_transition_user_id = NULL,
+             auth_transition_workspace_id = NULL,
+             auth_pending = CASE
+               WHEN @clears_own_issue = 1 THEN 0 ELSE auth_pending END,
+             auth_issue_code = CASE
+               WHEN @clears_own_issue = 1 THEN NULL ELSE auth_issue_code END,
+             auth_issue_message = CASE
+               WHEN @clears_own_issue = 1 THEN NULL ELSE auth_issue_message END,
+             auth_issue_operation_token = CASE
+               WHEN @clears_own_issue = 1
+               THEN NULL ELSE auth_issue_operation_token END,
+             auth_issue_generation = CASE
+               WHEN @clears_own_issue = 1
+               THEN NULL ELSE auth_issue_generation END,
+             auth_issue_kind = CASE
+               WHEN @clears_own_issue = 1 THEN NULL ELSE auth_issue_kind END,
+             updated_ms = @updated_ms
+         WHERE id = 1`,
+      )
+      .run({
+        clears_own_issue: clearsOwnIssue ? 1 : 0,
         updated_ms: now,
       });
   }
@@ -2037,6 +2138,15 @@ function pendingTupleMatches(
   );
 }
 
+function interruptedPublicationRecovery(
+  state: SyncState,
+  observed: SessionVersion,
+): "target" | "source" | "mismatch" {
+  if (pendingTupleMatches(state, observed)) return "target";
+  if (confirmedTupleMatches(state, observed)) return "source";
+  return "mismatch";
+}
+
 function authStateInvariantIssue(state: SyncState): string | null {
   if (
     (state.blocking !== 0 && state.blocking !== 1) ||
@@ -2082,7 +2192,9 @@ function authStateInvariantIssue(state: SyncState): string | null {
   if (transitionPresent) {
     if (
       (state.auth_transition_pid === null
-        ? state.auth_issue_code === null
+        ? state.auth_issue_code === null &&
+          (state.auth_transition_kind !== "request-code" ||
+            state.auth_pending !== 0)
         : !Number.isSafeInteger(state.auth_transition_pid) ||
           state.auth_transition_pid <= 0) ||
       state.auth_transition_generation !== state.auth_generation + 1 ||

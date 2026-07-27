@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing package-matching tag to release (for example v0.4.5)"
+        description: "Existing package-matching tag to release (for example v0.4.6)"
         required: true
         type: string
 
@@ -44,8 +44,35 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
           REQUESTED_TAG: ${{ inputs.tag }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_SERVER_URL" != "https://github.com" ] ||
+             [ "$GITHUB_API_URL" != "https://api.github.com" ]; then
+            echo "This release workflow has no reviewed GitHub host authority for the active context." >&2
+            exit 1
+          fi
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          if [ -z "$repository_owner" ] ||
+             [ -z "$repository_name" ] ||
+             [ "$repository_owner" = "$GITHUB_REPOSITORY" ] ||
+             [ "$repository_name" = "." ] ||
+             [ "$repository_name" = ".." ] ||
+             [ "$repository_owner" = "." ] ||
+             [ "$repository_owner" = ".." ]; then
+            echo "GitHub did not provide an exact repository authority." >&2
+            exit 1
+          fi
+          case "$repository_owner$repository_name" in
+            *[!A-Za-z0-9_.-]*)
+              echo "GitHub repository authority contains unsupported characters." >&2
+              exit 1
+              ;;
+          esac
+          export GH_HOST=github.com
           package_tag="v$(bun -e 'import p from "./package.json"; process.stdout.write(p.version)')"
           source_sha="$(git rev-parse HEAD)"
           test "${#source_sha}" -eq 40 ||
@@ -73,6 +100,7 @@ jobs:
             : > "$error_file"
             if ! ref_object=$(
               gh api \
+                --hostname github.com \
                 "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name" \
                 --jq '.object.type + " " + .object.sha' 2> "$error_file"
             ); then
@@ -86,6 +114,7 @@ jobs:
             if [ "$object_type" = "tag" ]; then
               if ! tag_object=$(
                 gh api \
+                  --hostname github.com \
                   "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
                   --jq '.object.type + " " + .object.sha' 2>> "$error_file"
               ); then
@@ -144,6 +173,24 @@ jobs:
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "create_tag=$create_tag" >> "$GITHUB_OUTPUT"
 
+  quality:
+    needs: authorize
+    if: needs.authorize.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile --no-progress
+      - name: Run the full quality gate
+        run: bun run check
+
   linux:
     needs: authorize
     if: needs.authorize.outputs.skip != 'true'
@@ -191,23 +238,49 @@ jobs:
         run: |
           set -euo pipefail
           chmod 755 "$ASSET"
+          EXECUTION_DIR="$(mktemp -d)"
+          chmod 700 "$EXECUTION_DIR"
+          trap 'chmod -R u+w "$EXECUTION_DIR"; find "$EXECUTION_DIR" -depth -delete' EXIT
+          EXECUTION_ASSET="$EXECUTION_DIR/artifact"
+          install -m 500 "$ASSET" "$EXECUTION_ASSET"
+          PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
           if [ "$LIBC" = musl ]; then
-            docker run --rm -v "$PWD:/work:ro" -w /work \
+            EXECUTED_SHA256="$(sha256sum "$EXECUTION_ASSET" | awk '{print $1}')"
+            docker run --rm -v "$EXECUTION_ASSET:/execution/artifact:ro" -w /execution \
+              -e "EXPECTED_SHA256=$EXECUTED_SHA256" \
               alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
               sh -eu -c \
               'apk add --no-cache libstdc++ libgcc >/dev/null
+              [ "$(sha256sum "$1" | awk "{print \$1}")" = "$EXPECTED_SHA256" ]
+              [ "$("$1" --version)" = "$2" ]
               "$1" __inspect --format json
-              "$1" --help >/dev/null' \
-              sh "/work/$ASSET" > "inspect-$TARGET.json"
+              "$1" --help >/dev/null
+              [ "$(sha256sum "$1" | awk "{print \$1}")" = "$EXPECTED_SHA256" ]' \
+              sh "/execution/artifact" "$PACKAGE_VERSION" > "inspect-$TARGET.json"
           else
-            "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
-            "./$ASSET" --help >/dev/null
+            exec 9<"$EXECUTION_ASSET"
+            EXECUTION_HANDLE="/proc/self/fd/9"
+            EXECUTED_SHA256="$(sha256sum "$EXECUTION_HANDLE" | awk '{print $1}')"
+            [ "$("$EXECUTION_HANDLE" --version)" = "$PACKAGE_VERSION" ]
+            "$EXECUTION_HANDLE" __inspect --format json > "inspect-$TARGET.json"
+            "$EXECUTION_HANDLE" --help >/dev/null
+            POST_EXECUTION_SHA256="$(sha256sum "$EXECUTION_HANDLE" | awk '{print $1}')"
+          fi
+          if [ "$LIBC" != musl ] &&
+             [ "$POST_EXECUTION_SHA256" != "$EXECUTED_SHA256" ]; then
+            echo "Private execution snapshot changed during smoke checks." >&2
+            exit 1
+          fi
+          if [ "$(sha256sum "$ASSET" | awk '{print $1}')" != "$EXECUTED_SHA256" ]; then
+            echo "Release artifact differs from the executed snapshot." >&2
+            exit 1
           fi
           bun scripts/release.ts attest \
             --target "$TARGET" \
             --artifact "$ASSET" \
             --inspect-file "inspect-$TARGET.json" \
             --commit-sha "$SOURCE_SHA" \
+            --executed-sha256 "$EXECUTED_SHA256" \
             --output "attestation-$TARGET.json"
       # actions/upload-artifact v4.6.2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -255,13 +328,50 @@ jobs:
         run: |
           set -euo pipefail
           chmod 755 "$ASSET"
-          "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
-          "./$ASSET" --help >/dev/null
+          EXECUTION_DIR="$(mktemp -d)"
+          chmod 700 "$EXECUTION_DIR"
+          trap 'chmod -R u+w "$EXECUTION_DIR"; find "$EXECUTION_DIR" -depth -delete' EXIT
+          EXECUTION_ASSET="$EXECUTION_DIR/artifact"
+          install -m 500 "$ASSET" "$EXECUTION_ASSET"
+          exec 9<"$EXECUTION_ASSET"
+          EXECUTION_HANDLE="/dev/fd/9"
+          reset_execution_handle() {
+            perl -e '
+              use Fcntl qw(SEEK_SET);
+              defined(sysseek(STDIN, 0, SEEK_SET)) or die "descriptor seek failed: $!\n";
+            ' <&9
+          }
+          reset_execution_handle
+          EXECUTED_SHA256="$(shasum -a 256 "$EXECUTION_HANDLE" | awk '{print $1}')"
+          # Replace the private snapshot pathname after acquiring its descriptor.
+          # Every consumer below must continue to observe the descriptor-bound
+          # executable, never the replacement pathname.
+          install -m 500 /usr/bin/false "$EXECUTION_ASSET.replacement"
+          mv -f "$EXECUTION_ASSET.replacement" "$EXECUTION_ASSET"
+          test "$(shasum -a 256 "$EXECUTION_ASSET" | awk '{print $1}')" != "$EXECUTED_SHA256"
+          PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
+          reset_execution_handle
+          [ "$("$EXECUTION_HANDLE" --version)" = "$PACKAGE_VERSION" ]
+          reset_execution_handle
+          "$EXECUTION_HANDLE" __inspect --format json > "inspect-$TARGET.json"
+          reset_execution_handle
+          "$EXECUTION_HANDLE" --help >/dev/null
+          reset_execution_handle
+          POST_EXECUTION_SHA256="$(shasum -a 256 "$EXECUTION_HANDLE" | awk '{print $1}')"
+          if [ "$POST_EXECUTION_SHA256" != "$EXECUTED_SHA256" ]; then
+            echo "Private execution snapshot changed during smoke checks." >&2
+            exit 1
+          fi
+          if [ "$(shasum -a 256 "$ASSET" | awk '{print $1}')" != "$EXECUTED_SHA256" ]; then
+            echo "Release artifact differs from the executed snapshot." >&2
+            exit 1
+          fi
           bun scripts/release.ts attest \
             --target "$TARGET" \
             --artifact "$ASSET" \
             --inspect-file "inspect-$TARGET.json" \
             --commit-sha "$SOURCE_SHA" \
+            --executed-sha256 "$EXECUTED_SHA256" \
             --output "attestation-$TARGET.json"
       # actions/upload-artifact v4.6.2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -289,13 +399,6 @@ jobs:
         with:
           bun-version: "1.3.14"
       - run: bun install --frozen-lockfile --no-progress
-      - name: Build through canonical release configuration
-        run: bun scripts/release.ts build --target bun-windows-x64 --outfile sana-mcp-windows-x64.exe
-      - name: Exercise the full native Windows installer replacement
-        env:
-          SANA_MCP_TEST_CURRENT_WINDOWS_BINARY: ${{ github.workspace }}\sana-mcp-windows-x64.exe
-          SANA_MCP_TEST_SOURCE_COMMIT: ${{ needs.authorize.outputs.sha }}
-        run: bun test tests/install/installers.test.ts --test-name-pattern "Windows full installer replaces an active receipt-backed v0.4.4 mcp runtime"
       - name: Validate the Windows installer syntax
         shell: powershell
         run: |
@@ -310,23 +413,257 @@ jobs:
             $Errors | ForEach-Object { Write-Error $_.Message }
             exit 1
           }
-      - name: Execute inspect and smoke check
-        shell: pwsh
+      - name: Run native Windows regression suite
+        run: bun test --parallel=1 --timeout 120000 tests/app/runtime.test.ts tests/core/status-auth.test.ts tests/install/apply.test.ts tests/install/atomic-config.test.ts tests/install/clients.test.ts tests/install/config-formats.test.ts tests/install/configurer-flow.test.ts tests/install/status.test.ts tests/install/writers.test.ts tests/runtime/build-info.test.ts tests/runtime/secure-session.test.ts tests/runtime/secure-store.test.ts tests/runtime/windows-acl.test.ts tests/sana/client.test.ts tests/sana/auth-request.test.ts tests/sana/auth.test.ts tests/sana/auth-e2e.test.ts tests/sana/session-publication.test.ts tests/sync/control.test.ts tests/sync/daemon.test.ts tests/sync/lifecycle.test.ts tests/tools/dispatch-auth.test.ts tests/install/config-transaction.test.ts tests/install/config-transaction-flow.test.ts
+      - name: Exercise exact-path Windows runtime replacement
+        run: bun test --parallel=1 --timeout 30000 tests/install/installers.test.ts --test-name-pattern "PowerShell retires an active exact-path runtime"
+      - name: Build through canonical release configuration
+        run: bun scripts/release.ts build --target bun-windows-x64 --outfile sana-mcp-windows-x64.exe
+      - name: Run tokenless native PowerShell smoke and attest
+        shell: powershell
         env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
           SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
         run: |
-          & .\sana-mcp-windows-x64.exe __inspect --format json |
-            Set-Content -LiteralPath inspect-bun-windows-x64.json -Encoding utf8
-          if ($LASTEXITCODE -ne 0) { throw "Standalone inspect failed: $LASTEXITCODE" }
-          & .\sana-mcp-windows-x64.exe --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "Standalone smoke check failed: $LASTEXITCODE" }
-          bun scripts/release.ts attest `
-            --target bun-windows-x64 `
-            --artifact sana-mcp-windows-x64.exe `
-            --inspect-file inspect-bun-windows-x64.json `
-            --commit-sha $env:SOURCE_SHA `
-            --output attestation-bun-windows-x64.json
-          if ($LASTEXITCODE -ne 0) { throw "Attestation failed: $LASTEXITCODE" }
+          $ErrorActionPreference = "Stop"
+          $Binary = Join-Path $PWD "sana-mcp-windows-x64.exe"
+          $PackageVersion = (Get-Content -LiteralPath (Join-Path $PWD "package.json") -Raw |
+            ConvertFrom-Json).version
+          $InspectPath = Join-Path $PWD "inspect-bun-windows-x64.json"
+          $AttestationPath = Join-Path $PWD "attestation-bun-windows-x64.json"
+          $BinaryLease = [IO.File]::Open(
+            $Binary,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+          )
+          try {
+            $Hasher = [Security.Cryptography.SHA256]::Create()
+            try {
+              $ExecutedSha256 = [BitConverter]::ToString(
+                $Hasher.ComputeHash($BinaryLease)
+              ).Replace("-", "").ToLowerInvariant()
+            } finally {
+              $Hasher.Dispose()
+            }
+
+            $ObservedVersion = (& $Binary --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $ObservedVersion -cne $PackageVersion) {
+              throw "Standalone version mismatch: expected $PackageVersion, received $ObservedVersion."
+            }
+            $InspectJson = (& $Binary __inspect --format json | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "Standalone inspect failed: $LASTEXITCODE"
+            }
+            [IO.File]::WriteAllText(
+              $InspectPath,
+              $InspectJson + "`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            $Inspect = $InspectJson | ConvertFrom-Json
+            $InspectNames = @($Inspect.PSObject.Properties.Name | Sort-Object)
+            $ExpectedNames = @(
+              "inspectProtocol",
+              "installerProtocol",
+              "lifecycleProtocol",
+              "mode",
+              "semanticCapability",
+              "standalone",
+              "stateCompatibility",
+              "target",
+              "version"
+            ) | Sort-Object
+            if ((Compare-Object $ExpectedNames $InspectNames).Count -ne 0 -or
+                $Inspect.mode -cne "standalone" -or
+                $Inspect.standalone -cne $true -or
+                $Inspect.version -cne $PackageVersion -or
+                $Inspect.target -cne "bun-windows-x64" -or
+                $Inspect.installerProtocol -ne 1 -or
+                $Inspect.lifecycleProtocol -ne 1 -or
+                $Inspect.inspectProtocol -ne 1 -or
+                $Inspect.stateCompatibility -ne 1 -or
+                $Inspect.semanticCapability -cne "keyword") {
+              throw "Standalone inspect tuple is not the exact Windows release identity."
+            }
+            & $Binary --help | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Standalone help smoke check failed: $LASTEXITCODE"
+            }
+
+            $BinaryLease.Position = 0
+            $Hasher = [Security.Cryptography.SHA256]::Create()
+            try {
+              $PostExecutionSha256 = [BitConverter]::ToString(
+                $Hasher.ComputeHash($BinaryLease)
+              ).Replace("-", "").ToLowerInvariant()
+            } finally {
+              $Hasher.Dispose()
+            }
+            if ($PostExecutionSha256 -cne $ExecutedSha256) {
+              throw "Release artifact changed while executing smoke checks."
+            }
+            $AttestArguments = @(
+              "scripts/release.ts",
+              "attest",
+              "--target", "bun-windows-x64",
+              "--artifact", $Binary,
+              "--inspect-file", $InspectPath,
+              "--commit-sha", $env:SOURCE_SHA,
+              "--executed-sha256", $ExecutedSha256,
+              "--output", $AttestationPath
+            )
+            & bun @AttestArguments
+            if ($LASTEXITCODE -ne 0 -or
+                -not (Test-Path -LiteralPath $AttestationPath -PathType Leaf)) {
+              throw "Attestation creation failed: $LASTEXITCODE"
+            }
+          } finally {
+            $BinaryLease.Dispose()
+          }
+          $Attestation = Get-Content -LiteralPath $AttestationPath -Raw |
+            ConvertFrom-Json
+          if ($Attestation.sourceCommit -cne $env:SOURCE_SHA -or
+              $Attestation.sha256 -cne $ExecutedSha256 -or
+              $Attestation.inspect.target -cne "bun-windows-x64" -or
+              $Attestation.inspect.version -cne $PackageVersion) {
+            throw "Attestation is not bound to the authorized Windows tuple."
+          }
+      - id: predecessor
+        name: Fetch the authenticated v0.4.5 Windows fixture
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREDECESSOR_TAG: v0.4.5
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($Required in @(
+            "RUNNER_TEMP",
+            "GITHUB_RUN_ID",
+            "GITHUB_RUN_ATTEMPT",
+            "GITHUB_REPOSITORY",
+            "GITHUB_OUTPUT"
+          )) {
+            $Value = [Environment]::GetEnvironmentVariable($Required)
+            if ([string]::IsNullOrWhiteSpace($Value)) {
+              throw "GitHub Actions did not provide $Required."
+            }
+          }
+          if ($env:GITHUB_RUN_ID -cnotmatch '^[1-9][0-9]*$' -or
+              $env:GITHUB_RUN_ATTEMPT -cnotmatch '^[1-9][0-9]*$') {
+            throw "GitHub Actions provided an invalid run identity."
+          }
+          $RunnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $RunnerTempItem = Get-Item -LiteralPath $RunnerTemp -Force
+          if (-not $RunnerTempItem.PSIsContainer -or
+              ($RunnerTempItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "GitHub Actions runner temp is not an ordinary directory."
+          }
+          $FixtureLeaf = "sana-mcp-predecessor-v0.4.5-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
+          $Fixture = Join-Path $RunnerTemp $FixtureLeaf
+          if (Test-Path -LiteralPath $Fixture) {
+            throw "The predecessor fixture path already exists."
+          }
+          $ExpectedAssets = @(
+            "manifest.json",
+            "manifest.json.sha256",
+            "sana-mcp-windows-x64.exe",
+            "sana-mcp-windows-x64.exe.sha256"
+          )
+          [IO.Directory]::CreateDirectory($Fixture) | Out-Null
+          try {
+            $DownloadArguments = @(
+              "release",
+              "download",
+              $env:PREDECESSOR_TAG,
+              "--repo",
+              $env:GITHUB_REPOSITORY,
+              "--dir",
+              $Fixture
+            )
+            foreach ($Asset in $ExpectedAssets) {
+              $DownloadArguments += @("--pattern", $Asset)
+            }
+            & gh @DownloadArguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticated predecessor fixture download failed with exit code $LASTEXITCODE."
+            }
+            $Observed = @(Get-ChildItem -LiteralPath $Fixture -Force)
+            if ($Observed.Count -ne $ExpectedAssets.Count) {
+              throw "The predecessor fixture asset count is incorrect."
+            }
+            foreach ($Item in $Observed) {
+              if ($Item.PSIsContainer -or
+                  ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  $ExpectedAssets -cnotcontains $Item.Name) {
+                throw "The predecessor fixture contains an unexpected entry: $($Item.Name)"
+              }
+            }
+            foreach ($Asset in $ExpectedAssets) {
+              if (-not (Test-Path -LiteralPath (Join-Path $Fixture $Asset) -PathType Leaf)) {
+                throw "The predecessor fixture is missing $Asset."
+              }
+            }
+            "directory=$Fixture" | Out-File -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } catch {
+            if (Test-Path -LiteralPath $Fixture) {
+              $FixtureItem = Get-Item -LiteralPath $Fixture -Force
+              if ($FixtureItem.PSIsContainer -and
+                  ($FixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                Remove-Item -LiteralPath $Fixture -Recurse -Force
+              }
+            }
+            throw
+          }
+      - name: Exercise the full native Windows installer replacement
+        env:
+          SANA_MCP_TEST_CURRENT_WINDOWS_BINARY: ${{ github.workspace }}\sana-mcp-windows-x64.exe
+          SANA_MCP_TEST_SOURCE_COMMIT: ${{ needs.authorize.outputs.sha }}
+          SANA_MCP_TEST_PREDECESSOR_WINDOWS_FIXTURE_DIR: ${{ steps.predecessor.outputs.directory }}
+        run: bun test tests/install/installers.test.ts --test-name-pattern "Windows full installer replaces an active receipt-backed v0.4.5 mcp runtime"
+      - name: Remove the authenticated predecessor fixture
+        if: ${{ always() && steps.predecessor.outputs.directory != '' }}
+        shell: powershell
+        env:
+          PREDECESSOR_FIXTURE: ${{ steps.predecessor.outputs.directory }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($Required in @(
+            "RUNNER_TEMP",
+            "GITHUB_RUN_ID",
+            "GITHUB_RUN_ATTEMPT",
+            "PREDECESSOR_FIXTURE"
+          )) {
+            $Value = [Environment]::GetEnvironmentVariable($Required)
+            if ([string]::IsNullOrWhiteSpace($Value)) {
+              throw "GitHub Actions did not provide $Required for fixture cleanup."
+            }
+          }
+          if ($env:GITHUB_RUN_ID -cnotmatch '^[1-9][0-9]*$' -or
+              $env:GITHUB_RUN_ATTEMPT -cnotmatch '^[1-9][0-9]*$') {
+            throw "GitHub Actions provided an invalid cleanup run identity."
+          }
+          $RunnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $Expected = [IO.Path]::GetFullPath((Join-Path $RunnerTemp "sana-mcp-predecessor-v0.4.5-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"))
+          $Fixture = [IO.Path]::GetFullPath($env:PREDECESSOR_FIXTURE)
+          if (-not [string]::Equals(
+            $Fixture,
+            $Expected,
+            [StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw "The predecessor fixture cleanup path is not the authorized runner-temp child."
+          }
+          if (Test-Path -LiteralPath $Fixture) {
+            $FixtureItem = Get-Item -LiteralPath $Fixture -Force
+            if (-not $FixtureItem.PSIsContainer -or
+                ($FixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "The predecessor fixture cleanup target is not an ordinary directory."
+            }
+            Remove-Item -LiteralPath $Fixture -Recurse -Force
+          }
+          if (Test-Path -LiteralPath $Fixture) {
+            throw "The predecessor fixture cleanup did not remove its exact target."
+          }
       # actions/upload-artifact v4.6.2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -338,7 +675,7 @@ jobs:
             attestation-bun-windows-x64.json
 
   publish:
-    needs: [authorize, linux, macos, windows]
+    needs: [authorize, quality, linux, macos, windows]
     if: needs.authorize.outputs.skip != 'true'
     concurrency:
       group: release-${{ needs.authorize.outputs.tag }}
@@ -382,21 +719,158 @@ jobs:
           RELEASE_TAG: ${{ needs.authorize.outputs.tag }}
           SOURCE_SHA: ${{ needs.authorize.outputs.sha }}
           CREATE_TAG: ${{ needs.authorize.outputs.create_tag }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          EXPECTED_UPLOAD_ORIGIN: ${{ github.server_url == 'https://github.com' && 'https://uploads.github.com' || '' }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_SERVER_URL" != "https://github.com" ] ||
+             [ "$GITHUB_API_URL" != "https://api.github.com" ]; then
+            echo "This release workflow has no reviewed upload-origin authority for the active GitHub context." >&2
+            exit 1
+          fi
+          test -n "$EXPECTED_UPLOAD_ORIGIN" ||
+            { echo "GitHub did not provide the reviewed upload-origin authority." >&2; exit 1; }
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          if [ -z "$repository_owner" ] ||
+             [ -z "$repository_name" ] ||
+             [ "$repository_owner" = "$GITHUB_REPOSITORY" ] ||
+             [ "$repository_name" = "." ] ||
+             [ "$repository_name" = ".." ] ||
+             [ "$repository_owner" = "." ] ||
+             [ "$repository_owner" = ".." ]; then
+            echo "GitHub did not provide an exact repository authority." >&2
+            exit 1
+          fi
+          case "$repository_owner$repository_name" in
+            *[!A-Za-z0-9_.-]*)
+              echo "GitHub repository authority contains unsupported characters." >&2
+              exit 1
+              ;;
+          esac
+          expected_upload_origin=$EXPECTED_UPLOAD_ORIGIN
+          export GH_HOST=github.com
           create_tag=$CREATE_TAG
           case "$create_tag" in
             true|false) ;;
             *) echo "CREATE_TAG must be exactly true or false." >&2; exit 1 ;;
           esac
           publish_work="$(mktemp -d)"
-          trap 'find "$publish_work" -depth -delete' EXIT
+          trap 'chmod -R u+w "$publish_work"; find "$publish_work" -depth -delete' EXIT
+          authorized_assets="$publish_work/authorized-assets"
+          mkdir "$authorized_assets"
+          cp -a release-assets/. "$authorized_assets/"
+          chmod -R a-w "$authorized_assets"
+          authority_json="$publish_work/authority.json"
+          if ! bun "$GITHUB_WORKSPACE/scripts/release.ts" assembled-authority \
+            --tag "$RELEASE_TAG" \
+            --commit-sha "$SOURCE_SHA" \
+            --dir "$authorized_assets" \
+            > "$authority_json"
+          then
+            echo "Could not establish the complete assembled release authority." >&2
+            exit 1
+          fi
+          test -s "$authority_json" ||
+            { echo "Assembled release authority is empty." >&2; exit 1; }
+          authority_lines_file="$publish_work/authority-lines"
+          if ! bun -e '
+            import { readFileSync } from "node:fs";
+            import path from "node:path";
+            import { pathToFileURL } from "node:url";
+            const input = readFileSync(process.argv[1], "utf8");
+            const authority = JSON.parse(input);
+            const contract = await import(
+              pathToFileURL(
+                path.join(process.argv[2], "src/release/contract.ts"),
+              ).href
+            );
+            const expectedNames = [
+              "install.ps1",
+              "install.ps1.sha256",
+              "install.sh",
+              "install.sh.sha256",
+              "manifest.json",
+              "manifest.json.sha256",
+              "manifest.schema.json",
+              ...contract.RELEASE_TARGETS.flatMap((target) => {
+                const asset = contract.releaseAssetName(target);
+                const metadata = contract.releaseMetadataFileName(target);
+                return [
+                  `attestation-${target}.json`,
+                  asset,
+                  `${asset}.sha256`,
+                  metadata,
+                  `${metadata}.sha256`,
+                ];
+              }),
+            ].sort((left, right) => left.localeCompare(right, "en"));
+            if (
+              authority === null ||
+              typeof authority !== "object" ||
+              Array.isArray(authority) ||
+              Object.keys(authority).sort().join(",") !==
+                "authorityVersion,files,releaseTag,sourceCommit" ||
+              authority.authorityVersion !== 1 ||
+              authority.releaseTag !== process.env.RELEASE_TAG ||
+              authority.sourceCommit !== process.env.SOURCE_SHA ||
+              !Array.isArray(authority.files) ||
+              authority.files.length !== expectedNames.length ||
+              input !== `${JSON.stringify(authority)}\n`
+            ) throw new Error("assembled authority envelope is invalid");
+            for (const [index, file] of authority.files.entries()) {
+              if (
+                file === null ||
+                typeof file !== "object" ||
+                Array.isArray(file) ||
+                Object.keys(file).sort().join(",") !== "name,sha256" ||
+                file.name !== expectedNames[index] ||
+                !/^[a-f0-9]{64}$/.test(file.sha256)
+              ) throw new Error("assembled authority file tuple is invalid");
+              console.log(`${file.sha256}\t${file.name}`);
+            }
+          ' "$authority_json" "$GITHUB_WORKSPACE" > "$authority_lines_file"
+          then
+            rm -f "$authority_lines_file"
+            echo "Could not validate the complete assembled release authority." >&2
+            exit 1
+          fi
+          test -s "$authority_lines_file" ||
+            { echo "Validated assembled release inventory is empty." >&2; exit 1; }
+          local_names="$publish_work/local-names"
+          : > "$local_names"
+          declare -A expected_digests
+          declare -A asset_descriptors
+          mapfile -t authority_lines < "$authority_lines_file"
+          reset_asset_descriptor() {
+            descriptor=$1
+            perl -e '
+              use Fcntl qw(SEEK_SET);
+              defined(sysseek(STDIN, 0, SEEK_SET)) or die "descriptor seek failed: $!\n";
+            ' <&"$descriptor"
+          }
+          for authority_line in "${authority_lines[@]}"; do
+            IFS=$'\t' read -r digest asset extra <<< "$authority_line"
+            test -n "$digest" && test -n "$asset" && test -z "${extra-}" ||
+              { echo "Assembled authority line has no delimiter." >&2; exit 1; }
+            printf '%s\n' "$asset" >> "$local_names"
+            exec {asset_fd}<"$authorized_assets/$asset"
+            reset_asset_descriptor "$asset_fd"
+            descriptor_digest="$(sha256sum "/proc/self/fd/$asset_fd" | awk '{print $1}')"
+            test "$descriptor_digest" = "$digest" ||
+              { echo "Publication descriptor differs from assembled authority: $asset" >&2; exit 1; }
+            expected_digests["$asset"]=$digest
+            asset_descriptors["$asset"]=$asset_fd
+          done
           resolve_tag_commit() {
             tag_name=$1
             error_file=$2
             : > "$error_file"
             if ! ref_object=$(
               gh api \
+                --hostname github.com \
                 "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name" \
                 --jq '.object.type + " " + .object.sha' 2> "$error_file"
             ); then
@@ -410,6 +884,7 @@ jobs:
             if [ "$object_type" = "tag" ]; then
               if ! tag_object=$(
                 gh api \
+                  --hostname github.com \
                   "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
                   --jq '.object.type + " " + .object.sha' 2>> "$error_file"
               ); then
@@ -488,6 +963,7 @@ jobs:
 
             tag_create_error="$publish_work/tag-create.error"
             if ! gh api \
+              --hostname github.com \
               --method POST \
               "repos/$GITHUB_REPOSITORY/git/refs" \
               -f "ref=refs/tags/$RELEASE_TAG" \
@@ -520,16 +996,18 @@ jobs:
           release_json="$publish_work/release.json"
           release_pages="$publish_work/release-pages.json"
           release_error="$publish_work/release.error"
-          local_names="$publish_work/local-names"
+          release_validation="$publish_work/release-validation"
           remote_names="$publish_work/remote-names"
+          remote_assets="$publish_work/remote-assets"
+          verified_asset_identity="$publish_work/verified-asset-identity"
           download_dir="$publish_work/downloads"
           mkdir "$download_dir"
-          find release-assets -maxdepth 1 -type f -printf '%f\n' |
-            LC_ALL=C sort > "$local_names"
+          release_id=""
 
-          fetch_release() {
+          fetch_release_by_tag() {
             : > "$release_error"
             if ! gh api \
+              --hostname github.com \
               --paginate \
               "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
               --slurp \
@@ -554,10 +1032,10 @@ jobs:
               > "$release_json" 2> "$release_error"
           }
 
-          require_release() {
+          require_release_by_tag() {
             release_probe=1
             while :; do
-              if fetch_release; then
+              if fetch_release_by_tag; then
                 return 0
               else
                 release_status=$?
@@ -577,57 +1055,215 @@ jobs:
             exit 1
           }
 
-          validate_release_identity() {
-            mapfile -t identity < <(
-              bun -e '
-                import { readFileSync } from "node:fs";
-                const release = JSON.parse(readFileSync(process.argv[1], "utf8"));
-                console.log(release.tag_name);
-                console.log(String(release.draft));
-                console.log(release.name);
-                console.log(String(release.prerelease));
-              ' "$release_json"
-            )
-            test "${identity[0]}" = "$RELEASE_TAG" ||
-              { echo "Existing release tag does not match the requested tag" >&2; exit 1; }
+          validate_release_document() {
+            expected_id=$1
+            if ! bun -e '
+              import { readFileSync } from "node:fs";
+              const release = JSON.parse(readFileSync(process.argv[1], "utf8"));
+              const expectedId = process.argv[2];
+              const releaseTag = process.env.RELEASE_TAG;
+              const repository = process.env.GITHUB_REPOSITORY;
+              const expectedPrerelease = process.argv[3] === "true";
+              const expectedApiUrl =
+                `https://api.github.com/repos/${repository}/releases/${release?.id}`;
+              const expectedUploadUrl =
+                `${process.argv[4]}/repos/${repository}/releases/${release?.id}` +
+                "/assets{?name,label}";
+              if (
+                release === null ||
+                typeof release !== "object" ||
+                Array.isArray(release) ||
+                !Number.isSafeInteger(release.id) ||
+                release.id <= 0 ||
+                (expectedId !== "" && String(release.id) !== expectedId) ||
+                typeof release.draft !== "boolean" ||
+                typeof release.prerelease !== "boolean" ||
+                release.url !== expectedApiUrl ||
+                release.upload_url !== expectedUploadUrl ||
+                !Array.isArray(release.assets)
+              ) throw new Error("release identity document is invalid");
+              if (release.tag_name !== releaseTag) {
+                throw new Error("Existing release tag does not match the requested tag");
+              }
+              if (release.name !== releaseTag) {
+                throw new Error("Existing release title does not match the requested tag");
+              }
+              if (release.prerelease !== expectedPrerelease) {
+                throw new Error(
+                  "Existing release prerelease classification is incorrect",
+                );
+              }
+              const assetIds = new Set();
+              const assetNames = new Set();
+              for (const asset of release.assets) {
+                if (
+                  asset === null ||
+                  typeof asset !== "object" ||
+                  Array.isArray(asset) ||
+                  !Number.isSafeInteger(asset.id) ||
+                  asset.id <= 0 ||
+                  !/^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/.test(asset.name) ||
+                  asset.url !==
+                    `https://api.github.com/repos/${repository}/releases/assets/${asset.id}` ||
+                  assetIds.has(asset.id) ||
+                  assetNames.has(asset.name)
+                ) throw new Error("release asset identity document is invalid");
+                assetIds.add(asset.id);
+                assetNames.add(asset.name);
+              }
+              process.stdout.write(
+                `${release.id}\n${release.draft ? "true" : "false"}\n`,
+              );
+            ' "$release_json" "$expected_id" "$expected_prerelease" \
+              "$expected_upload_origin" > "$release_validation"
+            then
+              rm -f "$release_validation"
+              echo "Existing release identity is invalid." >&2
+              exit 1
+            fi
+            mapfile -t identity < "$release_validation"
+            test "${#identity[@]}" -eq 2 &&
+              case "${identity[0]}" in
+                *[!0-9]*|"") false ;;
+                *) true ;;
+              esac &&
+              case "${identity[1]}" in
+                true|false) true ;;
+                *) false ;;
+              esac ||
+              { echo "Release identity validation output is invalid." >&2; exit 1; }
+            observed_release_id="${identity[0]}"
             release_is_draft="${identity[1]}"
-            test "${identity[2]}" = "$RELEASE_TAG" ||
-              { echo "Existing release title does not match the requested tag" >&2; exit 1; }
-            test "${identity[3]}" = "$expected_prerelease" ||
-              { echo "Existing release prerelease classification is incorrect" >&2; exit 1; }
+          }
+
+          pin_release_identity() {
+            test -z "$release_id" ||
+              { echo "Release identity was already pinned." >&2; exit 1; }
+            validate_release_document ""
+            release_id=$observed_release_id
+          }
+
+          validate_pinned_release_identity() {
+            test -n "$release_id" ||
+              { echo "Release identity has not been pinned." >&2; exit 1; }
+            validate_release_document "$release_id"
+            test "$observed_release_id" = "$release_id" ||
+              { echo "Release identity changed concurrently." >&2; exit 1; }
+          }
+
+          fetch_pinned_release() {
+            pinned_candidate="$publish_work/release-pinned-candidate.json"
+            : > "$release_error"
+            if ! gh api \
+              --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              > "$pinned_candidate" 2> "$release_error"
+            then
+              rm -f "$pinned_candidate"
+              return 1
+            fi
+            mv "$pinned_candidate" "$release_json"
+          }
+
+          require_pinned_release() {
+            if ! fetch_pinned_release; then
+              cat "$release_error" >&2
+              echo "Pinned release id $release_id is unavailable." >&2
+              exit 1
+            fi
+            validate_pinned_release_identity
+            verify_release_tag
+          }
+
+          derive_remote_asset_identity() {
+            if ! bun -e '
+              import { readFileSync } from "node:fs";
+              const release = JSON.parse(readFileSync(process.argv[1], "utf8"));
+              for (const asset of [...release.assets].sort((left, right) =>
+                left.name.localeCompare(right.name, "en")
+              )) {
+                console.log(`${asset.id}\t${asset.name}`);
+              }
+            ' "$release_json" > "$remote_assets"
+            then
+              rm -f "$remote_assets"
+              echo "Could not derive the pinned release asset inventory." >&2
+              exit 1
+            fi
+            cut -f2 "$remote_assets" > "$remote_names"
           }
 
           verify_remote_assets() {
             require_complete=$1
-            bun -e '
-              import { readFileSync } from "node:fs";
-              const release = JSON.parse(readFileSync(process.argv[1], "utf8"));
-              for (const asset of release.assets.map((asset) => asset.name).sort()) {
-                console.log(asset);
-              }
-            ' "$release_json" > "$remote_names"
+            derive_remote_asset_identity
             find "$download_dir" -mindepth 1 -depth -delete
-            while IFS= read -r asset; do
-              test -n "$asset" || continue
+            while IFS=$'\t' read -r remote_asset_id asset extra; do
+              test -n "$remote_asset_id" && test -n "$asset" &&
+                test -z "${extra-}" ||
+                { echo "Pinned release asset tuple is invalid." >&2; exit 1; }
               case "$asset" in
                 */*|*\\*|.*) echo "Existing draft contains an unsafe asset name: $asset" >&2; exit 1 ;;
               esac
-              test -f "release-assets/$asset" ||
-                { echo "Existing release contains an unexpected asset: $asset" >&2; exit 1; }
-              gh release download "$RELEASE_TAG" \
-                --pattern "$asset" \
-                --dir "$download_dir"
-              cmp -s "release-assets/$asset" "$download_dir/$asset" ||
+              test -n "${expected_digests[$asset]-}" ||
+                { echo "Existing release asset has no immutable digest authority: $asset" >&2; exit 1; }
+              gh api \
+                --hostname github.com \
+                -H "Accept: application/octet-stream" \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$remote_asset_id" \
+                > "$download_dir/$asset"
+              test "$(sha256sum "$download_dir/$asset" | awk '{print $1}')" = "${expected_digests[$asset]}" ||
                 { echo "Existing release asset differs from the authorized tuple: $asset" >&2; exit 1; }
-            done < "$remote_names"
+            done < "$remote_assets"
             if [ "$require_complete" = "true" ]; then
               cmp -s "$local_names" "$remote_names" ||
                 { echo "Existing release does not contain the complete authorized asset set" >&2; exit 1; }
             fi
           }
 
-          if fetch_release; then
-            validate_release_identity
+          seal_verified_asset_identity() {
+            test -s "$remote_assets" ||
+              { echo "Verified release asset identity is empty." >&2; exit 1; }
+            cp "$remote_assets" "$verified_asset_identity"
+          }
+
+          require_verified_asset_identity() {
+            derive_remote_asset_identity
+            cmp -s "$verified_asset_identity" "$remote_assets" ||
+              { echo "Pinned release asset identities changed after verification." >&2; exit 1; }
+          }
+
+          contain_published_release() {
+            containment_attempt=1
+            while [ "$containment_attempt" -le 3 ]; do
+              containment_response="$publish_work/release-containment-$containment_attempt.json"
+              containment_error="$publish_work/release-containment-$containment_attempt.error"
+              if (
+                gh api \
+                  --hostname github.com \
+                  --method PATCH \
+                  "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+                  -F draft=true \
+                  > "$containment_response" 2> "$containment_error"
+                fetch_pinned_release
+                validate_pinned_release_identity
+                test "$release_is_draft" = "true" ||
+                  { echo "Pinned release id $release_id is not draft after containment." >&2; exit 1; }
+              ); then
+                return 0
+              fi
+              cat "$containment_error" >&2
+              if [ "$containment_attempt" -lt 3 ]; then
+                echo "Draft containment attempt $containment_attempt failed for pinned release id $release_id; retrying." >&2
+                sleep 1
+              fi
+              containment_attempt=$((containment_attempt + 1))
+            done
+            echo "Publication state is unknown for pinned release id $release_id. Manually return this exact release id to draft before any retry." >&2
+            return 1
+          }
+
+          if fetch_release_by_tag; then
+            pin_release_identity
           else
             release_status=$?
             if [ "$release_status" -eq 4 ]; then
@@ -636,14 +1272,15 @@ jobs:
                 prerelease=(--prerelease)
               fi
               gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
                 --verify-tag \
                 --draft \
                 --target "$SOURCE_SHA" \
                 --title "$RELEASE_TAG" \
                 "${prerelease[@]}"
               verify_release_tag
-              require_release
-              validate_release_identity
+              require_release_by_tag
+              pin_release_identity
             else
               cat "$release_error" >&2
               echo "Could not resolve release $RELEASE_TAG." >&2
@@ -651,35 +1288,97 @@ jobs:
             fi
           fi
 
-          verify_release_tag
+          require_pinned_release
 
           if [ "$release_is_draft" = "false" ]; then
-            verify_remote_assets true
-            verify_release_tag
-            echo "Release $RELEASE_TAG is already published with the authorized tuple."
-            exit 0
+            if (
+              verify_remote_assets true
+              seal_verified_asset_identity
+              require_pinned_release
+              test "$release_is_draft" = "false" ||
+                { echo "Published release became a draft concurrently." >&2; exit 1; }
+              require_verified_asset_identity
+            ); then
+              echo "Release $RELEASE_TAG is already published with the authorized tuple."
+              exit 0
+            fi
+            echo "Published release authority failed; enforcing draft containment." >&2
+            if contain_published_release; then
+              echo "Pinned release id $release_id was returned to draft containment." >&2
+            else
+              echo "Draft containment of pinned release id $release_id could not be verified." >&2
+            fi
+            exit 1
           fi
 
           verify_remote_assets false
           missing_assets=()
           while IFS= read -r asset; do
             grep -Fxq "$asset" "$remote_names" ||
-              missing_assets+=("release-assets/$asset")
+              missing_assets+=("$asset")
           done < "$local_names"
           if [ "${#missing_assets[@]}" -gt 0 ]; then
-            gh release upload "$RELEASE_TAG" "${missing_assets[@]}"
+            for asset in "${missing_assets[@]}"; do
+              asset_fd=${asset_descriptors[$asset]-}
+              test -n "$asset_fd" ||
+                { echo "Missing asset has no publication descriptor: $asset" >&2; exit 1; }
+              reset_asset_descriptor "$asset_fd"
+              test "$(sha256sum "/proc/self/fd/$asset_fd" | awk '{print $1}')" = "${expected_digests[$asset]}" ||
+                { echo "Publication descriptor changed before upload: $asset" >&2; exit 1; }
+              reset_asset_descriptor "$asset_fd"
+              bun "$GITHUB_WORKSPACE/scripts/release.ts" upload-asset \
+                --release-json "$release_json" \
+                --repository "$GITHUB_REPOSITORY" \
+                --asset-name "$asset" \
+                --fd "$asset_fd" \
+                --expected-sha256 "${expected_digests[$asset]}" \
+                --expected-origin "$expected_upload_origin"
+            done
           fi
 
-          require_release
-          validate_release_identity
+          require_pinned_release
           test "$release_is_draft" = "true" ||
             { echo "Release publication state changed concurrently" >&2; exit 1; }
           verify_remote_assets true
-          verify_release_tag
-          gh release edit "$RELEASE_TAG" --draft=false
-          require_release
-          validate_release_identity
-          test "$release_is_draft" = "false" ||
-            { echo "Release remained a draft after publication" >&2; exit 1; }
-          verify_remote_assets true
-          verify_release_tag
+          seal_verified_asset_identity
+          require_pinned_release
+          test "$release_is_draft" = "true" ||
+            { echo "Release publication state changed concurrently" >&2; exit 1; }
+          require_verified_asset_identity
+          if ! gh api \
+              --hostname github.com \
+              --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -F draft=false \
+              > "$publish_work/release-patch.json"
+          then
+            echo "Release publication update failed; enforcing draft containment." >&2
+            if contain_published_release; then
+              echo "Pinned release id $release_id was returned to draft containment." >&2
+            else
+              echo "Draft containment of pinned release id $release_id could not be verified." >&2
+            fi
+            exit 1
+          fi
+          if (
+            require_pinned_release
+            test "$release_is_draft" = "false" ||
+              { echo "Release remained a draft after publication" >&2; exit 1; }
+            require_verified_asset_identity
+            verify_remote_assets true
+            require_verified_asset_identity
+            require_pinned_release
+            test "$release_is_draft" = "false" ||
+              { echo "Published release state changed concurrently" >&2; exit 1; }
+            require_verified_asset_identity
+          ); then
+            :
+          else
+            echo "Post-publication authority failed; enforcing draft containment." >&2
+            if ( contain_published_release ); then
+              echo "Pinned release id $release_id was returned to draft containment." >&2
+            else
+              echo "Draft containment of pinned release id $release_id could not be verified." >&2
+            fi
+            exit 1
+          fi

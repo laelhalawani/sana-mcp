@@ -18,7 +18,7 @@ afterEach(() => {
   }
 });
 
-test("missing authoritative workspace never falls back to lastUsedWorkspaceId", () => {
+test("null or absent workspace uses only the validated response lastUsedWorkspaceId", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-client-"));
   roots.push(root);
   const child = spawnSync(
@@ -26,44 +26,64 @@ test("missing authoritative workspace never falls back to lastUsedWorkspaceId", 
     [
       "-e",
       `
-        const {
-          AuthoritativeWorkspaceUnavailableError,
-          SanaClient,
-        } = await import("./src/sana/client.ts");
-        globalThis.fetch = async () =>
-          new Response(
-            JSON.stringify({
-              result: {
-                data: {
-                  user: {
-                    id: "user-authoritative",
-                    email: "person@example.test",
-                    lastUsedWorkspaceId:
-                      "workspace-fallback-must-not-be-used",
-                  },
+        const fs = await import("node:fs");
+        const { SanaClient } = await import("./src/sana/client.ts");
+        const fixture = JSON.parse(
+          fs.readFileSync(
+            "./tests/fixtures/sana/user-me-workspace-null.json",
+            "utf8",
+          ),
+        );
+        if (
+          fixture.provenance?.classification !==
+            "observed-shape regression fixture" ||
+          !fixture.provenance?.limitations?.includes(
+            "No raw user.me response was captured",
+          )
+        ) {
+          throw new Error("workspace-null fixture overstated its provenance");
+        }
+        const observedShape = fixture.response;
+        const responses = [
+          observedShape,
+          {
+            result: {
+              data: {
+                user: {
+                  id: "absent-user",
+                  email: "absent@example.test",
+                  lastUsedWorkspaceId: "absent-workspace",
                 },
               },
-            }),
-            {
+            },
+          },
+        ];
+        for (const expected of [
+          {
+            userId: "synthetic-user",
+            workspaceId: "synthetic-workspace",
+            email: "synthetic@example.test",
+          },
+          {
+            userId: "absent-user",
+            workspaceId: "absent-workspace",
+            email: "absent@example.test",
+          },
+        ]) {
+          globalThis.fetch = async () =>
+            new Response(JSON.stringify(responses.shift()), {
               status: 200,
               headers: { "content-type": "application/json" },
-            },
-          );
-        const client = new SanaClient();
-        let caught;
-        try {
+            });
+          const client = new SanaClient();
           await client.me();
-        } catch (error) {
-          caught = error;
-        }
-        if (!(caught instanceof AuthoritativeWorkspaceUnavailableError)) {
-          throw caught ?? new Error("missing workspace was accepted");
-        }
-        if (
-          client.workspaceId !== undefined ||
-          client.email !== undefined
-        ) {
-          throw new Error("fallback workspace or partial identity was adopted");
+          if (
+            client.userId !== expected.userId ||
+            client.workspaceId !== expected.workspaceId ||
+            client.email !== expected.email
+          ) {
+            throw new Error("validated response workspace was not adopted");
+          }
         }
       `,
     ],
@@ -78,6 +98,42 @@ test("missing authoritative workspace never falls back to lastUsedWorkspaceId", 
       },
     },
   );
+  expect(child.status, child.stderr).toBe(0);
+});
+
+test("active response workspace wins over a differing last-used workspace", () => {
+  const child = runClientScenario(`
+    const { SanaClient } = await import("./src/sana/client.ts");
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({
+        result: {
+          data: {
+            user: {
+              id: "user-authoritative",
+              email: "person@example.test",
+              lastUsedWorkspaceId: "last-used-workspace",
+            },
+            workspace: { id: "active-workspace" },
+          },
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const client = new SanaClient({
+      cookies: {},
+      userId: "saved-user",
+      workspaceId: "saved-workspace-must-not-win",
+    });
+    await client.me();
+    if (
+      client.userId !== "user-authoritative" ||
+      client.workspaceId !== "active-workspace" ||
+      client.email !== "person@example.test"
+    ) {
+      throw new Error("active response workspace did not win");
+    }
+  `);
   expect(child.status, child.stderr).toBe(0);
 });
 
@@ -295,6 +351,13 @@ test("me restores cookies and complete client state after identity validation fa
           workspace: { id: "new-workspace" },
         },
         type: SanaResponseValidationError,
+      },
+      {
+        data: {
+          user: { id: "new-user", email: "new@example.test" },
+          workspace: null,
+        },
+        type: AuthoritativeWorkspaceUnavailableError,
       },
       {
         data: {
@@ -1011,6 +1074,74 @@ test("code request requires validated CSRF and tRPC acceptance responses", () =>
         throw error;
       }
       if (!error?.message.includes("No pending login")) throw error;
+    }
+  `);
+  expect(child.status, child.stderr).toBe(0);
+});
+
+test("request-code cookies are origin-bound only after Sana accepts the request", () => {
+  const child = runClientScenario(`
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const { SanaClient } = await import("./src/sana/client.ts");
+    const client = new SanaClient();
+    let call = 0;
+    globalThis.fetch = async () => {
+      call++;
+      if (call === 1) {
+        return new Response(
+          JSON.stringify({ csrfToken: "csrf-authoritative" }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "set-cookie":
+                "sana-ai-session=request-session; Path=/; HttpOnly",
+            },
+          },
+        );
+      }
+      return new Response(
+        JSON.stringify({ result: { data: { accepted: true } } }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    };
+    await client.requestSignInCode("person@example.test");
+    const pending = client.pendingSignInChallenge();
+    if (
+      pending?.email !== "person@example.test" ||
+      Object.keys(pending).join(",") !== "email" ||
+      !Object.isFrozen(pending)
+    ) {
+      throw new Error("pending challenge API exposed mutable or secret state");
+    }
+    client.savePublication(
+      1,
+      "11111111-1111-4111-8111-111111111111",
+    );
+    const reloaded = SanaClient.load().pendingSignInChallenge();
+    const saved = JSON.parse(
+      fs.readFileSync(
+        path.join(process.env.SANA_DATA_DIR, "session.json"),
+        "utf8",
+      ),
+    );
+    if (
+      call !== 2 ||
+      saved.authenticatedOrigin !== "https://sana.ai" ||
+      saved.cookies["sana-ai-session"] !== "request-session" ||
+      saved.pendingLogin?.email !== "person@example.test" ||
+      saved.pendingLogin?.csrfToken !== "csrf-authoritative" ||
+      reloaded?.email !== "person@example.test" ||
+      saved.userId !== undefined ||
+      saved.workspaceId !== undefined
+    ) {
+      throw new Error(
+        "accepted request-code session was not durably origin-bound and pending",
+      );
     }
   `);
   expect(child.status, child.stderr).toBe(0);

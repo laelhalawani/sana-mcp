@@ -37,6 +37,7 @@ test("status exposes and keeps a crashed authentication transition blocked", () 
 
         const client = {
           hasAuthCookie: () => true,
+          pendingSignInChallenge: () => null,
           sessionVersion: () => ({
             generation: 0,
             publicationToken: null,
@@ -97,6 +98,7 @@ test("status exposes persisted daemon startup failure cause", () => {
         );
         const client = {
           hasAuthCookie: () => false,
+          pendingSignInChallenge: () => null,
           sessionVersion: () => ({
             generation: 0,
             publicationToken: null,
@@ -147,6 +149,7 @@ test("status treats persisted authentication issues as an indivisible authoritat
         const store = new SanaStore();
         const client = {
           hasAuthCookie: () => true,
+          pendingSignInChallenge: () => null,
           sessionVersion: () => ({
             generation: 0,
             publicationToken: null,
@@ -226,6 +229,7 @@ test("current ephemeral persistence failure outranks durable issue and hides blo
         });
         const client = {
           hasAuthCookie: () => false,
+          pendingSignInChallenge: () => null,
           sessionVersion: () => ({
             generation: 0,
             publicationToken: null,
@@ -282,6 +286,7 @@ test("status returns typed retry when the paired session snapshot never stabiliz
         const clients = [
           {
             hasAuthCookie: () => false,
+            pendingSignInChallenge: () => null,
             sessionVersion: () => ({
               generation: 0,
               publicationToken: null,
@@ -291,6 +296,7 @@ test("status returns typed retry when the paired session snapshot never stabiliz
           },
           {
             hasAuthCookie: () => true,
+            pendingSignInChallenge: () => null,
             sessionVersion: () => ({
               generation: 1,
               publicationToken:
@@ -341,6 +347,7 @@ test("ephemeral sync persistence issue is exposed only for its exact auth and ca
         const store = new SanaStore();
         const client = {
           hasAuthCookie: () => false,
+          pendingSignInChallenge: () => null,
           sessionVersion: () => ({
             generation: 0,
             publicationToken: null,
@@ -398,6 +405,182 @@ test("ephemeral sync persistence issue is exposed only for its exact auth and ca
           throw new Error("matching ephemeral issue was lost");
         }
         store.close();
+      `,
+    ],
+    {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SANA_DATA_DIR: root,
+        SANA_TRANSCRIPTS_DIR: path.join(root, "transcripts"),
+        SANA_SEMANTIC: "0",
+      },
+    },
+  );
+  expect(child.status, child.stderr).toBe(0);
+});
+
+test("pending origin-change challenge blocks old-cache status and usability", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-status-pending-"));
+  roots.push(root);
+  const child = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      `
+        const { SanaClient } = await import("./src/sana/client.ts");
+        const { SanaStore } = await import("./src/store/db.ts");
+        const {
+          computeStatus,
+          sessionUsable,
+        } = await import("./src/core/status.ts");
+        const token = "11111111-1111-4111-8111-111111111111";
+        const store = new SanaStore();
+        store.updateSyncState({
+          phase: "synced",
+          blocking: 0,
+          auth_generation: 5,
+          auth_publication_token: token,
+          auth_user_id: "old-user",
+          auth_workspace_id: "old-workspace",
+          cache_user_id: "old-user",
+          cache_workspace_id: "old-workspace",
+          meetings_total: 1,
+          transcripts_total: 1,
+          transcripts_done: 1,
+          last_full_sync_ms: 100,
+          last_incremental_ms: 200,
+        });
+        store.upsertMeeting({
+          id: "old-cache-meeting",
+          name: "must remain hidden",
+          source: "sana-ai:meeting",
+          created_at_ms: 1,
+        });
+        const client = new SanaClient({
+          cookies: { "sana-ai-session": "request-session" },
+          userId: "old-user",
+          workspaceId: "old-workspace",
+          generation: 5,
+          publicationToken: token,
+          authenticatedOrigin: "https://sana.ai",
+          pendingLogin: {
+            email: "new@example.test",
+            csrfToken: "pending-csrf",
+          },
+        });
+        store.countMeetings = () => {
+          throw new Error("blocked meeting metrics were read");
+        };
+        store.countTranscripts = () => {
+          throw new Error("blocked transcript metrics were read");
+        };
+        store.countEmbedded = () => {
+          throw new Error("blocked embedding metrics were read");
+        };
+        const status = computeStatus(client, store);
+        if (
+          !status.session.hasCookie ||
+          status.session.loggedIn ||
+          status.session.expired ||
+          sessionUsable(client, store.getSyncState()) ||
+          !status.blocking ||
+          status.meetings !== null ||
+          status.transcripts !== null ||
+          status.transcriptsDone !== null ||
+          status.transcriptsTotal !== null ||
+          status.lastFullSyncMs !== null ||
+          status.lastIncrementalMs !== null ||
+          status.semantic.embedded !== null ||
+          status.semantic.total !== null
+        ) {
+          throw new Error(
+            "pending origin-change challenge exposed old-cache readiness",
+          );
+        }
+        store.close();
+      `,
+    ],
+    {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SANA_DATA_DIR: root,
+        SANA_TRANSCRIPTS_DIR: path.join(root, "transcripts"),
+        SANA_SEMANTIC: "0",
+      },
+    },
+  );
+  expect(child.status, child.stderr).toBe(0);
+});
+
+test("non-pending signed-out, authenticated, and expired session semantics remain exact", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sana-status-session-"));
+  roots.push(root);
+  const child = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      `
+        const {
+          sessionInfo,
+          sessionUsable,
+        } = await import("./src/core/status.ts");
+        const states = [
+          {
+            name: "signed-out",
+            cookie: false,
+            phase: "idle",
+            expected: {
+              hasCookie: false,
+              loggedIn: false,
+              expired: false,
+              usable: false,
+            },
+          },
+          {
+            name: "authenticated",
+            cookie: true,
+            phase: "synced",
+            expected: {
+              hasCookie: true,
+              loggedIn: true,
+              expired: false,
+              usable: true,
+            },
+          },
+          {
+            name: "expired",
+            cookie: true,
+            phase: "needs_login",
+            expected: {
+              hasCookie: true,
+              loggedIn: false,
+              expired: true,
+              usable: false,
+            },
+          },
+        ];
+        for (const scenario of states) {
+          const client = {
+            hasAuthCookie: () => scenario.cookie,
+            pendingSignInChallenge: () => null,
+          };
+          const state = { phase: scenario.phase };
+          const info = sessionInfo(client, state);
+          if (
+            JSON.stringify({
+              ...info,
+              usable: sessionUsable(client, state),
+            }) !== JSON.stringify(scenario.expected)
+          ) {
+            throw new Error(
+              scenario.name + " session semantics changed",
+            );
+          }
+        }
       `,
     ],
     {

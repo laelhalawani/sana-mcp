@@ -18,6 +18,10 @@ export class SanaClient {
     return true;
   }
 
+  pendingSignInChallenge(): null {
+    return null;
+  }
+
   sessionVersion(): Readonly<{
     generation: 1;
     publicationToken: string;

@@ -104,83 +104,36 @@ program
 
 async function daemonLifecycle(
   operation: string,
+  allowLegacyCooperative: boolean,
 ): Promise<{ state: "running" | "stopped"; changed: boolean }> {
-  const { SanaStore } = await import("./store/db.js");
-  const { daemonStateStatus, pidAlive } = await import("./sync/lock.js");
-  const inspect = (): { state: "running" | "stopped"; pid?: number } => {
-    const store = new SanaStore();
-    try {
-      const status = daemonStateStatus(store.getSyncState());
-      if (status.kind === "stale-live") {
-        throw new Error(
-          `daemon heartbeat is stale while process ${status.pid} is still running; stop it manually`,
-        );
-      }
-      return status.kind === "alive"
-        ? { state: "running", pid: status.pid }
-        : { state: "stopped" };
-    } finally {
-      store.close();
-    }
-  };
-
-  if (operation === "health") {
-    return { state: inspect().state, changed: false };
-  }
-  if (operation === "start") {
-    const before = inspect();
-    if (before.state === "running") return { state: "running", changed: false };
-    const { ensureDaemonRunning } = await import("./sync/spawn.js");
-    await ensureDaemonRunning();
-    return { state: inspect().state, changed: true };
-  }
-  if (operation === "stop") {
-    const { requestDaemonStop } = await import("./sync/control.js");
-    const deadline = Date.now() + 10_000;
-    let changed = false;
-    let stoppedObservations = 0;
-    while (Date.now() < deadline) {
-      const before = inspect();
-      if (before.state === "stopped") {
-        stoppedObservations++;
-        if (stoppedObservations >= 3) {
-          return { state: "stopped", changed };
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
-        continue;
-      }
-      stoppedObservations = 0;
-      const stoppedPid = before.pid!;
-      requestDaemonStop(stoppedPid);
-      changed = true;
-      while (pidAlive(stoppedPid)) {
-        if (Date.now() >= deadline) {
-          throw new Error(
-            `daemon process ${stoppedPid} did not exit within 10000ms; stop it manually`,
-          );
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    throw new Error(
-      "daemon state did not remain stopped within 10000ms; stop it manually",
-    );
-  }
-  throw new Error("__lifecycle operation must be health, stop, or start");
+  const { runDaemonLifecycle } = await import("./sync/lifecycle.js");
+  return await runDaemonLifecycle(operation, {
+    allowLegacyCooperative,
+  });
 }
 
 program
   .command("__lifecycle <operation>", { hidden: true })
   .description("Run the versioned installer lifecycle protocol")
   .option("--format <format>", "machine format: properties", "properties")
-  .action(async (operation: string, opts: { format: string }) => {
+  .option(
+    "--allow-legacy-cooperative",
+    "installer-only compatibility after receipt, digest, and executable-path verification",
+  )
+  .action(async (
+    operation: string,
+    opts: { format: string; allowLegacyCooperative?: boolean },
+  ) => {
     if (!BUILD_INFO.standalone) {
       throw new Error("__lifecycle is available only in a standalone build");
     }
     if (opts.format !== "properties") {
       throw new Error("__lifecycle --format must be properties");
     }
-    const result = await daemonLifecycle(operation);
+    const result = await daemonLifecycle(
+      operation,
+      opts.allowLegacyCooperative === true,
+    );
     process.stdout.write(
       [
         `lifecycleProtocol=${BUILD_INFO.lifecycleProtocol}`,
