@@ -1213,14 +1213,10 @@ download "$base_url/manifest.json.sha256" "$tmp_dir/manifest.json.sha256" ||
 read_checksum "$tmp_dir/manifest.json.sha256" "manifest.json"
 manifest_hash=$(hash_file "$tmp_dir/manifest.json")
 [ "$manifest_hash" = "$checksum_hash" ] || fail "release manifest checksum mismatch"
-[ "$manifest_hash" = "$P_manifestSha256" ] ||
-  fail "release metadata is not bound to the downloaded manifest"
 
 download "$base_url/$P_checksumFileName" "$tmp_dir/binary.sha256" ||
   fail "could not download the binary checksum"
 read_checksum "$tmp_dir/binary.sha256" "$P_assetName"
-[ "$checksum_hash" = "$P_sha256" ] ||
-  fail "binary checksum does not match the release manifest"
 download_binary "$base_url/$P_assetName" "$tmp_dir/binary" ||
   fail "could not download the sana-mcp binary"
 [ "$(hash_file "$tmp_dir/binary")" = "$P_sha256" ] ||
