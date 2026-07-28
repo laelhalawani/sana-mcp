@@ -5,7 +5,10 @@ import {
   type MeetingBrowserResult,
 } from "../../src/app/browser-prompt.js";
 import { runApp } from "../../src/app/app.js";
-import type { AppPrompts } from "../../src/app/prompts.js";
+import {
+  TerminalAppPrompts,
+  type AppPrompts,
+} from "../../src/app/prompts.js";
 import { syncStatusPrompt } from "../../src/app/status-prompt.js";
 import type { AppRuntime } from "../../src/app/runtime.js";
 import {
@@ -271,11 +274,19 @@ test("cache-blocked browser performs no meeting query and refreshes into the lis
   expect(await app.result).toEqual({ action: "quit" });
 });
 
-test("selection dispatches the highlighted meeting to every direct action", async () => {
+test("Enter opens meeting actions while t, s, and p remain direct shortcuts", async () => {
   const app = await harness();
   await app.key("\x1b[B");
   await app.key("\r");
+  const actions = latestFrame(app.output, "Meeting 2");
+  expect(actions).toContain("Transcript");
+  expect(actions).toContain("Summary");
+  expect(actions).toContain("Participants");
+  await app.key("\r");
   expect(app.runtime.transcriptIds).toEqual(["2"]);
+  await app.key("\x1b");
+  await app.key("t");
+  expect(app.runtime.transcriptIds).toEqual(["2", "2"]);
   await app.key("\x1b");
   await app.key("s");
   expect(app.runtime.summaryIds).toEqual(["2"]);
@@ -290,18 +301,36 @@ test("selection dispatches the highlighted meeting to every direct action", asyn
   expect(await app.result).toEqual({ action: "quit" });
 });
 
+test("meeting actions retain their original meeting across list refresh", async () => {
+  const runtime = new FakeRuntime();
+  const app = await harness(runtime);
+  await app.key("\x1b[B");
+  await app.key("\r");
+  expect(latestFrame(app.output, "Meeting 2")).toContain("Summary");
+  runtime.onRefresh = () => {
+    runtime.rows = [row("1")];
+  };
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  await app.key("s");
+  expect(runtime.summaryIds).toEqual(["2"]);
+  await app.key("q");
+  await app.result;
+});
+
 test("list and transcript viewports page and clamp within the current rows", async () => {
   const runtime = new FakeRuntime();
   runtime.rows = Array.from({ length: 10 }, (_, index) =>
     row(String(index + 1)),
   );
-  const app = await harness(runtime, { rows: 5, columns: 48 });
+  const app = await harness(runtime, { rows: 5, columns: 120 });
   expect(latestFrame(app.output, "Meetings | 2 ready")).toContain(
     "PgUp/PgDn page",
   );
 
   await app.key("\x1b[F");
   await app.key("\x1b[5~");
+  await app.key("\r");
+  expect(latestFrame(app.output, "Meeting 7")).toContain("Transcript");
   await app.key("\r");
   expect(runtime.transcriptIds).toEqual(["7"]);
   expect(latestFrame(app.output, "Transcript 7")).toContain("transcript line 1");
@@ -346,12 +375,28 @@ test("filter input owns shortcut letters until Enter applies the title query", a
   await app.result;
 });
 
+test("automatic refresh pauses while the name filter is being typed", async () => {
+  const runtime = new FakeRuntime();
+  const app = await harness(runtime);
+  await app.key("/");
+  await app.key("weekly review");
+  const calls = runtime.meetingCalls.length;
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  expect(runtime.meetingCalls).toHaveLength(calls);
+  expect(latestFrame(app.output, "Filter meetings")).toContain("weekly review");
+  await app.key("\x1b");
+  await app.key("q");
+  await app.result;
+});
+
 test("help scrolls and short-terminal filter input remains visible", async () => {
   const app = await harness(new FakeRuntime(), { rows: 3, columns: 40 });
   await app.key("?");
   expect(latestFrame(app.output, "Keyboard help")).toContain("up/down or j/k");
   await app.key("\x1b[B");
-  expect(latestFrame(app.output, "Keyboard help")).toContain("enter/t transcript");
+  expect(latestFrame(app.output, "Keyboard help")).toContain(
+    "enter meeting actions",
+  );
   await app.key("\x1b");
 
   app.output.rows = 2;
@@ -610,6 +655,102 @@ test("signed-in menu does not offer transcript search while cache access is bloc
   expect(choices).not.toContain("Search transcripts");
   expect(choices).toContain("Meetings (syncing)");
   expect(choices).toContain("Sync status");
+});
+
+test("signed-in account screen is inspectable and Back never starts login", async () => {
+  const runtime = new FakeRuntime();
+  const messages: string[] = [];
+  let selects = 0;
+  let inputCalls = 0;
+  const prompts: AppPrompts = {
+    interactive: true,
+    select: async (options) => {
+      messages.push(options.message);
+      const result = selects === 0 ? "login" : selects === 1 ? "back" : "quit";
+      selects++;
+      return result as never;
+    },
+    input: async () => {
+      inputCalls++;
+      return null;
+    },
+    meetingBrowser: async () => ({ action: "back" }),
+    syncStatus: async () => ({ action: "back" }),
+  };
+  await runApp(runtime, prompts);
+  expect(messages).toContain("Sana account - signed in");
+  expect(inputCalls).toBe(0);
+  expect(selects).toBe(3);
+});
+
+test("text entry stays visible and supports submit or Escape back", async () => {
+  for (const action of ["submit", "back"] as const) {
+    const input = new TestInput();
+    const output = new TestOutput();
+    const prompts = new TerminalAppPrompts({
+      input,
+      output,
+      env: { NO_COLOR: "", LANG: "C" },
+      platform: "win32",
+    });
+    const result = prompts.input("Search transcripts");
+    await wait();
+    input.write("weekly review");
+    await wait();
+    expect(latestFrame(output, "Search transcripts")).toContain(
+      "> weekly review",
+    );
+    input.write(action === "submit" ? "\r" : "\x1b");
+    expect(await result).toBe(action === "submit" ? "weekly review" : null);
+    expect(input.isRaw).toBe(false);
+  }
+});
+
+test("text entry keeps long pasted input visible and submits it intact", async () => {
+  const input = new TestInput();
+  const output = new TestOutput();
+  output.columns = 20;
+  const prompts = new TerminalAppPrompts({
+    input,
+    output,
+    env: { NO_COLOR: "", LANG: "C" },
+    platform: "win32",
+  });
+  const expected = `${"long-search-".repeat(8)}END`;
+  const result = prompts.input("Search transcripts");
+  await wait();
+  input.write(expected);
+  await wait();
+  expect(
+    latestFrame(output, "Search transcripts").replaceAll("\n", ""),
+  ).toContain("END");
+  input.write("\r");
+  expect(await result).toBe(expected);
+  expect(input.isRaw).toBe(false);
+});
+
+test("text entry preserves native cursor editing and grapheme backspace", async () => {
+  const makePrompt = () => {
+    const input = new TestInput();
+    const output = new TestOutput();
+    const prompts = new TerminalAppPrompts({
+      input,
+      output,
+      env: { NO_COLOR: "", LANG: "en_US.UTF-8" },
+      platform: "win32",
+    });
+    return { input, result: prompts.input("Search transcripts") };
+  };
+
+  const edited = makePrompt();
+  await wait();
+  edited.input.write("ac\x1b[Db\r");
+  expect(await edited.result).toBe("abc");
+
+  const grapheme = makePrompt();
+  await wait();
+  grapheme.input.write("👨‍👩‍👧‍👦\x7f\r");
+  expect(await grapheme.result).toBe("");
 });
 
 test("setup status keeps live-sync exit guidance visible", async () => {

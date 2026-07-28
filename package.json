@@ -1,6 +1,6 @@
 {
   "name": "sana-mcp",
-  "version": "0.4.12",
+  "version": "0.4.13",
   "private": true,
   "description": "Sync and read your Sana.AI meeting transcripts (CLI + MCP server)",
   "license": "GPL-3.0",

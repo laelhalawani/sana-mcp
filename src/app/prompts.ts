@@ -1,4 +1,4 @@
-import { input, select } from "@inquirer/prompts";
+import { select } from "@inquirer/prompts";
 import {
   TerminalUi,
   createTerminalPolicy,
@@ -15,6 +15,7 @@ import {
   syncStatusPrompt,
   type SyncStatusPromptResult,
 } from "./status-prompt.js";
+import { textInputPrompt } from "./text-prompt.js";
 
 export interface AppPromptChoice<Value extends string> {
   readonly name: string;
@@ -28,7 +29,7 @@ export interface AppPrompts {
     choices: readonly AppPromptChoice<Value>[];
     pageSize?: number;
   }): Promise<Value>;
-  input(message: string): Promise<string>;
+  input(message: string): Promise<string | null>;
   meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult>;
   syncStatus(runtime: AppRuntime): Promise<SyncStatusPromptResult>;
 }
@@ -109,14 +110,19 @@ export class TerminalAppPrompts implements AppPrompts {
     );
   }
 
-  input(message: string): Promise<string> {
-    return input(
-      { message, theme: this.theme },
+  async input(message: string): Promise<string | null> {
+    const result = await textInputPrompt(
+      {
+        message,
+        output: this.outputStream,
+        ui: this.ui,
+      },
       {
         input: this.inputStream as NodeJS.ReadableStream,
         output: this.outputStream as NodeJS.WritableStream,
       },
     );
+    return result.action === "submit" ? result.value : null;
   }
 
   meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult> {

@@ -34,6 +34,7 @@ type BrowserView =
   | { kind: "status" }
   | { kind: "help" }
   | { kind: "sync"; id: string }
+  | { kind: "actions"; id: string; title: string; selected: number }
   | { kind: "detail"; id: string; title: string; lines: string[]; loading: boolean };
 
 type StatusFilter = NonNullable<MeetingListOpts["status"]>;
@@ -45,6 +46,14 @@ const STATUS_FILTERS: readonly StatusFilterChoice[] = [
   "processing",
   "retrying",
 ];
+const MEETING_ACTIONS = [
+  { label: "Transcript", value: "transcript" },
+  { label: "Summary", value: "summary" },
+  { label: "Participants", value: "participants" },
+  { label: "Recording", value: "recording" },
+  { label: "Sync details", value: "sync" },
+  { label: "Back to meetings", value: "back" },
+] as const;
 
 interface BrowserModel {
   status: ReturnType<AppRuntime["status"]>;
@@ -322,7 +331,7 @@ function statusLines(status: BrowserModel["status"]): string[] {
 
 const HELP_LINES = [
   "up/down or j/k move; pgup/pgdn/home/end jump",
-  "enter/t transcript; d sync details; s summary; p participants; o recording",
+  "enter meeting actions; t transcript; s summary; p participants; o recording",
   "/ filter name; f filter status; c clear filters; r refresh; i status",
   "esc menu; q quit",
 ];
@@ -391,12 +400,23 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
     };
 
     useEffect(() => {
-      const timer = setInterval(() => refresh(undefined, false), 1_000);
+      const timer = setInterval(() => {
+        const current = modelRef.current;
+        if (
+          current.filterInput === null &&
+          current.statusFilterInput === null
+        ) {
+          refresh(undefined, false);
+        }
+      }, 1_000);
       return () => clearInterval(timer);
     }, []);
 
-    const openSelected = (kind: "transcript" | "summary" | "participants") => {
-      const id = modelRef.current.selectedId;
+    const openSelected = (
+      kind: "transcript" | "summary" | "participants",
+      requestedId?: string,
+    ) => {
+      const id = requestedId ?? modelRef.current.selectedId;
       if (id === null) return;
       requestToken.current += 1;
       try {
@@ -418,8 +438,8 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       }
     };
 
-    const openRecording = async () => {
-      const id = modelRef.current.selectedId;
+    const openRecording = async (requestedId?: string) => {
+      const id = requestedId ?? modelRef.current.selectedId;
       if (id === null) return;
       const token = ++requestToken.current;
       setModel({
@@ -438,7 +458,6 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         const current = modelRef.current;
         if (
           requestToken.current !== token ||
-          current.selectedId !== id ||
           current.view.kind !== "detail" ||
           current.view.id !== id
         ) {
@@ -449,7 +468,6 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         const current = modelRef.current;
         if (
           requestToken.current !== token ||
-          current.selectedId !== id ||
           current.view.kind !== "detail" ||
           current.view.id !== id
         ) {
@@ -579,6 +597,58 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         return;
       }
 
+      if (current.view.kind === "actions") {
+        if (name === "escape") {
+          setModel({ ...current, view: { kind: "list" }, scroll: 0 });
+          return;
+        }
+        if (name === "t") {
+          openSelected("transcript", current.view.id);
+          return;
+        }
+        if (name === "s") {
+          openSelected("summary", current.view.id);
+          return;
+        }
+        if (name === "p") {
+          openSelected("participants", current.view.id);
+          return;
+        }
+        if (name === "o") {
+          await openRecording(current.view.id);
+          return;
+        }
+        if (isUpKey(key) || isDownKey(key) || name === "j" || name === "k") {
+          const delta = isUpKey(key) || name === "k" ? -1 : 1;
+          const selected = Math.max(
+            0,
+            Math.min(MEETING_ACTIONS.length - 1, current.view.selected + delta),
+          );
+          setModel({
+            ...current,
+            view: { ...current.view, selected },
+          });
+          return;
+        }
+        if (isEnterKey(key)) {
+          const action = MEETING_ACTIONS[current.view.selected]!.value;
+          if (action === "back") {
+            setModel({ ...current, view: { kind: "list" }, scroll: 0 });
+          } else if (action === "recording") {
+            await openRecording(current.view.id);
+          } else if (action === "sync") {
+            setModel({
+              ...current,
+              view: { kind: "sync", id: current.view.id },
+              scroll: 0,
+            });
+          } else {
+            openSelected(action, current.view.id);
+          }
+        }
+        return;
+      }
+
       if (current.view.kind !== "list") {
         if (name === "escape") {
           requestToken.current += 1;
@@ -678,7 +748,23 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         return;
       }
       if (isEnterKey(key) || name === "t") {
-        openSelected("transcript");
+        if (isEnterKey(key) && current.selectedId !== null) {
+          const selected = current.page?.rows.find(
+            (row) => row.id === current.selectedId,
+          );
+          setModel({
+            ...current,
+            view: {
+              kind: "actions",
+              id: current.selectedId,
+              title: selected?.name ?? current.selectedId,
+              selected: 0,
+            },
+            scroll: 0,
+          });
+        } else {
+          openSelected("transcript");
+        }
         return;
       }
       if (name === "s") {
@@ -770,6 +856,21 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       const scroll = Math.max(0, Math.min(maximum, model.scroll));
       body = model.view.lines.slice(scroll, scroll + capacity);
       footer = "up/down scroll  pgup/pgdn page  esc meetings  q quit";
+    } else if (model.view.kind === "actions") {
+      const selected = model.view.selected;
+      const top = Math.max(
+        0,
+        Math.min(
+          selected - Math.max(0, capacity - 1),
+          Math.max(0, MEETING_ACTIONS.length - capacity),
+        ),
+      );
+      header = model.view.title;
+      body = MEETING_ACTIONS.slice(top, top + capacity).map((action, index) => {
+        const active = top + index === selected;
+        return `${active ? ui.glyphs.pointer : " "} ${action.label}`;
+      });
+      footer = "up/down choose  enter open  t transcript  s summary  p participants  esc back";
     } else if (model.view.kind === "sync") {
       const syncId = model.view.id;
       const row = model.page?.rows.find((item) => item.id === syncId);
@@ -826,7 +927,7 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
             : "No ready or syncing meetings found.",
         ];
       }
-      footer = "PgUp/PgDn page  / name  f status  d details  enter open  ? help";
+      footer = "Enter actions  t transcript  s summary  p participants  PgUp/PgDn page  / filter by name  f filter by status";
     }
 
     const rendered: string[] = [];
