@@ -297,13 +297,18 @@ function renderStatus(client: SanaClient, store: SanaStore): string {
   if (status.authTransition) {
     lines.push(`Authentication: ${status.authTransition.message}`);
   }
-  if (status.meetings !== null) lines.push(`Meetings: ${status.meetings}`);
+  if (status.meetings !== null) lines.push(`Meetings ready: ${status.meetings}`);
+  if (status.remaining !== null && status.remaining > 0) {
+    lines.push(
+      `Pending: ${status.remaining}${status.retrying ? ` (${status.retrying} retrying)` : ""}`,
+    );
+  }
   if (
     status.transcriptsDone !== null &&
     status.transcriptsTotal !== null
   ) {
     lines.push(
-      `Transcripts: ${status.transcriptsDone}/${status.transcriptsTotal}`,
+      `Transcripts stored: ${status.transcriptsDone}/${status.transcriptsTotal}`,
     );
   }
   if (status.etaMinutes !== null && status.blocking) {
@@ -480,7 +485,8 @@ function renderParticipants(store: SanaStore, id: string): string {
     "",
     ...result.participants.map(
       (participant) =>
-        `${participant.displayName}  ${participant.email}` +
+        `${participant.displayName ?? participant.email ?? "Unnamed participant"}` +
+          `${participant.displayName && participant.email ? `  ${participant.email}` : ""}` +
         `${participant.isHost ? "  (host)" : ""}`,
     ),
   ].join("\n");

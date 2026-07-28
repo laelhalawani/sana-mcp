@@ -901,7 +901,7 @@ function handleParticipants(store: SanaStore, args: Record<string, unknown>): st
     `| name (string) | email (string) | host (yes/no) |`,
     `|---|---|---|`,
     ...r.participants.map(
-      (p) => `| ${escCell(p.displayName)} | ${escCell(p.email ?? "")} | ${p.isHost ? "yes" : "no"} |`
+      (p) => `| ${escCell(p.displayName ?? "")} | ${escCell(p.email ?? "")} | ${p.isHost ? "yes" : "no"} |`
     ),
   ];
   return table.join("\n");

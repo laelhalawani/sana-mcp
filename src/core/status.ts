@@ -67,7 +67,12 @@ export interface StatusInfo {
   transcriptsTotal: number | null;
   remaining: number | null;
   etaMinutes: number | null;
+  /** Fully downloaded meetings with both transcript and metadata. */
   meetings: number | null;
+  /** Authoritative meeting rows discovered from Sana, including pending rows. */
+  meetingsTotal: number | null;
+  retrying: number | null;
+  message: string | null;
   transcripts: number | null;
   lastFullSyncMs: number | null;
   lastIncrementalMs: number | null;
@@ -194,12 +199,15 @@ function buildStatus(
     s.cache_workspace_id !== s.auth_workspace_id;
   const exposeMetrics = !activeCacheBlocked && authTransition === undefined;
   const transcripts = exposeMetrics ? store.countTranscripts() : null;
-  const meetings = exposeMetrics ? store.countMeetings() : null;
+  const meetingsTotal = exposeMetrics ? store.countMeetings() : null;
+  const meetings = exposeMetrics ? store.countMeetings({ status: "ready" }) : null;
+  const retrying = exposeMetrics
+    ? store.countMeetings({ status: "retrying" })
+    : null;
   const transcriptsDone = transcripts;
-  const transcriptsTotal = meetings;
-  const complete = exposeMetrics ? store.countMeetings({ status: "ready" }) : null;
+  const transcriptsTotal = meetingsTotal;
   const remaining =
-    meetings !== null && complete !== null ? meetings - complete : null;
+    meetingsTotal !== null && meetings !== null ? meetingsTotal - meetings : null;
   const phase =
     exposeMetrics && remaining !== null && remaining > 0 && s.phase === "synced"
       ? "downloading"
@@ -227,6 +235,9 @@ function buildStatus(
     // is preferable to inventing one from a hardcoded per-item duration.
     etaMinutes: null,
     meetings,
+    meetingsTotal,
+    retrying,
+    message: exposeMetrics && s.message ? s.message : null,
     transcripts,
     lastFullSyncMs: exposeMetrics ? s.last_full_sync_ms : null,
     lastIncrementalMs: exposeMetrics ? s.last_incremental_ms : null,

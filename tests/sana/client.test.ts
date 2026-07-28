@@ -224,7 +224,7 @@ test("absent workspace uses saved routing and valid explicit workspace wins", ()
   expect(child.status, child.stderr).toBe(0);
 });
 
-test("participant responses require every field used by the fixed table", () => {
+test("participant responses accept an omitted display name but retain structural checks", () => {
   const child = runClientScenario(`
     const {
       SanaClient,
@@ -233,6 +233,7 @@ test("participant responses require every field used by the fixed table", () => 
     const client = new SanaClient();
     const responses = [
       [{ displayName: "Alex", email: "alex@example.test", isHost: false }],
+      [{ email: "unnamed@example.test", isHost: false }],
       [{ id: "participant-a" }],
       [{ displayName: "Alex", email: "alex@example.test" }],
       [{ displayName: "   ", email: "alex@example.test", isHost: true }],
@@ -257,6 +258,15 @@ test("participant responses require every field used by the fixed table", () => 
     ) {
       throw new Error("valid participant response changed");
     }
+    const unnamed = await client.getMeetingParticipants("meeting-a");
+    if (
+      unnamed.length !== 1 ||
+      unnamed[0].displayName !== undefined ||
+      unnamed[0].email !== "unnamed@example.test" ||
+      unnamed[0].isHost !== false
+    ) {
+      throw new Error("participant without a display name was not preserved");
+    }
     for (let index = 0; index < 4; index++) {
       let caught;
       try {
@@ -267,6 +277,30 @@ test("participant responses require every field used by the fixed table", () => 
       if (!(caught instanceof SanaResponseValidationError)) {
         throw caught ?? new Error("partial participant was accepted");
       }
+    }
+  `);
+  expect(child.status, child.stderr).toBe(0);
+});
+
+test("meeting metadata preserves numeric due dates as displayable values", () => {
+  const child = runClientScenario(`
+    const { SanaClient } = await import("./src/sana/client.ts");
+    const client = new SanaClient();
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({
+        result: {
+          data: {
+            actionItems: [{
+              action: "Follow up",
+              assignedTo: null,
+              dueDate: 1785190232720,
+            }],
+          },
+        },
+      }), { status: 200 });
+    const metadata = await client.getMeetingById("meeting-a");
+    if (metadata.actionItems?.[0]?.dueDate !== "1785190232720") {
+      throw new Error("numeric due date was not preserved as text");
     }
   `);
   expect(child.status, child.stderr).toBe(0);

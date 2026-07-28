@@ -75,13 +75,18 @@ async function showStatus(runtime: AppRuntime): Promise<void> {
     return;
   }
   line(`Sync status: ${status.phase.replaceAll("_", " ")}`);
-  if (status.meetings !== null) line(`Meetings: ${status.meetings}`);
+  if (status.meetings !== null) line(`Meetings ready: ${status.meetings}`);
+  if (status.remaining !== null && status.remaining > 0) {
+    line(
+      `Pending: ${status.remaining}${status.retrying ? ` (${status.retrying} retrying)` : ""}`,
+    );
+  }
   if (
     status.transcriptsDone !== null &&
     status.transcriptsTotal !== null
   ) {
     line(
-      `Transcripts: ${status.transcriptsDone}/${status.transcriptsTotal}`,
+      `Transcripts stored: ${status.transcriptsDone}/${status.transcriptsTotal}`,
     );
   }
   if (status.etaMinutes !== null && status.blocking) {
@@ -249,7 +254,8 @@ async function showMeeting(
     line(result.name);
     for (const participant of result.participants) {
       line(
-        `${participant.displayName}  ${participant.email}` +
+        `${participant.displayName ?? participant.email ?? "Unnamed participant"}` +
+          `${participant.displayName && participant.email ? `  ${participant.email}` : ""}` +
           `${participant.isHost ? "  (host)" : ""}`,
       );
     }
@@ -326,12 +332,13 @@ function signedInChoices(blocking: boolean): Array<{
 }> {
   const pending = blocking ? " (syncing)" : "";
   return [
-    { name: `Search transcripts${pending}`, value: "search" },
-    { name: `List meetings${pending}`, value: "list" },
-    { name: `Open a meeting${pending}`, value: "meeting" },
+    { name: `Meetings${pending}`, value: "list" },
+    ...(!blocking
+      ? [{ name: "Search transcripts", value: "search" as const }]
+      : []),
     { name: "Sync status", value: "status" },
-    { name: "Sign in / account", value: "login" },
-    { name: "Configure AI clients", value: "configure" },
+    { name: "Sana account", value: "login" },
+    { name: "Configuration", value: "configure" },
     { name: "Quit", value: "quit" },
   ];
 }
@@ -350,29 +357,13 @@ export async function runApp(
     for (;;) {
       activeRuntime.refresh();
       const status = activeRuntime.status();
-      if (status.session.loggedIn) {
-        let result: Awaited<ReturnType<AppPrompts["meetingBrowser"]>>;
-        try {
-          result = await prompts.meetingBrowser(activeRuntime);
-        } catch (error) {
-          if (error instanceof ExitPromptError) return;
-          throw error;
-        }
-        if (result.action === "quit") return;
-        try {
-          if (result.action === "account") await signIn(activeRuntime, prompts);
-          else await activeRuntime.configure();
-        } catch (error) {
-          if (error instanceof ExitPromptError) return;
-          line(`Could not complete that action: ${errorMessage(error)}`);
-        }
-        continue;
-      }
       let choice: AppChoice;
       try {
         choice = await choose(
           prompts,
-          signedOutChoices(status.session.expired),
+          status.session.loggedIn
+            ? signedInChoices(status.blocking)
+            : signedOutChoices(status.session.expired),
         );
       } catch (error) {
         if (error instanceof ExitPromptError) return;
@@ -382,8 +373,14 @@ export async function runApp(
       try {
         if (choice === "login") await signIn(activeRuntime, prompts);
         else if (choice === "configure") await activeRuntime.configure();
-        else if (choice === "status") await showStatus(activeRuntime);
-        else if (choice === "list") await showMeetings(activeRuntime);
+        else if (choice === "status") {
+          const result = await prompts.syncStatus(activeRuntime);
+          if (result.action === "quit") return;
+        }
+        else if (choice === "list") {
+          const result = await prompts.meetingBrowser(activeRuntime);
+          if (result.action === "quit") return;
+        }
         else if (choice === "meeting") await showMeeting(activeRuntime, prompts);
         else if (choice === "search") await showSearch(activeRuntime, prompts);
       } catch (error) {

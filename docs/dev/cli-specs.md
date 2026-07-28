@@ -15,7 +15,7 @@ flags, environment variables, and exit/edge behaviour.
 
 Status legend used throughout:
 
-- [shipped] - implemented in the current `v0.4.11` release candidate.
+- [shipped] - implemented in the current `v0.4.12` release candidate.
 - [planned] - designed in the per-area documents but not implemented in the
   current release candidate.
 

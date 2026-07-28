@@ -205,7 +205,10 @@ const meetingMetadataSchema = z
           .object({
             assignedTo: z.string().nullable().optional(),
             action: z.string(),
-            dueDate: z.string().nullable().optional(),
+            dueDate: z
+              .union([z.string(), z.number().finite().transform(String)])
+              .nullable()
+              .optional(),
           })
           .passthrough(),
       )
@@ -226,7 +229,8 @@ const participantSchema = z
       .refine(
         (displayName) => displayName.trim() !== "",
         "displayName must contain a non-whitespace character",
-      ),
+      )
+      .optional(),
     isHost: z.boolean(),
   })
   .passthrough();
@@ -875,7 +879,7 @@ export class SanaClient {
   }
 
   async getMeetingParticipants(assetId: string): Promise<
-    { id?: string; email?: string | null; displayName: string; isHost: boolean }[]
+    { id?: string; email?: string | null; displayName?: string; isHost: boolean }[]
   > {
     return this.trpcQuery(
       "meeting.getMeetingParticipants",

@@ -328,7 +328,7 @@ export function getSummaryView(store: SanaStore, id: string): SummaryResult {
 // ---- participants --------------------------------------------------------
 
 export interface Participant {
-  displayName: string;
+  displayName?: string;
   email?: string | null;
   isHost: boolean;
 }
@@ -356,8 +356,9 @@ const cachedParticipantsSchema = z.array(
         .refine(
           (displayName) => displayName.trim() !== "",
           "displayName must contain a non-whitespace character",
-        ),
-      email: z.string().email(),
+        )
+        .optional(),
+      email: z.string().email().nullish(),
       isHost: z.boolean(),
     })
     .passthrough(),

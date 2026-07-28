@@ -261,7 +261,7 @@ function Download-Https(
             $ReadTotal `
             $Response.ContentLength `
             $Stopwatch.Elapsed.TotalSeconds
-        )
+        ) -ForegroundColor Cyan
       }
     }
     if ($ShowProgress) {
@@ -270,7 +270,7 @@ function Download-Https(
           $ReadTotal `
           $Response.ContentLength `
           $Stopwatch.Elapsed.TotalSeconds
-      )
+      ) -ForegroundColor Green
       $ProgressCompleted = $true
     }
   } finally {
@@ -1741,7 +1741,10 @@ try {
   }
 
   $BaseUrl = "https://github.com/$Repo/releases/download/$Version"
-  Write-Host "Installing sana-mcp $Version ($Target)"
+  Write-Host ""
+  Write-Host "Installing sana-mcp $Version" -ForegroundColor Cyan
+  Write-Host "  Platform    $Target" -ForegroundColor DarkGray
+  Write-Host "  Downloading verified release" -ForegroundColor White
 
   $PropertiesFile = Join-Path $TempDir "release.properties"
   $PropertiesChecksum = Join-Path $TempDir "release.properties.sha256"
