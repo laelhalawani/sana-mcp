@@ -1,12 +1,18 @@
-// Optional semantic search. The embedding model and sqlite-vec are optional
-// dependencies and are only loaded when semantic search is enabled AND used,
-// so a base install pays no RAM/CPU cost. Enable with SANA_SEMANTIC=1.
+// Semantic dependencies are loaded only when semantic search is enabled and
+// used, so keyword-only operations pay no model RAM/CPU cost.
 import path from "node:path";
 import { SQLiteError, type Database } from "bun:sqlite";
 import { dataDirectory } from "../config.js";
 import { RUNTIME_ENV } from "../runtime/env.js";
 import { BUILD_INFO, type SemanticCapability } from "../runtime/build-info.js";
 import type { Bindings } from "../store/db.js";
+import {
+  PINNED_MODEL_ID,
+  PINNED_MODEL_REVISION,
+  createPinnedModelSnapshot,
+  downloadPinnedModelFile,
+  preparePinnedModelCache,
+} from "./model-cache.js";
 
 export const EMBED_MODEL = RUNTIME_ENV.embedModel;
 export const EMBED_DIM = RUNTIME_ENV.embedDimension;
@@ -18,6 +24,7 @@ const IDLE_UNLOAD_MS = RUNTIME_ENV.embedIdleMs;
 export interface SemanticUnavailableContext {
   readonly operation:
     | "transformers-import"
+    | "model-cache"
     | "model-initialization"
     | "embedding-output"
     | "sqlite-vec-import"
@@ -55,7 +62,9 @@ export function resolveSemanticCapability(
   capability: SemanticCapability,
 ): SemanticCapabilityState {
   if (!requested) return { kind: "disabled" };
-  if (capability === "source-semantic") return { kind: "available" };
+  if (capability === "source-semantic" || capability === "bundled") {
+    return { kind: "available" };
+  }
   return {
     kind: "unsupported",
     message:
@@ -89,13 +98,22 @@ export interface EmbeddingPipe {
 
 export interface TransformersModule {
   readonly env: {
-    cacheDir: string;
+    cacheDir: string | null;
     allowRemoteModels: boolean;
+    localModelPath?: string;
+    allowLocalModels?: boolean;
+    useFSCache?: boolean;
+    useWasmCache?: boolean;
+    backends?: unknown;
   };
   readonly pipeline: (
     task: "feature-extraction",
     model: string,
-    options: { readonly dtype: "q8" },
+    options: {
+      readonly dtype: "q8";
+      readonly revision?: string;
+      readonly local_files_only?: boolean;
+    },
   ) => Promise<unknown>;
 }
 
@@ -109,11 +127,13 @@ function unavailable(
 
 export async function loadEmbeddingPipe(
   importTransformers: () => Promise<TransformersModule>,
+  signal?: AbortSignal,
 ): Promise<EmbeddingPipe> {
   let mod: TransformersModule;
   try {
     mod = await importTransformers();
   } catch (cause) {
+    if (cause instanceof SemanticUnavailableError) throw cause;
     throw unavailable(
       "Semantic search dependencies are not installed. Run: bun install",
       { operation: "transformers-import", model: EMBED_MODEL },
@@ -123,16 +143,71 @@ export async function loadEmbeddingPipe(
 
   try {
     const { pipeline, env } = mod;
-    env.cacheDir = path.join(dataDirectory(), "models");
-    env.allowRemoteModels = true;
-    const pipe = await pipeline("feature-extraction", EMBED_MODEL, {
-      dtype: "q8",
-    });
+    let pipelineOptions: {
+      dtype: "q8";
+      revision?: string;
+      local_files_only?: boolean;
+    } = { dtype: "q8" };
+    if (BUILD_INFO.standalone) {
+      if (EMBED_MODEL !== PINNED_MODEL_ID || EMBED_DIM !== 384) {
+        throw new TypeError(
+          `Standalone semantic runtime requires ${PINNED_MODEL_ID} with dimension 384`,
+        );
+      }
+      let localModelRoot: string;
+      try {
+        localModelRoot = await preparePinnedModelCache(
+          path.join(dataDirectory(), "models"),
+          (file) => downloadPinnedModelFile(file, { signal }),
+        );
+      } catch (cause) {
+        throw unavailable(
+          `Could not prepare the verified semantic model revision ${PINNED_MODEL_REVISION}.`,
+          { operation: "model-cache", model: PINNED_MODEL_ID },
+          cause,
+        );
+      }
+      const snapshot = createPinnedModelSnapshot(localModelRoot);
+      try {
+        const { configureStandaloneTransformers } = await import(
+          "./standalone-runtime.js"
+        );
+        await configureStandaloneTransformers(
+          env as Parameters<typeof configureStandaloneTransformers>[0],
+          snapshot.root,
+        );
+        pipelineOptions = {
+          dtype: "q8",
+          revision: PINNED_MODEL_REVISION,
+          local_files_only: true,
+        };
+        const pipe = await pipeline(
+          "feature-extraction",
+          EMBED_MODEL,
+          pipelineOptions,
+        );
+        if (typeof pipe !== "function") {
+          throw new TypeError("the feature-extraction pipeline is not callable");
+        }
+        return pipe as EmbeddingPipe;
+      } finally {
+        snapshot.dispose();
+      }
+    } else {
+      env.cacheDir = path.join(dataDirectory(), "models");
+      env.allowRemoteModels = true;
+    }
+    const pipe = await pipeline(
+      "feature-extraction",
+      EMBED_MODEL,
+      pipelineOptions,
+    );
     if (typeof pipe !== "function") {
       throw new TypeError("the feature-extraction pipeline is not callable");
     }
     return pipe as EmbeddingPipe;
   } catch (cause) {
+    if (cause instanceof SemanticUnavailableError) throw cause;
     throw unavailable(
       `Could not initialize semantic embedding model "${EMBED_MODEL}". Check model access and the local model cache, then retry.`,
       {
@@ -145,9 +220,10 @@ export async function loadEmbeddingPipe(
   }
 }
 
-async function loadPipe(): Promise<EmbeddingPipe> {
+async function loadPipe(signal?: AbortSignal): Promise<EmbeddingPipe> {
   return loadEmbeddingPipe(
     async () => (await import("@huggingface/transformers")) as TransformersModule,
+    signal,
   );
 }
 
@@ -266,15 +342,38 @@ export function validateEmbeddingOutput(
 }
 
 export interface EmbeddingRuntime {
-  embed(texts: string[]): Promise<Float32Array[]>;
+  embed(texts: string[], signal?: AbortSignal): Promise<Float32Array[]>;
   unload(): Promise<void>;
 }
 
 export interface EmbeddingRuntimeOptions {
-  readonly load: () => Promise<EmbeddingPipe>;
+  readonly load: (signal?: AbortSignal) => Promise<EmbeddingPipe>;
   readonly idleMs: number;
+  readonly cancelLoadWhenUnused?: boolean;
   readonly setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   readonly clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
+function waitWithSignal<Value>(
+  promise: Promise<Value>,
+  signal?: AbortSignal,
+): Promise<Value> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<Value>((resolve, reject) => {
+    const aborted = (): void => reject(signal.reason);
+    signal.addEventListener("abort", aborted, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** Create the small lazy-load lifecycle used by production and deterministic tests. */
@@ -283,31 +382,54 @@ export function createEmbeddingRuntime(options: EmbeddingRuntimeOptions): Embedd
   const clearTimer = options.clearTimer ?? clearTimeout;
   let pipePromise: Promise<EmbeddingPipe> | null = null;
   let pipeRef: EmbeddingPipe | null = null;
+  let loadController: AbortController | null = null;
+  let loadWaiters = 0;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let activeEmbeds = 0;
   let unloadPending = false;
+  let inferenceTail: Promise<void> = Promise.resolve();
 
   const clearIdleTimer = (): void => {
     if (idleTimer !== null) clearTimer(idleTimer);
     idleTimer = null;
   };
 
-  const getPipe = (): Promise<EmbeddingPipe> => {
-    if (pipePromise) return pipePromise;
-    const attempt = options.load();
-    pipePromise = attempt;
-    void attempt.then(
-      (pipe) => {
-        if (pipePromise === attempt) pipeRef = pipe;
-      },
-      () => {
-        if (pipePromise === attempt) {
-          pipePromise = null;
-          pipeRef = null;
-        }
-      },
-    );
-    return attempt;
+  const getPipe = async (signal?: AbortSignal): Promise<EmbeddingPipe> => {
+    if (
+      pipePromise === null ||
+      (options.cancelLoadWhenUnused === true && loadController?.signal.aborted)
+    ) {
+      loadController = new AbortController();
+      const attempt = options.load(loadController.signal);
+      pipePromise = attempt;
+      void attempt.then(
+        (pipe) => {
+          if (pipePromise === attempt) pipeRef = pipe;
+        },
+        () => {
+          if (pipePromise === attempt) {
+            pipePromise = null;
+            pipeRef = null;
+            loadController = null;
+          }
+        },
+      );
+    }
+    const attempt = pipePromise;
+    loadWaiters++;
+    try {
+      return await waitWithSignal(attempt, signal);
+    } finally {
+      loadWaiters--;
+      if (
+        options.cancelLoadWhenUnused === true &&
+        loadWaiters === 0 &&
+        pipePromise === attempt &&
+        pipeRef === null
+      ) {
+        loadController?.abort();
+      }
+    }
   };
 
   const unload = async (): Promise<void> => {
@@ -318,6 +440,8 @@ export function createEmbeddingRuntime(options: EmbeddingRuntimeOptions): Embedd
     }
     unloadPending = false;
     const pipe = pipeRef;
+    loadController?.abort();
+    loadController = null;
     pipePromise = null;
     pipeRef = null;
     if (pipe?.dispose) {
@@ -336,13 +460,27 @@ export function createEmbeddingRuntime(options: EmbeddingRuntimeOptions): Embedd
   };
 
   return {
-    async embed(texts: string[]): Promise<Float32Array[]> {
+    async embed(texts: string[], signal?: AbortSignal): Promise<Float32Array[]> {
       clearIdleTimer();
       activeEmbeds++;
       try {
-        const pipe = await getPipe();
-        const output = await pipe(texts, { pooling: "mean", normalize: true });
-        return validateEmbeddingOutput(output, texts.length);
+        signal?.throwIfAborted();
+        const pipe = await getPipe(signal);
+        signal?.throwIfAborted();
+        const previous = inferenceTail;
+        let release!: () => void;
+        inferenceTail = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await previous;
+        try {
+          signal?.throwIfAborted();
+          const output = await pipe(texts, { pooling: "mean", normalize: true });
+          signal?.throwIfAborted();
+          return validateEmbeddingOutput(output, texts.length);
+        } finally {
+          release();
+        }
       } finally {
         activeEmbeds--;
         if (activeEmbeds === 0) {
@@ -358,6 +496,7 @@ export function createEmbeddingRuntime(options: EmbeddingRuntimeOptions): Embedd
 const embeddingRuntime = createEmbeddingRuntime({
   load: loadPipe,
   idleMs: IDLE_UNLOAD_MS,
+  cancelLoadWhenUnused: BUILD_INFO.standalone,
 });
 
 /** Free the model from RAM. Called automatically after an idle period. */
@@ -365,22 +504,28 @@ export async function unloadModel(): Promise<void> {
   await embeddingRuntime.unload();
 }
 
-async function embed(texts: string[]): Promise<Float32Array[]> {
-  return embeddingRuntime.embed(texts);
+async function embed(
+  texts: string[],
+  signal?: AbortSignal,
+): Promise<Float32Array[]> {
+  return embeddingRuntime.embed(texts, signal);
 }
 
 const toBuf = (v: Float32Array): Buffer => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
 
 /** Embed a single query string; returns a Float32 BLOB for sqlite-vec. */
-export async function embedQuery(text: string): Promise<Buffer> {
-  const [v] = await embed([text]);
+export async function embedQuery(
+  text: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  const [v] = await embed([text], signal);
   return toBuf(v);
 }
 
 // ---- sqlite-vec storage (lazy) -------------------------------------------
 
 interface SqliteVecModule {
-  load(db: Database): void;
+  load(db: Database, dataDirectory?: string): void;
 }
 
 function isMissingVecModule(cause: unknown): boolean {
@@ -423,7 +568,7 @@ export function createVectorExtensionRuntime(
           );
         }
         try {
-          const load = () => sqliteVec.load(db);
+          const load = () => sqliteVec.load(db, dataDirectory());
           if (fence) fence(load);
           else load();
         } catch (cause) {

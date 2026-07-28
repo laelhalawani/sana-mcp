@@ -33,6 +33,14 @@ import {
   createStandaloneBuildConfig,
   writeStandaloneBuildOutput,
 } from "../src/runtime/build-info.js";
+import {
+  PINNED_MODEL_ID,
+  PINNED_MODEL_REVISION,
+} from "../src/semantic/model-cache.js";
+import {
+  STANDALONE_SEMANTIC_SMOKE_VERSION,
+  standaloneSemanticSmokeEvidence,
+} from "../src/semantic/smoke-contract.js";
 
 const sha256Pattern = /^[a-f0-9]{64}$/;
 
@@ -52,6 +60,22 @@ const inspectedBuildSchema = z
   })
   .strict();
 
+const semanticSmokeSchema = z
+  .object({
+    smokeVersion: z.literal(STANDALONE_SEMANTIC_SMOKE_VERSION),
+    model: z.literal(PINNED_MODEL_ID),
+    revision: z.literal(PINNED_MODEL_REVISION),
+    dimensions: z.tuple([z.literal(2), z.literal(384)]),
+    sqliteVec: z.literal("v0.1.9"),
+    nearest: z.literal("row-0"),
+  })
+  .strict();
+
+const attestedSemanticSmokeSchema = semanticSmokeSchema.extend({
+  target: z.enum(RELEASE_TARGETS),
+  executedSha256: z.string().regex(sha256Pattern),
+});
+
 const attestationSchema = z
   .object({
     attestationVersion: z.literal(1),
@@ -61,6 +85,7 @@ const attestationSchema = z
     assetName: z.string(),
     sha256: z.string().regex(sha256Pattern),
     inspect: inspectedBuildSchema,
+    semanticSmoke: attestedSemanticSmokeSchema,
   })
   .strict();
 
@@ -110,14 +135,34 @@ function decodeInspectJson(input: string): InspectedBuild {
   return parsed.data;
 }
 
+function decodeSemanticSmokeJson(input: string): z.infer<typeof semanticSmokeSchema> {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(input);
+  } catch {
+    throw new Error("standalone semantic smoke output is not valid JSON");
+  }
+  const parsed = semanticSmokeSchema.safeParse(decoded);
+  if (!parsed.success) {
+    throw new Error(
+      `standalone semantic smoke output is invalid: ${parsed.error.issues
+        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+        .join("; ")}`,
+    );
+  }
+  return parsed.data;
+}
+
 export async function createAttestation(options: {
   readonly target: ReleaseTarget;
   readonly artifact: string;
   readonly inspectJson: string;
+  readonly semanticSmokeJson: string;
   readonly sourceCommit: string;
   readonly executedSha256: string;
 }): Promise<ReleaseAttestation> {
   const inspect = decodeInspectJson(options.inspectJson);
+  const semanticSmokeOutput = decodeSemanticSmokeJson(options.semanticSmokeJson);
   if (inspect.target !== options.target) {
     throw new Error(
       `executed binary target ${inspect.target} does not match requested target ${options.target}`,
@@ -141,12 +186,18 @@ export async function createAttestation(options: {
       "artifact bytes do not match the digest acquired around execution",
     );
   }
+  const semanticSmoke = {
+    ...semanticSmokeOutput,
+    target: options.target,
+    executedSha256: artifactSha256,
+  } satisfies z.infer<typeof attestedSemanticSmokeSchema>;
   return Object.freeze({
     attestationVersion: 1,
     sourceCommit: options.sourceCommit,
     assetName: expectedName,
     sha256: artifactSha256,
     inspect,
+    semanticSmoke,
   });
 }
 
@@ -175,6 +226,11 @@ function canonicalAttestation(
       target,
       ...SUPPORTED_RELEASE_PROTOCOLS,
       semanticCapability: STANDALONE_SEMANTIC_CAPABILITY,
+    },
+    semanticSmoke: {
+      ...standaloneSemanticSmokeEvidence(),
+      target,
+      executedSha256: sha256,
     },
   });
 }
@@ -841,6 +897,10 @@ async function main(args: readonly string[]): Promise<void> {
       target,
       artifact,
       inspectJson: await readFile(inspectFile, "utf8"),
+      semanticSmokeJson: await readFile(
+        requiredOption(args, "--semantic-smoke-file"),
+        "utf8",
+      ),
       sourceCommit: requiredOption(args, "--commit-sha"),
       executedSha256: requiredOption(args, "--executed-sha256"),
     });

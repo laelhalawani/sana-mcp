@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
 import packageMetadata from "../../package.json" with { type: "json" };
+import { createSemanticBuildPlugin } from "../semantic/build-plugin.js";
 import {
   RELEASE_TARGETS,
   SOURCE_SEMANTIC_CAPABILITY,
@@ -668,18 +669,16 @@ export function parseCompileTarget(args: readonly string[]): ReleaseTarget {
   return parsed.data;
 }
 
-export const KEYWORD_STANDALONE_EXTERNALS = Object.freeze([
-  "@huggingface/transformers",
-  "sqlite-vec",
-]);
+export const STANDALONE_EXTERNALS = Object.freeze([] as const);
 
 export function createStandaloneBuildConfig(
   target: ReleaseTarget,
   outfile = "dist/sana-mcp",
 ): Bun.BuildConfig {
   return {
-    entrypoints: ["src/cli.ts"],
-    external: [...KEYWORD_STANDALONE_EXTERNALS],
+    entrypoints: ["src/semantic/standalone-entry.ts"],
+    external: [...STANDALONE_EXTERNALS],
+    plugins: [createSemanticBuildPlugin(target)],
     compile: {
       target,
       outfile,
@@ -687,7 +686,6 @@ export function createStandaloneBuildConfig(
       autoloadBunfig: false,
     },
     minify: true,
-    bytecode: true,
     define: {
       __SANA_BUILD_STANDALONE__: "true",
       __SANA_BUILD_VERSION__: JSON.stringify(packageMetadata.version),

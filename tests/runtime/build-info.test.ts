@@ -10,7 +10,7 @@ import {
   assertReleaseBuildHost,
   assertWindowsReleaseSourceRoot,
   createStandaloneBuildConfig,
-  KEYWORD_STANDALONE_EXTERNALS,
+  STANDALONE_EXTERNALS,
   parseCompileTarget,
   resolveBuildInfo,
   serializeStandaloneBuildInfoProperties,
@@ -75,7 +75,7 @@ describe("build identity", () => {
         "installerProtocol=1",
         "lifecycleProtocol=1",
         "stateCompatibility=1",
-        "semanticCapability=keyword",
+        "semanticCapability=bundled",
         "",
       ].join("\n"),
     );
@@ -309,22 +309,22 @@ describe("build identity", () => {
       expect(parsed).toBe(target);
 
       const config = createStandaloneBuildConfig(parsed);
+      expect(config.entrypoints).toEqual(["src/semantic/standalone-entry.ts"]);
       const externals = config.external;
       if (externals === undefined) {
         throw new Error(`standalone build ${target} omitted its externals`);
       }
-      expect(externals).toEqual([
-        "@huggingface/transformers",
-        "sqlite-vec",
-      ]);
-      expect(KEYWORD_STANDALONE_EXTERNALS).toEqual(externals);
+      expect(externals).toEqual([]);
+      expect(STANDALONE_EXTERNALS).toEqual(externals);
+      expect(config.plugins).toHaveLength(1);
+      expect(config.plugins?.[0]?.name).toBe(`sana-bundled-semantic-${target}`);
       expect(config.compile).toEqual({
         target,
         outfile: "dist/sana-mcp",
         autoloadDotenv: false,
         autoloadBunfig: false,
       });
-      expect(config.bytecode).toBe(true);
+      expect(config.bytecode).toBeUndefined();
       expect(config.define).toMatchObject({
         __SANA_BUILD_STANDALONE__: "true",
         __SANA_BUILD_TARGET__: JSON.stringify(target),

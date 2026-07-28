@@ -34,7 +34,7 @@ test("standalone store startup rejects relative HOME before filesystem mutation"
       __SANA_LIFECYCLE_PROTOCOL__: "1",
       __SANA_INSPECT_PROTOCOL__: "1",
       __SANA_STATE_COMPATIBILITY__: "1",
-      __SANA_SEMANTIC_CAPABILITY__: JSON.stringify("keyword"),
+      __SANA_SEMANTIC_CAPABILITY__: JSON.stringify("bundled"),
     };
     const build = await Bun.build({
       entrypoints: [

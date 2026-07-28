@@ -2,8 +2,8 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.13 sh
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.13/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.14 sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.14/install.sh | sh
 set -eu
 set -f
 umask 077
@@ -783,7 +783,7 @@ read_properties() {
   case "$P_stateCompatibility" in
     ""|0|0*|*[!0-9]*) fail "release state compatibility is invalid" ;;
   esac
-  [ "$P_semanticCapability" = "keyword" ] || fail "unsupported binary capability"
+  [ "$P_semanticCapability" = "bundled" ] || fail "unsupported binary capability"
   [ "$P_installerAssetName" = "install.sh" ] ||
     fail "release metadata does not bind the POSIX installer"
   [ "${#P_installerSha256}" -eq 64 ] ||
@@ -894,9 +894,12 @@ read_inspect() {
     [ "$I_target" = "$expected_target" ] &&
     [ "$I_installerProtocol" = "$expected_installer_protocol" ] &&
     [ "$I_lifecycleProtocol" = "$expected_lifecycle_protocol" ] &&
-    [ "$I_stateCompatibility" = "$expected_state_compatibility" ] &&
-    [ "$I_semanticCapability" = "keyword" ] ||
+    [ "$I_stateCompatibility" = "$expected_state_compatibility" ] ||
     fail "binary identity does not match its authoritative release metadata"
+  case "$inspect_context:$I_semanticCapability" in
+    release:bundled|receipt:keyword|receipt:bundled) ;;
+    *) fail "binary semantic capability does not match its authoritative context" ;;
+  esac
 }
 
 read_receipt() {
@@ -1167,10 +1170,20 @@ case "$os" in
   *) fail "unsupported OS: $os (on Windows use install.ps1)" ;;
 esac
 
-if [ "${libc:-}" = "musl" ] && command -v apk >/dev/null 2>&1; then
-  if ! apk info --exists libstdc++ >/dev/null 2>&1 ||
-    ! apk info --exists libgcc >/dev/null 2>&1; then
-    fail "Alpine requires the libstdc++ and libgcc runtime packages. Run: apk add --no-cache libstdc++ libgcc. Then rerun this installer."
+if [ "${libc:-}" = "musl" ]; then
+  case "$machine" in
+    x64) glibc_compat_loader=/lib/ld-linux-x86-64.so.2 ;;
+    arm64) glibc_compat_loader=/lib/ld-linux-aarch64.so.1 ;;
+    *) fail "unsupported musl architecture: $machine" ;;
+  esac
+  if command -v apk >/dev/null 2>&1; then
+    if ! apk info --exists libstdc++ >/dev/null 2>&1 ||
+      ! apk info --exists libgcc >/dev/null 2>&1 ||
+      ! apk info --exists gcompat >/dev/null 2>&1; then
+      fail "Alpine requires the libstdc++, libgcc, and gcompat runtime packages. Run: apk add --no-cache libstdc++ libgcc gcompat. Then rerun this installer."
+    fi
+  elif [ ! -e "$glibc_compat_loader" ]; then
+    fail "This musl system requires a glibc compatibility runtime providing $glibc_compat_loader for bundled semantic search. Install the distribution's compatibility runtime and rerun this installer."
   fi
 fi
 

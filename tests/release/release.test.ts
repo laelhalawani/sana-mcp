@@ -36,6 +36,7 @@ import {
 } from "../../src/release/contract.js";
 import { parseReleaseManifestJson } from "../../src/install/manifest.js";
 import type { ReleaseAsset } from "../../src/install/manifest.js";
+import { standaloneSemanticSmokeEvidence } from "../../src/semantic/smoke-contract.js";
 
 const sourceCommit = "0123456789abcdef0123456789abcdef01234567";
 const linuxOnlyTest = process.platform === "linux" ? test : test.skip;
@@ -57,6 +58,7 @@ async function makeArtifacts(directory: string): Promise<void> {
       target,
       artifact,
       inspectJson,
+      semanticSmokeJson: JSON.stringify(standaloneSemanticSmokeEvidence()),
       sourceCommit,
       executedSha256: await sha256File(artifact),
     });
@@ -86,10 +88,27 @@ test("attestation requires the exact digest acquired around execution", async ()
       target,
       artifact,
       inspectJson,
+      semanticSmokeJson: JSON.stringify(standaloneSemanticSmokeEvidence()),
       sourceCommit,
       executedSha256,
     });
     assert.equal(attestation.sha256, executedSha256);
+    assert.equal(attestation.semanticSmoke.target, target);
+    assert.equal(attestation.semanticSmoke.executedSha256, executedSha256);
+    await assert.rejects(
+      createAttestation({
+        target,
+        artifact,
+        inspectJson,
+        semanticSmokeJson: JSON.stringify({
+          ...standaloneSemanticSmokeEvidence(),
+          revision: "f".repeat(40),
+        }),
+        sourceCommit,
+        executedSha256,
+      }),
+      /semantic smoke output is invalid/,
+    );
 
     await writeFile(artifact, "bytes replaced after execution\n");
     await assert.rejects(
@@ -97,6 +116,7 @@ test("attestation requires the exact digest acquired around execution", async ()
         target,
         artifact,
         inspectJson,
+        semanticSmokeJson: JSON.stringify(standaloneSemanticSmokeEvidence()),
         sourceCommit,
         executedSha256,
       }),
@@ -107,6 +127,7 @@ test("attestation requires the exact digest acquired around execution", async ()
         target,
         artifact,
         inspectJson,
+        semanticSmokeJson: JSON.stringify(standaloneSemanticSmokeEvidence()),
         sourceCommit,
         executedSha256: "not-a-digest",
       }),

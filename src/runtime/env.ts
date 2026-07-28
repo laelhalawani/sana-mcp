@@ -17,7 +17,7 @@ export const RUNTIME_DEFAULTS = Object.freeze({
   embedDimension: 384,
   embedMinWords: 5,
   embedIdleMs: 60_000,
-  semanticEnabled: false,
+  semanticEnabled: true,
 });
 
 export class EnvironmentConfigError extends Error {

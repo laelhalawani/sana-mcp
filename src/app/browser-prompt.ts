@@ -17,7 +17,7 @@ import {
   type MeetingListRow,
 } from "../store/db.js";
 import type { AppRuntime } from "./runtime.js";
-import type { TerminalOutput, TerminalUi } from "./ui.js";
+import { displayWidth, type TerminalOutput, type TerminalUi } from "./ui.js";
 
 export type MeetingBrowserResult =
   | { action: "quit" }
@@ -33,9 +33,20 @@ type BrowserView =
   | { kind: "list" }
   | { kind: "status" }
   | { kind: "help" }
-  | { kind: "sync"; id: string }
+  | { kind: "sync"; id: string; returnTo: DetailReturn }
   | { kind: "actions"; id: string; title: string; selected: number }
-  | { kind: "detail"; id: string; title: string; lines: string[]; loading: boolean };
+  | {
+      kind: "detail";
+      id: string;
+      title: string;
+      lines: string[];
+      loading: boolean;
+      returnTo: DetailReturn;
+    };
+
+type DetailReturn =
+  | { kind: "list" }
+  | { kind: "actions"; title: string; selected: number };
 
 type StatusFilter = NonNullable<MeetingListOpts["status"]>;
 type StatusFilterChoice = StatusFilter | "all";
@@ -54,6 +65,8 @@ const MEETING_ACTIONS = [
   { label: "Sync details", value: "sync" },
   { label: "Back to meetings", value: "back" },
 ] as const;
+type MeetingDetailKind = "transcript" | "summary" | "participants" | "recording";
+const CARD_HEIGHT = 3;
 
 interface BrowserModel {
   status: ReturnType<AppRuntime["status"]>;
@@ -189,7 +202,11 @@ function syncDetailLines(row: MeetingListRow | undefined): string[] {
   return lines;
 }
 
-function transcriptDetail(runtime: AppRuntime, id: string): BrowserView {
+function transcriptDetail(
+  runtime: AppRuntime,
+  id: string,
+  returnTo: DetailReturn,
+): BrowserView {
   const result = runtime.transcript(id);
   if (result.kind === "ok") {
     return {
@@ -197,26 +214,31 @@ function transcriptDetail(runtime: AppRuntime, id: string): BrowserView {
       id,
       title: result.name,
       loading: false,
+      returnTo,
       lines: result.lines.map(
         (line) => `${line.n} [${line.time}] ${line.speaker}: ${line.text}`,
       ),
     };
   }
   if (result.kind === "no-meeting") {
-    return detail(id, "Transcript", [`No meeting found with ID ${id}.`]);
+    return detail(id, "Transcript", [`No meeting found with ID ${id}.`], returnTo);
   }
   if (result.kind === "still-listing") {
-    return detail(id, "Transcript", ["The meeting list is still syncing."]);
+    return detail(id, "Transcript", ["The meeting list is still syncing."], returnTo);
   }
   if (result.kind === "not-downloaded") {
     return detail(id, result.name, [
       `Transcript is downloading (${result.done}/${result.total}).`,
-    ]);
+    ], returnTo);
   }
-  return detail(id, result.name ?? "Transcript", artifactLines(result));
+  return detail(id, result.name ?? "Transcript", artifactLines(result), returnTo);
 }
 
-function summaryDetail(runtime: AppRuntime, id: string): BrowserView {
+function summaryDetail(
+  runtime: AppRuntime,
+  id: string,
+  returnTo: DetailReturn,
+): BrowserView {
   const result = runtime.summary(id);
   if (result.kind === "ok") {
     const view = result.view;
@@ -230,18 +252,22 @@ function summaryDetail(runtime: AppRuntime, id: string): BrowserView {
         topic.topic,
         ...topic.notes.map((note) => `- ${note}`),
       ]),
-    ]);
+    ], returnTo);
   }
   if (result.kind === "no-meeting") {
-    return detail(id, "Summary", [`No meeting found with ID ${id}.`]);
+    return detail(id, "Summary", [`No meeting found with ID ${id}.`], returnTo);
   }
   if (result.kind === "none") {
-    return detail(id, result.name, ["No summary is available."]);
+    return detail(id, result.name, ["No summary is available."], returnTo);
   }
-  return detail(id, result.name ?? "Summary", artifactLines(result));
+  return detail(id, result.name ?? "Summary", artifactLines(result), returnTo);
 }
 
-function participantsDetail(runtime: AppRuntime, id: string): BrowserView {
+function participantsDetail(
+  runtime: AppRuntime,
+  id: string,
+  returnTo: DetailReturn,
+): BrowserView {
   const result = runtime.participants(id);
   if (result.kind === "ok") {
     return detail(
@@ -258,38 +284,45 @@ function participantsDetail(runtime: AppRuntime, id: string): BrowserView {
           }`;
         },
       ),
+      returnTo,
     );
   }
   if (result.kind === "no-meeting") {
-    return detail(id, "Participants", [`No meeting found with ID ${id}.`]);
+    return detail(id, "Participants", [`No meeting found with ID ${id}.`], returnTo);
   }
   if (result.kind === "none") {
-    return detail(id, result.name, ["No participants are available."]);
+    return detail(id, result.name, ["No participants are available."], returnTo);
   }
-  return detail(id, result.name ?? "Participants", artifactLines(result));
+  return detail(id, result.name ?? "Participants", artifactLines(result), returnTo);
 }
 
-function detail(id: string, title: string, lines: string[]): BrowserView {
-  return { kind: "detail", id, title, lines, loading: false };
+function detail(
+  id: string,
+  title: string,
+  lines: string[],
+  returnTo: DetailReturn = { kind: "list" },
+): BrowserView {
+  return { kind: "detail", id, title, lines, loading: false, returnTo };
 }
 
 function recordingLines(
   id: string,
   result: Awaited<ReturnType<AppRuntime["recording"]>>,
+  returnTo: DetailReturn,
 ): BrowserView {
-  if (result.kind === "ok") return detail(id, result.name, [result.url]);
+  if (result.kind === "ok") return detail(id, result.name, [result.url], returnTo);
   if (result.kind === "none") {
-    return detail(id, result.name, ["No recording is available."]);
+    return detail(id, result.name, ["No recording is available."], returnTo);
   }
   if (result.kind === "no-meeting") {
-    return detail(id, "Recording", [`No meeting found with ID ${id}.`]);
+    return detail(id, "Recording", [`No meeting found with ID ${id}.`], returnTo);
   }
   if (result.kind === "expired") {
-    return detail(id, "Recording", ["Your Sana session has expired. Sign in again."]);
+    return detail(id, "Recording", ["Your Sana session has expired. Sign in again."], returnTo);
   }
   return detail(id, "Recording", [
     `Could not load the recording link: ${result.message}`,
-  ]);
+  ], returnTo);
 }
 
 function statusLines(status: BrowserModel["status"]): string[] {
@@ -345,6 +378,92 @@ function keyName(key: KeypressEvent): string {
   return (key.name || sequence || "").toLowerCase();
 }
 
+function detailReturn(
+  returnTo: DetailReturn,
+  kind: MeetingDetailKind,
+): DetailReturn {
+  if (returnTo.kind === "list") return returnTo;
+  const selected = MEETING_ACTIONS.findIndex((action) => action.value === kind);
+  return { ...returnTo, selected };
+}
+
+function returnView(id: string, returnTo: DetailReturn): BrowserView {
+  return returnTo.kind === "list"
+    ? { kind: "list" }
+    : { id, ...returnTo };
+}
+
+function cardCapacity(bodyHeight: number): number {
+  return Math.floor(Math.max(0, bodyHeight) / CARD_HEIGHT);
+}
+
+function statusLabel(status: ReturnType<typeof rowStatus>): string {
+  return `${status[0]!.toUpperCase()}${status.slice(1)}`;
+}
+
+function meetingCard(
+  row: MeetingListRow,
+  selected: boolean,
+  width: number,
+  ui: TerminalUi,
+): string[] {
+  const pointer = selected ? ui.glyphs.pointer : " ";
+  const rail = selected ? (ui.policy.unicode ? "│" : "|") : " ";
+  if (width <= 2) {
+    const padding = " ".repeat(width - 1);
+    return [
+      ui.line(selected ? ui.color.cyan(pointer) : pointer, padding).text,
+      ui.line(selected ? ui.color.cyan(rail) : rail, padding).text,
+      "",
+    ];
+  }
+
+  const contentWidth = width - 2;
+  const title = ui.truncate(row.name, contentWidth);
+  const titleLine = ui.line(
+    selected ? ui.color.cyan(pointer) : pointer,
+    " ",
+    selected ? ui.color.bold(title) : title,
+  ).text;
+
+  const status = rowStatus(row);
+  const statusText = statusLabel(status);
+  const date = new Date(row.created_at_ms).toLocaleString();
+  const words =
+    row.word_count === null
+      ? null
+      : `${row.word_count.toLocaleString()} ${row.word_count === 1 ? "word" : "words"}`;
+  let metadata = [date, ...(words === null ? [] : [words]), statusText];
+  if (displayWidth(metadata.join("  ")) > contentWidth && words !== null) {
+    metadata = [date, statusText];
+  }
+  if (displayWidth(metadata.join("  ")) > contentWidth) metadata = [statusText];
+
+  const precedingMetadata =
+    metadata.length === 1 ? "" : `${metadata.slice(0, -1).join("  ")}  `;
+  const visibleStatus = ui.truncate(
+    statusText,
+    Math.max(0, contentWidth - displayWidth(precedingMetadata)),
+  );
+  const styledStatus =
+    status === "ready"
+      ? ui.color.green(visibleStatus)
+      : status === "downloading"
+        ? ui.color.cyan(visibleStatus)
+        : ui.color.yellow(visibleStatus);
+  const metadataLine = ui.line(
+    selected ? ui.color.cyan(rail) : rail,
+    " ",
+    precedingMetadata,
+    styledStatus,
+  ).text;
+  return [titleLine, metadataLine, ""];
+}
+
+function adaptiveFooter(width: number, choices: readonly string[]): string {
+  return choices.find((choice) => displayWidth(choice) <= width) ?? choices.at(-1) ?? "";
+}
+
 const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
   (config, done) => {
     const [model, setModel] = useState<BrowserModel>(() =>
@@ -387,13 +506,31 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
           });
           return;
         }
+        requestToken.current += 1;
+        const target =
+          current.view.kind === "actions"
+            ? {
+                id: current.view.id,
+                returnTo: {
+                  kind: "actions" as const,
+                  title: current.view.title,
+                  selected: current.view.selected,
+                },
+              }
+            : current.view.kind === "detail" || current.view.kind === "sync"
+              ? { id: current.view.id, returnTo: current.view.returnTo }
+              : {
+                  id: current.selectedId ?? "",
+                  returnTo: { kind: "list" as const },
+                };
         setModel({
           ...current,
           scroll: 0,
           view: detail(
-            current.selectedId ?? "",
+            target.id,
             "Refresh failed",
             [error instanceof Error ? error.message : String(error)],
+            target.returnTo,
           ),
         });
       }
@@ -415,32 +552,38 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
     const openSelected = (
       kind: "transcript" | "summary" | "participants",
       requestedId?: string,
+      requestedReturn?: DetailReturn,
     ) => {
       const id = requestedId ?? modelRef.current.selectedId;
       if (id === null) return;
+      const returnTo = requestedReturn ?? { kind: "list" };
       requestToken.current += 1;
       try {
         const view =
           kind === "transcript"
-            ? transcriptDetail(config.runtime, id)
+            ? transcriptDetail(config.runtime, id, returnTo)
             : kind === "summary"
-              ? summaryDetail(config.runtime, id)
-              : participantsDetail(config.runtime, id);
+              ? summaryDetail(config.runtime, id, returnTo)
+              : participantsDetail(config.runtime, id, returnTo);
         setModel({ ...modelRef.current, view, scroll: 0 });
       } catch (error) {
         setModel({
           ...modelRef.current,
           view: detail(id, kind, [
             error instanceof Error ? error.message : String(error),
-          ]),
+          ], returnTo),
           scroll: 0,
         });
       }
     };
 
-    const openRecording = async (requestedId?: string) => {
+    const openRecording = async (
+      requestedId?: string,
+      requestedReturn?: DetailReturn,
+    ) => {
       const id = requestedId ?? modelRef.current.selectedId;
       if (id === null) return;
+      const returnTo = requestedReturn ?? { kind: "list" };
       const token = ++requestToken.current;
       setModel({
         ...modelRef.current,
@@ -451,6 +594,7 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
           title: "Recording",
           lines: ["Loading recording..."],
           loading: true,
+          returnTo,
         },
       });
       try {
@@ -463,7 +607,7 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         ) {
           return;
         }
-        setModel({ ...current, view: recordingLines(id, result), scroll: 0 });
+        setModel({ ...current, view: recordingLines(id, result, returnTo), scroll: 0 });
       } catch (error) {
         const current = modelRef.current;
         if (
@@ -477,7 +621,7 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
           ...current,
           view: detail(id, "Recording", [
             error instanceof Error ? error.message : String(error),
-          ]),
+          ], returnTo),
           scroll: 0,
         });
       }
@@ -598,24 +742,29 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       }
 
       if (current.view.kind === "actions") {
+        const returnTo: DetailReturn = {
+          kind: "actions",
+          title: current.view.title,
+          selected: current.view.selected,
+        };
         if (name === "escape") {
           setModel({ ...current, view: { kind: "list" }, scroll: 0 });
           return;
         }
         if (name === "t") {
-          openSelected("transcript", current.view.id);
+          openSelected("transcript", current.view.id, detailReturn(returnTo, "transcript"));
           return;
         }
         if (name === "s") {
-          openSelected("summary", current.view.id);
+          openSelected("summary", current.view.id, detailReturn(returnTo, "summary"));
           return;
         }
         if (name === "p") {
-          openSelected("participants", current.view.id);
+          openSelected("participants", current.view.id, detailReturn(returnTo, "participants"));
           return;
         }
         if (name === "o") {
-          await openRecording(current.view.id);
+          await openRecording(current.view.id, detailReturn(returnTo, "recording"));
           return;
         }
         if (isUpKey(key) || isDownKey(key) || name === "j" || name === "k") {
@@ -635,24 +784,48 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
           if (action === "back") {
             setModel({ ...current, view: { kind: "list" }, scroll: 0 });
           } else if (action === "recording") {
-            await openRecording(current.view.id);
+            await openRecording(current.view.id, returnTo);
           } else if (action === "sync") {
             setModel({
               ...current,
-              view: { kind: "sync", id: current.view.id },
+              view: { kind: "sync", id: current.view.id, returnTo },
               scroll: 0,
             });
           } else {
-            openSelected(action, current.view.id);
+            openSelected(action, current.view.id, returnTo);
           }
         }
         return;
       }
 
       if (current.view.kind !== "list") {
+        if (current.view.kind === "detail" || current.view.kind === "sync") {
+          const id = current.view.id;
+          const returnTo = current.view.returnTo;
+          if (name === "t") {
+            openSelected("transcript", id, detailReturn(returnTo, "transcript"));
+            return;
+          }
+          if (name === "s") {
+            openSelected("summary", id, detailReturn(returnTo, "summary"));
+            return;
+          }
+          if (name === "p") {
+            openSelected("participants", id, detailReturn(returnTo, "participants"));
+            return;
+          }
+          if (name === "o") {
+            await openRecording(id, detailReturn(returnTo, "recording"));
+            return;
+          }
+        }
         if (name === "escape") {
           requestToken.current += 1;
-          setModel({ ...current, view: { kind: "list" }, scroll: 0 });
+          const view =
+            current.view.kind === "detail" || current.view.kind === "sync"
+              ? returnView(current.view.id, current.view.returnTo)
+              : { kind: "list" as const };
+          setModel({ ...current, view, scroll: 0 });
           return;
         }
         const syncId = current.view.kind === "sync" ? current.view.id : null;
@@ -741,7 +914,11 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         if (current.selectedId !== null) {
           setModel({
             ...current,
-            view: { kind: "sync", id: current.selectedId },
+            view: {
+              kind: "sync",
+              id: current.selectedId,
+              returnTo: { kind: "list" },
+            },
             scroll: 0,
           });
         }
@@ -783,7 +960,7 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       const rows = current.page?.rows ?? [];
       if (rows.length === 0) return;
       const index = selectedIndex(current);
-      const capacity = Math.max(1, bodyRows());
+      const capacity = Math.max(1, cardCapacity(bodyRows()));
       let next = index;
       if (isUpKey(key) || name === "k") next -= 1;
       else if (isDownKey(key) || name === "j") next += 1;
@@ -797,6 +974,11 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         0,
         Math.min(current.listTop, Math.max(0, rows.length - capacity)),
       );
+      if (name === "pageup") listTop = Math.max(0, listTop - capacity);
+      else if (name === "pagedown") {
+        listTop = Math.min(Math.max(0, rows.length - capacity), listTop + capacity);
+      } else if (name === "home") listTop = 0;
+      else if (name === "end") listTop = Math.max(0, rows.length - capacity);
       if (next < listTop) listTop = next;
       if (next >= listTop + capacity) listTop = next - capacity + 1;
       setModel({ ...current, selectedId: rows[next]!.id, listTop });
@@ -845,17 +1027,38 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       header = "Sync status";
       body = statusLines(model.status).slice(model.scroll, model.scroll + capacity);
       if (model.refreshError) body.push(`Refresh failed: ${model.refreshError}`);
-      footer = "auto-refreshing  r refresh  esc meetings  q quit";
+      footer = adaptiveFooter(renderWidth, [
+        "auto-refreshing  r refresh  esc meetings  q quit",
+        "r refresh  esc meetings  q quit",
+        "r refresh  esc back  q quit",
+        "esc back  q quit",
+        "esc back",
+        "q",
+      ]);
     } else if (model.view.kind === "help") {
       header = "Keyboard help";
       body = HELP_LINES.slice(model.scroll, model.scroll + capacity);
-      footer = "up/down scroll  esc meetings  q quit";
+      footer = adaptiveFooter(renderWidth, [
+        "up/down scroll  esc meetings  q quit",
+        "up/down scroll  esc back",
+        "esc back  q quit",
+        "esc back",
+        "q",
+      ]);
     } else if (model.view.kind === "detail") {
       header = `${model.view.loading ? "Loading: " : ""}${model.view.title}`;
       const maximum = Math.max(0, model.view.lines.length - capacity);
       const scroll = Math.max(0, Math.min(maximum, model.scroll));
       body = model.view.lines.slice(scroll, scroll + capacity);
-      footer = "up/down scroll  pgup/pgdn page  esc meetings  q quit";
+      const back = model.view.returnTo.kind === "actions" ? "actions" : "meetings";
+      footer = adaptiveFooter(renderWidth, [
+        `up/down scroll  pgup/pgdn page  t/s/p/o switch  esc ${back}  q quit`,
+        `pgup/pgdn page  t/s/p/o switch  esc ${back}`,
+        `t/s/p/o switch  esc ${back}`,
+        `esc ${back}  q quit`,
+        "esc back",
+        "q",
+      ]);
     } else if (model.view.kind === "actions") {
       const selected = model.view.selected;
       const top = Math.max(
@@ -870,7 +1073,14 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         const active = top + index === selected;
         return `${active ? ui.glyphs.pointer : " "} ${action.label}`;
       });
-      footer = "up/down choose  enter open  t transcript  s summary  p participants  esc back";
+      footer = adaptiveFooter(renderWidth, [
+        "up/down choose  enter open  t transcript  s summary  p participants  o recording  esc meetings",
+        "up/down choose  enter open  t/s/p/o open  esc meetings",
+        "enter open  t/s/p/o open  esc back",
+        "enter open  esc back",
+        "esc back",
+        "q",
+      ]);
     } else if (model.view.kind === "sync") {
       const syncId = model.view.id;
       const row = model.page?.rows.find((item) => item.id === syncId);
@@ -879,13 +1089,22 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       const maximum = Math.max(0, lines.length - capacity);
       const scroll = Math.max(0, Math.min(maximum, model.scroll));
       body = lines.slice(scroll, scroll + capacity);
-      footer = "auto-refreshing  pgup/pgdn page  esc meetings  q quit";
+      const back = model.view.returnTo.kind === "actions" ? "actions" : "meetings";
+      footer = adaptiveFooter(renderWidth, [
+        `auto-refreshing  pgup/pgdn page  t/s/p/o switch  esc ${back}  q quit`,
+        `pgup/pgdn page  t/s/p/o switch  esc ${back}`,
+        `t/s/p/o switch  esc ${back}`,
+        `esc ${back}  q quit`,
+        "esc back",
+        "q",
+      ]);
     } else if (model.status.blocking) {
       header = "sana-mcp | preparing meeting cache";
       body = statusLines(model.status).slice(0, capacity);
       footer = "auto-refreshing  r refresh  i status  esc menu  q quit";
     } else {
       const meetingRows = model.page?.rows ?? [];
+      const meetingCapacity = cardCapacity(capacity);
       header = `Meetings | ${model.status.meetings ?? 0} ready${
         model.status.remaining ? ` | ${model.status.remaining} syncing` : ""
       }${model.filter ? ` | name: ${model.filter}` : ""}${
@@ -894,40 +1113,31 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       const index = selectedIndex(model);
       let top = Math.max(
         0,
-        Math.min(model.listTop, Math.max(0, meetingRows.length - capacity)),
+        Math.min(model.listTop, Math.max(0, meetingRows.length - meetingCapacity)),
       );
-      if (capacity > 0 && index >= 0) {
+      if (meetingCapacity > 0 && index >= 0) {
         if (index < top) top = index;
-        if (index >= top + capacity) top = index - capacity + 1;
+        if (index >= top + meetingCapacity) top = index - meetingCapacity + 1;
       }
-      body = meetingRows.slice(top, top + capacity).map((row) => {
-        const pointer = row.id === model.selectedId ? ui.glyphs.pointer : " ";
-        const date = new Date(row.created_at_ms).toISOString().slice(0, 10);
-        const status = rowStatus(row);
-        const statusToken = `[${status.padEnd(11)}]`;
-        const raw = ui.truncate(
-          `${pointer} ${date}  ${statusToken} ${row.name}`,
-          renderWidth,
-        );
-        const styledStatus =
-          status === "ready"
-            ? ui.color.green(statusToken).text
-            : status === "downloading"
-              ? ui.color.cyan(statusToken).text
-              : ui.color.yellow(statusToken).text;
-        const withStatus = raw.replace(statusToken, styledStatus);
-        return row.id === model.selectedId
-          ? withStatus.replace(pointer, ui.color.cyan(pointer).text)
-          : withStatus;
-      });
-      if (body.length === 0 && capacity > 0) {
+      body = meetingRows
+        .slice(top, top + meetingCapacity)
+        .flatMap((row) => meetingCard(row, row.id === model.selectedId, renderWidth, ui));
+      if (body.length === 0 && capacity > 0 && meetingRows.length === 0) {
         body = [
           model.filter || model.statusFilter
             ? "No meetings match the current filters. Press / or f to edit, or c to clear."
             : "No ready or syncing meetings found.",
         ];
       }
-      footer = "Enter actions  t transcript  s summary  p participants  PgUp/PgDn page  / filter by name  f filter by status";
+      footer = adaptiveFooter(renderWidth, [
+        "Enter actions  t transcript  s summary  p participants  o recording  PgUp/PgDn page  / name filter  f status filter",
+        "Enter actions  t/s/p/o open  PgUp/PgDn page  / name  f status",
+        "Enter actions  t/s/p/o open  PgUp/PgDn page",
+        "Enter actions  up/down move",
+        "Enter open  up/down move",
+        "Enter open",
+        "q",
+      ]);
     }
 
     const rendered: string[] = [];
@@ -939,7 +1149,9 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         ...body
           .slice(0, capacity)
           .map((line) =>
-            line.includes("\x1b[") ? line : ui.truncate(line, renderWidth),
+            model.view.kind === "list" && line.includes("\x1b[")
+              ? line
+              : ui.truncate(line, renderWidth),
           ),
       );
       while (rendered.length < availableRows - 1) rendered.push("");

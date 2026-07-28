@@ -41,7 +41,7 @@ export const TOOLS: ToolDoc[] = [
   {
     name: "search",
     summary:
-      "Search transcripts and get matching lines with meeting id and line number. Keyword (BM25, whole-word) by default; becomes hybrid keyword+semantic when semantic search is enabled (SANA_SEMANTIC=1).",
+      "Search transcripts and get matching lines with meeting id and line number. Hybrid keyword+semantic search is enabled by default and may download a verified public model on first use; set SANA_SEMANTIC=0 for keyword-only BM25 search.",
     args:
       'query: string (required); page: number (default 1); limit: number (page size, default 10); sort: "best" (default, relevance) or "newest" or "oldest"; filter: {date: {from, to}} where from/to are ISO dates ("YYYY-MM-DD") or epoch ms',
     example: 'meeting_transcripts("search", {"query":"pricing", "sort":"newest"})',
@@ -61,7 +61,7 @@ export const TOOLS: ToolDoc[] = [
   {
     name: "recording",
     summary:
-      "Get a temporary link to a meeting's recording. Fetched live from Sana (the only tool that hits the network); the URL expires after a few hours.",
+      "Get a temporary link to a meeting's recording. Fetched live from Sana; the URL expires after a few hours.",
     args: "meeting_id: string (required)",
     example: 'meeting_transcripts("recording", {"meeting_id":"<meeting-id>"})',
   },

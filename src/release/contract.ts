@@ -8,7 +8,7 @@ export const SUPPORTED_RELEASE_PROTOCOLS = Object.freeze({
 } as const);
 
 export const SOURCE_SEMANTIC_CAPABILITY = "source-semantic" as const;
-export const STANDALONE_SEMANTIC_CAPABILITY = "keyword" as const;
+export const STANDALONE_SEMANTIC_CAPABILITY = "bundled" as const;
 
 export type SemanticCapability =
   | typeof SOURCE_SEMANTIC_CAPABILITY

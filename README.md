@@ -54,10 +54,10 @@ not launch the configurer. A compatible Windows updater is silent about setup an
 preserves registrations and local state; only an incompatible Windows updater
 prints the deferred command to configure clients and sign in.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.13` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.14` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
-`apk add --no-cache libstdc++ libgcc`; the installer detects and reports this
+`apk add --no-cache libstdc++ libgcc gcompat`; the installer detects and reports this
 before downloading release metadata or binary assets. Windows ARM64 is not yet
 in the verified release matrix.
 
@@ -142,8 +142,9 @@ Notes:
 - `read.lines` is a 1-based `[start, end]` range. With no selection it reports
   the line count and your options; `full: true` returns everything.
 - `search.sort` is `"best"` (relevance, default), `"newest"`, or `"oldest"`.
-- `recording` is the only tool that hits the network; the returned URL expires
-  after a few hours.
+- `recording` fetches a live Sana URL that expires after a few hours. Initial
+  semantic indexing or search may also download the verified public model; no
+  meeting data is sent with that request.
 
 Example:
 
@@ -247,27 +248,21 @@ progress, then ask your agent to search, read, or summarize your meetings.
 **Keyword search is always available** - a line-level SQLite FTS5 index with BM25
 ranking, whole-word matching, and phrase / date-range / sort options.
 
-**Semantic / hybrid search is optional**, because it loads an embedding model
-(RAM/CPU cost). Enable it with `SANA_SEMANTIC=1` and `search` becomes hybrid -
-keyword + semantic results fused by Reciprocal Rank Fusion:
-
-```bash
-# From a source checkout (installs the optional deps transformers.js + sqlite-vec)
-bun install
-SANA_SEMANTIC=1 bun src/cli.ts daemon
-# set SANA_SEMANTIC=1 for the MCP server process too
-```
+**Semantic / hybrid search is enabled by default**. Search combines keyword and
+semantic results using Reciprocal Rank Fusion. Set `SANA_SEMANTIC=0` for
+keyword-only search when the embedding model's RAM/CPU cost is undesirable.
 
 The model (`Xenova/all-MiniLM-L6-v2`, q8) is loaded lazily on demand and unloaded
 after roughly a minute of idle (about 150 MB only while active); vectors are
 stored in the same SQLite database via `sqlite-vec`. When enabled, embeddings are
 built as part of the login catch-up because they are required for hybrid ranking.
 
-> The embedding model and `sqlite-vec` are optional dependencies. They are
-> installed by `bun install` (source), but are **not bundled in the prebuilt
-> binary**. If the model cannot be loaded, `search` returns keyword (BM25)
-> results with an explicit semantic-degradation notice; it never presents those
-> results as hybrid search.
+> Prebuilt binaries bundle the semantic runtime and platform-specific
+> `sqlite-vec` extension. Initial semantic indexing or search downloads the
+> exact pinned model revision (about 23.7 MB) over HTTPS and verifies every
+> file's size and SHA-256.
+> If semantic initialization fails, `search` returns keyword (BM25) results with
+> an explicit degradation notice; it never presents those results as hybrid.
 
 ## Configuration
 
@@ -275,7 +270,7 @@ All environment variables are optional.
 
 | var | default | purpose |
 |-----|---------|---------|
-| `SANA_SEMANTIC`            | off             | `1` to enable semantic / hybrid search                       |
+| `SANA_SEMANTIC`            | on              | `0` to disable semantic / hybrid search                      |
 | `SANA_SYNC_INTERVAL_MS`    | `600000`        | how often the daemon checks for new meetings                  |
 | `SANA_REQUEST_DELAY_MS`    | `150`           | delay between Sana artifact requests                          |
 | `SANA_MAX_ATTEMPTS`        | `5`             | failures before the retry delay stops increasing              |
@@ -296,7 +291,9 @@ binary, `./data` when running from source), and nothing there is committed:
 - `models/` - cached embedding model (only when semantic search is enabled).
 - `daemon.log` - background daemon log.
 
-No data leaves your machine except the authenticated requests to Sana itself.
+Meeting data leaves your machine only in authenticated requests to Sana.
+Initial semantic indexing or search also downloads the pinned public model
+files from Hugging Face; transcripts and queries are never sent there.
 
 ## Build from source
 

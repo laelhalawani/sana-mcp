@@ -4,7 +4,6 @@ import {
   rowStatus,
   type ArtifactProblem,
 } from "../core/meetings.js";
-import { snippetAround } from "../core/search.js";
 import { sanitizeTerminalText } from "./render.js";
 import {
   LocalAppRuntime,
@@ -113,50 +112,6 @@ async function showMeetings(runtime: AppRuntime): Promise<void> {
   }
   if (result.hasMore) {
     line(`Showing 20 of ${result.total}. Use sana-mcp list --page 2 for more.`);
-  }
-}
-
-async function showSearch(
-  runtime: AppRuntime,
-  prompts: AppPrompts,
-): Promise<void> {
-  const input = await prompts.input("Search your transcripts");
-  if (input === null) return;
-  const query = input.trim();
-  if (!query) return;
-  if (!/[\p{L}\p{N}]/u.test(query)) {
-    line("Enter at least one word to search.");
-    return;
-  }
-  const result = await runtime.search({ query, limit: 10 });
-  line();
-  if (result.kind === "no-query" || result.kind === "no-terms") {
-    line("Enter at least one word to search.");
-    return;
-  }
-  if (result.kind === "error") {
-    line(`Search failed: ${result.message}`);
-    return;
-  }
-  if (result.rows.length === 0) {
-    line(
-      result.total === 0
-        ? `No transcript matches for "${query}".`
-        : `No matches on page ${result.page}. ${result.total} matching line(s) exist across ${Math.ceil(result.total / result.limit)} page(s).`,
-    );
-  }
-  for (const match of result.rows) {
-    line(
-      `${date(match.created_at_ms)}  ${match.name}  line ${match.line_no}`,
-    );
-    line(`  ${snippetAround(match.text, result.anchor)}`);
-  }
-  if (result.degradation) {
-    const detail =
-      result.degradation.message === undefined
-        ? result.degradation.code
-        : `${result.degradation.code}: ${result.degradation.message}`;
-    line(`Semantic search unavailable (${detail}); showing keyword results.`);
   }
 }
 
@@ -421,7 +376,10 @@ export async function runApp(
           if (result.action === "quit") return;
         }
         else if (choice === "meeting") await showMeeting(activeRuntime, prompts);
-        else if (choice === "search") await showSearch(activeRuntime, prompts);
+        else if (choice === "search") {
+          const result = await prompts.search(activeRuntime);
+          if (result.action === "quit") return;
+        }
       } catch (error) {
         if (error instanceof ExitPromptError) return;
         line(`Could not complete that action: ${errorMessage(error)}`);
