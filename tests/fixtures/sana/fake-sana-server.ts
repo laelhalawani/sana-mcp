@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-type ServerMode = "source" | "native";
+type ServerMode = "source" | "native" | "daemon-restart";
 type ServerScenario =
   | "happy"
   | "workspace-unavailable"
@@ -151,7 +151,11 @@ function assertJsonKeys(
   }
 }
 
-const mode = exactChoice<ServerMode>("--mode", ["source", "native"]);
+const mode = exactChoice<ServerMode>("--mode", [
+  "source",
+  "native",
+  "daemon-restart",
+]);
 const scenario = exactChoice<ServerScenario>("--scenario", [
   "happy",
   "workspace-unavailable",
@@ -249,14 +253,14 @@ function requireNativeReleaseFile(): string | undefined {
   if (mode === "source") {
     if (configuredNativeReleaseFile !== undefined) {
       throw new Error(
-        "--native-release-file is forbidden when --mode is source",
+        `--native-release-file is forbidden when --mode is ${mode}`,
       );
     }
     return undefined;
   }
   if (configuredNativeReleaseFile === undefined) {
     throw new Error(
-      "--native-release-file is required when --mode is native",
+      `--native-release-file is required when --mode is ${mode}`,
     );
   }
   return authorizeControlFile(
@@ -290,9 +294,20 @@ const syntheticWorkspace = "synthetic-workspace";
 const csrfToken = "synthetic-csrf-token";
 const requestCookie = "sana-ai-session=request-session";
 const freshCookie = "sana-ai-session=fresh-session";
-const expectedCount = mode === "source" ? 4 : 6;
+const expectedCount =
+  mode === "source" ? 4 : mode === "native" ? 6 : 2;
+const configuredPort = optionalArgument("--port");
+const serverPort = configuredPort === undefined ? 0 : Number(configuredPort);
+if (
+  !Number.isSafeInteger(serverPort) ||
+  serverPort < 0 ||
+  serverPort > 65_535
+) {
+  throw new Error("--port must be an integer between 0 and 65535");
+}
 const observations: RequestObservation[] = [];
 let requestIndex = 0;
+let restartAwaitingList = false;
 let terminal = false;
 const lifetimeDeadline = Date.now() + lifetimeMs;
 
@@ -403,6 +418,15 @@ function publishDaemonBlocked(): void {
   });
 }
 
+function publishRestartRunning(): void {
+  writeJsonAtomic(stateFile, {
+    kind: "restart-running",
+    mode,
+    scenario,
+    requests: observations,
+  });
+}
+
 async function awaitReleaseFile(
   releaseFile: string,
   description: string,
@@ -489,7 +513,7 @@ function finalJsonResponse(value: unknown): Response {
 
 server = Bun.serve({
   hostname: "127.0.0.1",
-  port: 0,
+  port: serverPort,
   development: false,
   async fetch(request): Promise<Response> {
     if (terminal) {
@@ -513,6 +537,75 @@ server = Bun.serve({
     });
     try {
       assertHeader(request, "host", `127.0.0.1:${server.port}`);
+      if (mode === "daemon-restart") {
+        if (url.pathname === "/x-api/trpc/user.me") {
+          if (
+            request.method !== "GET" ||
+            url.search !== ""
+          ) {
+            throw new Error(
+              "restart request was not the exact daemon user.me query",
+            );
+          }
+          assertHeader(request, "accept", "application/json");
+          assertHeader(request, "cookie", freshCookie);
+          assertHeader(
+            request,
+            "sana-ai-workspace-id",
+            syntheticWorkspace,
+          );
+          restartAwaitingList = true;
+          publishRestartRunning();
+          if (nativeReleaseFile === undefined) {
+            throw new Error(
+              "restart daemon release authority is unavailable",
+            );
+          }
+          await awaitReleaseFile(
+            nativeReleaseFile,
+            "restart daemon release",
+          );
+          return jsonResponse(daemonMeResponse());
+        }
+        if (url.pathname === "/x-api/trpc/asset.listRecent") {
+          if (
+            !restartAwaitingList ||
+            request.method !== "GET" ||
+            url.searchParams.size !== 1
+          ) {
+            throw new Error(
+              "restart request was not the exact daemon meeting-list query",
+            );
+          }
+          assertHeader(request, "accept", "application/json");
+          assertHeader(request, "cookie", freshCookie);
+          assertHeader(
+            request,
+            "sana-ai-workspace-id",
+            syntheticWorkspace,
+          );
+          const input = JSON.parse(
+            url.searchParams.get("input") ?? "null",
+          );
+          assertJsonKeys(input, {
+            assetSourceTypes: ["sana-ai:meeting"],
+            direction: "forward",
+          });
+          restartAwaitingList = false;
+          publishRestartRunning();
+          return jsonResponse({
+            result: {
+              data: {
+                assets: [],
+                nextCursor: null,
+              },
+            },
+          });
+        }
+        throw new Error(
+          `unexpected restart request ${currentIndex}: ${request.method} ${url.pathname}`,
+        );
+      }
       if (currentIndex === 0) {
         if (
           request.method !== "GET" ||
