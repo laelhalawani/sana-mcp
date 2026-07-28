@@ -66,7 +66,8 @@ const semanticSmokeSchema = z
     model: z.literal(PINNED_MODEL_ID),
     revision: z.literal(PINNED_MODEL_REVISION),
     dimensions: z.tuple([z.literal(2), z.literal(384)]),
-    sqliteVec: z.literal("v0.1.9"),
+    vectorBackend: z.enum(["sqlite-vec", "portable"]),
+    sqliteVec: z.enum(["v0.1.9", "not-loaded"]),
     nearest: z.literal("row-0"),
   })
   .strict();
@@ -168,6 +169,18 @@ export async function createAttestation(options: {
       `executed binary target ${inspect.target} does not match requested target ${options.target}`,
     );
   }
+  const expectedVectorBackend = options.target.startsWith("bun-darwin-")
+    ? "portable"
+    : "sqlite-vec";
+  if (
+    semanticSmokeOutput.vectorBackend !== expectedVectorBackend ||
+    semanticSmokeOutput.sqliteVec !==
+      (expectedVectorBackend === "sqlite-vec" ? "v0.1.9" : "not-loaded")
+  ) {
+    throw new Error(
+      `semantic smoke backend does not match release target ${options.target}`,
+    );
+  }
   const expectedName = releaseAssetName(options.target);
   if (!isReleaseCommit(options.sourceCommit)) {
     throw new Error("attestation source commit must be a lowercase full Git commit SHA");
@@ -228,7 +241,9 @@ function canonicalAttestation(
       semanticCapability: STANDALONE_SEMANTIC_CAPABILITY,
     },
     semanticSmoke: {
-      ...standaloneSemanticSmokeEvidence(),
+      ...standaloneSemanticSmokeEvidence(
+        target.startsWith("bun-darwin-") ? "portable" : "sqlite-vec",
+      ),
       target,
       executedSha256: sha256,
     },

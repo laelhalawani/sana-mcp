@@ -11,6 +11,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeSync,
 } from "node:fs";
 import path from "node:path";
@@ -150,12 +151,18 @@ export function loadEmbeddedVectorExtension(
       if (digest(readFileSync(descriptor)) !== options.sha256) {
         throw new SemanticAssetError("sqlite-vec extension changed before loading");
       }
-      const descriptorPath =
-        process.platform === "darwin"
-          ? `/dev/fd/${descriptor}`
-          : `/proc/self/fd/${descriptor}`;
-      db.loadExtension(descriptorPath, "sqlite3_vec_init");
-      return;
+      const descriptorPath = `/proc/self/fd/${descriptor}`;
+      const loadPath = path.join(
+        path.dirname(extension),
+        `.load-${randomUUID()}-${path.basename(extension)}`,
+      );
+      symlinkSync(descriptorPath, loadPath);
+      try {
+        db.loadExtension(loadPath, "sqlite3_vec_init");
+        return;
+      } finally {
+        rmSync(loadPath, { force: true });
+      }
     } finally {
       closeSync(descriptor);
     }

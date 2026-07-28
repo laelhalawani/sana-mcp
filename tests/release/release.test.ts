@@ -58,7 +58,11 @@ async function makeArtifacts(directory: string): Promise<void> {
       target,
       artifact,
       inspectJson,
-      semanticSmokeJson: JSON.stringify(standaloneSemanticSmokeEvidence()),
+      semanticSmokeJson: JSON.stringify(
+        standaloneSemanticSmokeEvidence(
+          target.startsWith("bun-darwin-") ? "portable" : "sqlite-vec",
+        ),
+      ),
       sourceCommit,
       executedSha256: await sha256File(artifact),
     });
@@ -108,6 +112,19 @@ test("attestation requires the exact digest acquired around execution", async ()
         executedSha256,
       }),
       /semantic smoke output is invalid/,
+    );
+    await assert.rejects(
+      createAttestation({
+        target,
+        artifact,
+        inspectJson,
+        semanticSmokeJson: JSON.stringify(
+          standaloneSemanticSmokeEvidence("portable"),
+        ),
+        sourceCommit,
+        executedSha256,
+      }),
+      /semantic smoke backend does not match release target/,
     );
 
     await writeFile(artifact, "bytes replaced after execution\n");

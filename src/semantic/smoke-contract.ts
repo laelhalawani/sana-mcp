@@ -5,12 +5,15 @@ import {
 
 export const STANDALONE_SEMANTIC_SMOKE_VERSION = 1 as const;
 
-export function standaloneSemanticSmokeEvidence(): Readonly<{
+export function standaloneSemanticSmokeEvidence(
+  vectorBackend: "sqlite-vec" | "portable" = "sqlite-vec",
+): Readonly<{
   smokeVersion: 1;
   model: typeof PINNED_MODEL_ID;
   revision: typeof PINNED_MODEL_REVISION;
   dimensions: readonly [2, 384];
-  sqliteVec: "v0.1.9";
+  vectorBackend: "sqlite-vec" | "portable";
+  sqliteVec: "v0.1.9" | "not-loaded";
   nearest: "row-0";
 }> {
   return Object.freeze({
@@ -18,7 +21,8 @@ export function standaloneSemanticSmokeEvidence(): Readonly<{
     model: PINNED_MODEL_ID,
     revision: PINNED_MODEL_REVISION,
     dimensions: Object.freeze([2, 384] as const),
-    sqliteVec: "v0.1.9",
+    vectorBackend,
+    sqliteVec: vectorBackend === "sqlite-vec" ? "v0.1.9" : "not-loaded",
     nearest: "row-0",
   });
 }
