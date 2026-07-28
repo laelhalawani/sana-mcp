@@ -60,7 +60,9 @@ async function makeArtifacts(directory: string): Promise<void> {
       inspectJson,
       semanticSmokeJson: JSON.stringify(
         standaloneSemanticSmokeEvidence(
-          target.startsWith("bun-darwin-") ? "portable" : "sqlite-vec",
+          target.startsWith("bun-darwin-") || target.endsWith("-musl")
+            ? "portable"
+            : "sqlite-vec",
         ),
       ),
       sourceCommit,

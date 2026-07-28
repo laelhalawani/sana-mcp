@@ -26,9 +26,10 @@ import {
 
 describe("semantic build capability", () => {
   test("selects the portable vector backend only where Bun disables extensions", () => {
-    expect(vectorBackendForPlatform("darwin")).toBe("portable");
-    expect(vectorBackendForPlatform("linux")).toBe("sqlite-vec");
-    expect(vectorBackendForPlatform("win32")).toBe("sqlite-vec");
+    expect(vectorBackendForPlatform("darwin", "bun-darwin-arm64")).toBe("portable");
+    expect(vectorBackendForPlatform("linux", "bun-linux-x64-musl")).toBe("portable");
+    expect(vectorBackendForPlatform("linux", "bun-linux-x64")).toBe("sqlite-vec");
+    expect(vectorBackendForPlatform("win32", "bun-windows-x64")).toBe("sqlite-vec");
   });
 
   test("keeps an absent request disabled for every build capability", () => {

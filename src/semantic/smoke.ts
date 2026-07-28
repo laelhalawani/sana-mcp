@@ -11,6 +11,7 @@ import { standaloneSemanticSmokeEvidence } from "./smoke-contract.js";
 import {
   createPortableVectorSchema,
   portableKnn,
+  vectorBackendForPlatform,
 } from "./semantic.js";
 
 interface SmokeTransformersModule {
@@ -60,8 +61,9 @@ export async function runStandaloneSemanticSmoke(): Promise<void> {
   const db = new Database(":memory:");
   try {
     const query = output.data.slice(0, 384);
+    const vectorBackend = vectorBackendForPlatform();
     let nearest: { label: string; distance: number } | null;
-    if (process.platform === "darwin") {
+    if (vectorBackend === "portable") {
       createPortableVectorSchema(db);
       const insert = db.prepare(
         `INSERT INTO vec_lines_portable
@@ -109,7 +111,7 @@ export async function runStandaloneSemanticSmoke(): Promise<void> {
     if (nearest?.label !== "row-0" || !Number.isFinite(nearest.distance)) {
       throw new Error("Compiled semantic KNN smoke returned an unexpected nearest row");
     }
-    if (process.platform !== "darwin") {
+    if (vectorBackend === "sqlite-vec") {
       const version = db.query("SELECT vec_version() AS version").get() as {
         version: string;
       };
@@ -119,9 +121,7 @@ export async function runStandaloneSemanticSmoke(): Promise<void> {
     }
     process.stdout.write(
       `${JSON.stringify(
-        standaloneSemanticSmokeEvidence(
-          process.platform === "darwin" ? "portable" : "sqlite-vec",
-        ),
+        standaloneSemanticSmokeEvidence(vectorBackend),
       )}\n`,
     );
   } finally {
