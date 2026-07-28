@@ -720,11 +720,29 @@ test("POSIX upgrades separate receipt-owned PATH state from current-shell availa
         };
         delete environment.SHELL;
         if (shell !== undefined) environment.SHELL = shell;
-        return spawnSync(
-          "/bin/sh",
-          [path.join(root, "install.sh")],
-          { encoding: "utf8", env: environment },
+        const result = spawnSync(
+          "/usr/bin/timeout",
+          [
+            "--signal=KILL",
+            "--kill-after=1s",
+            "10s",
+            "/bin/sh",
+            path.join(root, "install.sh"),
+          ],
+          {
+            encoding: "utf8",
+            env: environment,
+          },
         );
+        if (result.error !== undefined) throw result.error;
+        if (
+          result.status === 124 ||
+          result.status === 137 ||
+          result.signal === "SIGKILL"
+        ) {
+          throw new Error(`${entry.name} installer exceeded 10 seconds`);
+        }
+        return result;
       };
 
       const first = run(firstFixture, "0.3.2", "/bin/bash");
@@ -845,21 +863,41 @@ test("POSIX upgrades preserve legacy receipt-owned profiles without claiming cur
         fixture: string,
         version: string,
         configExit: string,
-      ) =>
-        spawnSync("/bin/sh", [path.join(root, "install.sh")], {
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            PATH: `${commands}:/usr/bin:/bin`,
-            HOME: home,
-            SHELL: "/bin/bash",
-            FIXTURE_ROOT: fixture,
-            FAKE_CONFIG_EXIT: configExit,
-            SANA_MCP_INSTALL_DIR: installDirectory,
-            SANA_MCP_VERSION: `v${version}`,
-            SANA_MCP_YES: "1",
+      ) => {
+        const result = spawnSync(
+          "/usr/bin/timeout",
+          [
+            "--signal=KILL",
+            "--kill-after=1s",
+            "10s",
+            "/bin/sh",
+            path.join(root, "install.sh"),
+          ],
+          {
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              PATH: `${commands}:/usr/bin:/bin`,
+              HOME: home,
+              SHELL: "/bin/bash",
+              FIXTURE_ROOT: fixture,
+              FAKE_CONFIG_EXIT: configExit,
+              SANA_MCP_INSTALL_DIR: installDirectory,
+              SANA_MCP_VERSION: `v${version}`,
+              SANA_MCP_YES: "1",
+            },
           },
-        });
+        );
+        if (result.error !== undefined) throw result.error;
+        if (
+          result.status === 124 ||
+          result.status === 137 ||
+          result.signal === "SIGKILL"
+        ) {
+          throw new Error(`${entry.name} installer exceeded 10 seconds`);
+        }
+        return result;
+      };
 
       const first = run(firstFixture, "0.3.2", "0");
       assert.equal(first.status, 0, `${entry.name}: ${first.stderr}`);
