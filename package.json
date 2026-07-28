@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "bun run typecheck && bun test --parallel=1 --timeout 20000",
+    "check": "bun run typecheck && bun scripts/run-test-suite.ts",
     "cli": "bun src/cli.ts",
     "login": "bun src/cli.ts login",
     "mcp": "bun src/mcp.ts",
