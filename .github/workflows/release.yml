@@ -25,6 +25,9 @@ concurrency:
 jobs:
   authorize:
     runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
     outputs:
       tag: ${{ steps.verify.outputs.tag }}
       sha: ${{ steps.verify.outputs.sha }}
@@ -176,6 +179,47 @@ jobs:
           echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "create_tag=$create_tag" >> "$GITHUB_OUTPUT"
+      - name: Cancel obsolete main release runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_SERVER_URL" = "https://github.com" ]
+          [ "$GITHUB_API_URL" = "https://api.github.com" ]
+          case "$CURRENT_RUN_ID" in
+            ''|*[!0-9]*) exit 1 ;;
+          esac
+          run_rows=$(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?per_page=100" \
+              --jq '.workflow_runs[] | [.id, .status, .event, .head_branch] | @tsv'
+          )
+          if [ -n "$run_rows" ]; then
+            while IFS=$'\t' read -r run_id status event head_branch; do
+              case "$run_id" in
+                ''|*[!0-9]*) exit 1 ;;
+              esac
+              if [ "$run_id" -lt "$CURRENT_RUN_ID" ] &&
+                 { [ "$status" = queued ] || [ "$status" = in_progress ]; } &&
+                 [ "$event" = push ] &&
+                 [ "$head_branch" = main ]; then
+                if ! cancel_error=$(gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/cancel" 2>&1); then
+                  current_status=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+                    --jq '.status')
+                  if [ "$current_status" != completed ]; then
+                    printf '%s\n' "$cancel_error" >&2
+                    exit 1
+                  fi
+                fi
+              fi
+            done <<< "$run_rows"
+          fi
 
   quality:
     needs: authorize
