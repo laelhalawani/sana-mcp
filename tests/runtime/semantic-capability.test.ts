@@ -2,13 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { Database, SQLiteError } from "bun:sqlite";
 import {
   createEmbeddingRuntime,
+  createPortableVectorSchema,
   createVectorExtensionRuntime,
   EMBED_DIM,
   EMBED_MODEL,
   loadEmbeddingPipe,
+  portableKnn,
   resolveSemanticCapability,
   SemanticUnavailableError,
   validateEmbeddingOutput,
+  vectorBackendForPlatform,
 } from "../../src/semantic/semantic.js";
 import type {
   EmbeddingOutput,
@@ -22,6 +25,12 @@ import {
 } from "../../src/store/db.js";
 
 describe("semantic build capability", () => {
+  test("selects the portable vector backend only where Bun disables extensions", () => {
+    expect(vectorBackendForPlatform("darwin")).toBe("portable");
+    expect(vectorBackendForPlatform("linux")).toBe("sqlite-vec");
+    expect(vectorBackendForPlatform("win32")).toBe("sqlite-vec");
+  });
+
   test("keeps an absent request disabled for every build capability", () => {
     expect(resolveSemanticCapability(false, "bundled")).toEqual({ kind: "disabled" });
     expect(resolveSemanticCapability(false, "source-semantic")).toEqual({
@@ -452,6 +461,77 @@ describe("semantic embedding lifecycle", () => {
 });
 
 describe("semantic optional dependency boundaries", () => {
+  test("portable vector storage returns the nearest persisted embedding", () => {
+    const db = new Database(":memory:");
+    try {
+      createPortableVectorSchema(db);
+      const first = new Float32Array(EMBED_DIM);
+      const second = new Float32Array(EMBED_DIM);
+      first[0] = 1;
+      second[1] = 1;
+      const insert = db.prepare(
+        `INSERT INTO vec_lines_portable
+           (meeting_id, line_no, created_at, embedding)
+         VALUES (?, ?, ?, ?)`,
+      );
+      insert.run("first", 1, 10, Buffer.from(first.buffer));
+      insert.run("second", 2, 20, Buffer.from(second.buffer));
+
+      expect(portableKnn(db, Buffer.from(first.buffer), { k: 1 })).toEqual([
+        { meeting_id: "first", line_no: 1, distance: 0 },
+      ]);
+      expect(
+        portableKnn(db, Buffer.from(first.buffer), {
+          k: 2,
+          dateFrom: 15,
+        }),
+      ).toEqual([
+        {
+          meeting_id: "second",
+          line_no: 2,
+          distance: Math.sqrt(2),
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("portable KNN scans in bounded fenced batches and keeps only top k", () => {
+    const db = new Database(":memory:");
+    try {
+      createPortableVectorSchema(db);
+      const insert = db.prepare(
+        `INSERT INTO vec_lines_portable
+           (meeting_id, line_no, created_at, embedding)
+         VALUES (?, ?, ?, ?)`,
+      );
+      for (let index = 0; index < 300; index++) {
+        const vector = new Float32Array(EMBED_DIM);
+        vector[0] = 300 - index;
+        insert.run(`row-${index}`, index + 1, index, Buffer.from(vector.buffer));
+      }
+      const query = new Float32Array(EMBED_DIM);
+      let fences = 0;
+
+      expect(
+        portableKnn(db, Buffer.from(query.buffer), {
+          k: 2,
+          fence: (read) => {
+            fences++;
+            return read();
+          },
+        }),
+      ).toEqual([
+        { meeting_id: "row-299", line_no: 300, distance: 1 },
+        { meeting_id: "row-298", line_no: 299, distance: 2 },
+      ]);
+      expect(fences).toBe(3);
+    } finally {
+      db.close();
+    }
+  });
+
   test("post-import vector load and schema creation run inside the supplied fence", async () => {
     const events: string[] = [];
     const db = {

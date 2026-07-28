@@ -528,6 +528,123 @@ interface SqliteVecModule {
   load(db: Database, dataDirectory?: string): void;
 }
 
+export type VectorBackend = "sqlite-vec" | "portable";
+
+export function vectorBackendForPlatform(
+  platform: NodeJS.Platform = process.platform,
+): VectorBackend {
+  return platform === "darwin" ? "portable" : "sqlite-vec";
+}
+
+export function createPortableVectorSchema(db: Database): void {
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS vec_lines_portable (
+       meeting_id TEXT NOT NULL,
+       line_no INTEGER NOT NULL,
+       created_at INTEGER NOT NULL,
+       embedding BLOB NOT NULL,
+       PRIMARY KEY (meeting_id, line_no)
+     );
+     CREATE INDEX IF NOT EXISTS idx_vec_lines_portable_created
+       ON vec_lines_portable(created_at);`,
+  );
+}
+
+function decodeVector(bytes: Uint8Array): Float32Array {
+  if (bytes.byteLength !== EMBED_DIM * Float32Array.BYTES_PER_ELEMENT) {
+    throw new Error(
+      `Stored semantic vector has ${bytes.byteLength} bytes; expected ${EMBED_DIM * Float32Array.BYTES_PER_ELEMENT}`,
+    );
+  }
+  const copy = new Uint8Array(bytes);
+  const vector = new Float32Array(copy.buffer);
+  for (let index = 0; index < vector.length; index++) {
+    if (!Number.isFinite(vector[index])) {
+      throw new Error(`Stored semantic vector value ${index} is not finite`);
+    }
+  }
+  return vector;
+}
+
+export function portableKnn(
+  db: Database,
+  queryVec: Uint8Array,
+  opts: {
+    k: number;
+    dateFrom?: number;
+    dateTo?: number;
+    fence?: <Value>(operation: () => Value) => Value;
+  },
+): { meeting_id: string; line_no: number; distance: number }[] {
+  const query = decodeVector(queryVec);
+  const clauses = ["rowid > $after"];
+  const baseParams: Bindings = {};
+  if (opts.dateFrom != null) {
+    clauses.push("created_at >= $dateFrom");
+    baseParams.$dateFrom = opts.dateFrom;
+  }
+  if (opts.dateTo != null) {
+    clauses.push("created_at <= $dateTo");
+    baseParams.$dateTo = opts.dateTo;
+  }
+  const statement = db
+    .prepare(
+      `SELECT rowid, meeting_id, line_no, embedding
+       FROM vec_lines_portable
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY rowid
+       LIMIT $batch`,
+    );
+  type PortableRow = {
+    rowid: number;
+    meeting_id: string;
+    line_no: number;
+    embedding: Uint8Array;
+  };
+  const limit = Math.max(1, opts.k);
+  const nearest: Array<{
+    meeting_id: string;
+    line_no: number;
+    distance: number;
+  }> = [];
+  const compare = (
+    left: (typeof nearest)[number],
+    right: (typeof nearest)[number],
+  ): number =>
+    left.distance - right.distance ||
+    left.meeting_id.localeCompare(right.meeting_id) ||
+    left.line_no - right.line_no;
+  let after = 0;
+  const batch = 256;
+  for (;;) {
+    const read = () =>
+      statement.all({
+        ...baseParams,
+        $after: after,
+        $batch: batch,
+      }) as PortableRow[];
+    const rows = opts.fence ? opts.fence(read) : read();
+    if (rows.length === 0) break;
+    after = rows.at(-1)!.rowid;
+    for (const row of rows) {
+      const candidate = decodeVector(row.embedding);
+      let squaredDistance = 0;
+      for (let index = 0; index < query.length; index++) {
+        const delta = query[index]! - candidate[index]!;
+        squaredDistance += delta * delta;
+      }
+      nearest.push({
+        meeting_id: row.meeting_id,
+        line_no: row.line_no,
+        distance: Math.sqrt(squaredDistance),
+      });
+      nearest.sort(compare);
+      if (nearest.length > limit) nearest.pop();
+    }
+  }
+  return nearest;
+}
+
 function isMissingVecModule(cause: unknown): boolean {
   if (
     !(cause instanceof SQLiteError) ||
@@ -617,13 +734,25 @@ export function createVectorExtensionRuntime(
 const ensureVectorExtension = createVectorExtensionRuntime(
   async () => import("sqlite-vec"),
 );
+const vectorBackends = new WeakMap<Database, VectorBackend>();
 
 /** Load the sqlite-vec extension into a connection and ensure the table. */
 export async function ensureVec(
   db: Database,
   fence?: <Value>(operation: () => Value) => Value,
-): Promise<void> {
+): Promise<VectorBackend> {
+  const existing = vectorBackends.get(db);
+  if (existing) return existing;
+  if (vectorBackendForPlatform() === "portable") {
+    const createSchema = () => createPortableVectorSchema(db);
+    if (fence) fence(createSchema);
+    else createSchema();
+    vectorBackends.set(db, "portable");
+    return "portable";
+  }
   await ensureVectorExtension(db, fence);
+  vectorBackends.set(db, "sqlite-vec");
+  return "sqlite-vec";
 }
 
 /** Embed a meeting's lines (skipping trivially short ones) and store vectors. */
@@ -634,17 +763,18 @@ export async function embedMeeting(
   lines: { n: number; text: string }[],
   commit: <Value>(write: () => Value) => Value,
 ): Promise<void> {
-  await ensureVec(db, commit);
+  const backend = await ensureVec(db, commit);
+  const table = backend === "sqlite-vec" ? "vec_lines" : "vec_lines_portable";
   const usable = lines.filter((l) => l.text.split(/\s+/).length >= MIN_WORDS);
   if (usable.length === 0) {
     commit(() => {
-      db.prepare(`DELETE FROM vec_lines WHERE meeting_id = ?`).run(meetingId);
+      db.prepare(`DELETE FROM ${table} WHERE meeting_id = ?`).run(meetingId);
     });
     return;
   }
 
   const ins = db.prepare(
-    `INSERT INTO vec_lines(embedding, meeting_id, line_no, created_at) VALUES (?, ?, ?, ?)`
+    `INSERT INTO ${table}(embedding, meeting_id, line_no, created_at) VALUES (?, ?, ?, ?)`
   );
   const BATCH = 128;
   for (let i = 0; i < usable.length; i += BATCH) {
@@ -652,7 +782,7 @@ export async function embedMeeting(
     const vecs = await embed(slice.map((l) => l.text));
     commit(() => {
       if (i === 0) {
-        db.prepare(`DELETE FROM vec_lines WHERE meeting_id = ?`).run(meetingId);
+        db.prepare(`DELETE FROM ${table} WHERE meeting_id = ?`).run(meetingId);
       }
       const tx = db.transaction(() => {
         for (let j = 0; j < slice.length; j++) {
@@ -675,7 +805,10 @@ export async function searchKnn(
     fence?: <Value>(operation: () => Value) => Value;
   }
 ): Promise<{ meeting_id: string; line_no: number; distance: number }[]> {
-  await ensureVec(db, opts.fence);
+  const backend = await ensureVec(db, opts.fence);
+  if (backend === "portable") {
+    return portableKnn(db, queryVec, opts);
+  }
   const clauses = ["embedding MATCH @q"];
   const params: Bindings = { q: queryVec, k: BigInt(Math.max(1, opts.k)) };
   if (opts.dateFrom != null) {

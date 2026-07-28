@@ -1777,15 +1777,17 @@ export class SanaStore {
         DELETE FROM fetch_failures;
         DELETE FROM meetings;
       `);
-      const vectorTable = this.db
-        .prepare(
-          `SELECT 1 AS present
-           FROM sqlite_master
-           WHERE type = 'table' AND name = 'vec_lines'`,
-        )
-        .get() as { present: number } | null;
-      if (vectorTable !== null) {
-        this.db.exec(`DELETE FROM vec_lines`);
+      for (const table of ["vec_lines", "vec_lines_portable"]) {
+        const vectorTable = this.db
+          .prepare(
+            `SELECT 1 AS present
+             FROM sqlite_master
+             WHERE type = 'table' AND name = ?`,
+          )
+          .get(table) as { present: number } | null;
+        if (vectorTable !== null) {
+          this.db.exec(`DELETE FROM ${table}`);
+        }
       }
       this.searchIndexReady = true;
       this.db
