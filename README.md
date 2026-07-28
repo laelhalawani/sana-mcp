@@ -54,7 +54,7 @@ not launch the configurer. A compatible Windows updater is silent about setup an
 preserves registrations and local state; only an incompatible Windows updater
 prints the deferred command to configure clients and sign in.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.15` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.16` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
 `apk add --no-cache libstdc++ libgcc gcompat`; the installer detects and reports this

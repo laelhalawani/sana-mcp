@@ -42,6 +42,7 @@ $Committed = $false
 $OldPresent = $false
 $LegacyInstall = $false
 $OldWasRunning = $false
+$OldLifecycleRetirementRequired = $false
 $ShouldRunAfterInstall = $false
 $PathChanged = $false
 $OldUserPath = $null
@@ -751,6 +752,22 @@ function Get-LegacyDaemonProcesses([string] $Executable) {
   return @($DaemonProcesses)
 }
 
+function Test-RevalidatedCanonicalDaemonRunning(
+  [string] $Executable,
+  [int] $ExpectedPid
+) {
+  foreach ($Process in @(Get-LegacyDaemonProcesses $Executable)) {
+    if ([int] $Process.ProcessId -ne $ExpectedPid) {
+      continue
+    }
+    $Identity = Get-CanonicalProcessIdentity $Process $Executable
+    if ($null -ne (Get-RevalidatedCanonicalProcess $Identity)) {
+      return $true
+    }
+  }
+  return $false
+}
+
 function Stop-LegacyDaemon([string] $Executable) {
   foreach ($Process in @(Get-LegacyDaemonProcesses $Executable)) {
     $Identity = Get-CanonicalProcessIdentity $Process $Executable
@@ -969,12 +986,52 @@ function Assert-ExpectedUpdateInstallation(
 }
 
 function Invoke-Lifecycle([string] $Executable, [string] $Operation) {
+  if (@("health", "stop", "start") -cnotcontains $Operation) {
+    throw "Runtime lifecycle operation is invalid."
+  }
   $LifecycleFile = Join-Path $TempDir "lifecycle.properties"
-  & $Executable __lifecycle $Operation --format properties |
-    Set-Content -LiteralPath $LifecycleFile -Encoding ASCII
-  $LifecycleExit = $LASTEXITCODE
+  $LifecycleProcess = [Diagnostics.Process]::new()
+  $LifecycleProcess.StartInfo.FileName = $Executable
+  $LifecycleProcess.StartInfo.Arguments =
+    "__lifecycle $Operation --format properties"
+  $LifecycleProcess.StartInfo.UseShellExecute = $false
+  $LifecycleProcess.StartInfo.CreateNoWindow = $true
+  $LifecycleProcess.StartInfo.RedirectStandardInput = $true
+  $LifecycleProcess.StartInfo.RedirectStandardOutput = $true
+  $LifecycleProcess.StartInfo.RedirectStandardError = $true
+  try {
+    if (-not $LifecycleProcess.Start()) {
+      throw "Runtime lifecycle $Operation could not start."
+    }
+    $LifecycleProcess.StandardInput.Close()
+    $LifecycleOutputTask = $LifecycleProcess.StandardOutput.ReadToEndAsync()
+    $LifecycleErrorTask = $LifecycleProcess.StandardError.ReadToEndAsync()
+    $LifecycleProcess.WaitForExit()
+    $LifecycleOutput = $LifecycleOutputTask.GetAwaiter().GetResult()
+    $LifecycleError = $LifecycleErrorTask.GetAwaiter().GetResult().Trim()
+    $LifecycleExit = $LifecycleProcess.ExitCode
+  } finally {
+    $LifecycleProcess.Dispose()
+  }
+  [IO.File]::WriteAllText(
+    $LifecycleFile,
+    $LifecycleOutput,
+    [Text.Encoding]::ASCII
+  )
   if ($LifecycleExit -ne 0) {
-    throw "Runtime lifecycle $Operation failed (exit $LifecycleExit)."
+    $LifecycleMessage = "Runtime lifecycle $Operation failed (exit $LifecycleExit)."
+    if (-not [string]::IsNullOrWhiteSpace($LifecycleError)) {
+      $LifecycleMessage += " $LifecycleError"
+    }
+    $LifecycleException = [InvalidOperationException]::new($LifecycleMessage)
+    if ($LifecycleError -cmatch '\Adaemon control heartbeat is stale while process ([1-9][0-9]*) is still running; stop it manually\z') {
+      $LifecyclePid = 0
+      if ([int]::TryParse($Matches[1], [ref] $LifecyclePid)) {
+        $LifecycleException.Data["sanaMcpLifecycleFailure"] = "stale-live"
+        $LifecycleException.Data["sanaMcpLifecyclePid"] = $LifecyclePid
+      }
+    }
+    throw $LifecycleException
   }
   $Lifecycle = Read-Properties $LifecycleFile @(
     "lifecycleProtocol", "state", "changed"
@@ -1959,8 +2016,22 @@ try {
     }
 
     $NewPathManaged = $OldReceipt["pathManaged"] -ceq "true"
-    $OldLifecycle = Invoke-Lifecycle $Destination "health"
-    $OldWasRunning = $OldLifecycle["state"] -ceq "running"
+    try {
+      $OldLifecycle = Invoke-Lifecycle $Destination "health"
+      $OldWasRunning = $OldLifecycle["state"] -ceq "running"
+    } catch {
+      $LifecycleFailure = $_.Exception.Data["sanaMcpLifecycleFailure"]
+      $LifecyclePid = $_.Exception.Data["sanaMcpLifecyclePid"]
+      if ($LifecycleFailure -cne "stale-live" -or
+          $LifecyclePid -isnot [int] -or
+          -not (Test-RevalidatedCanonicalDaemonRunning `
+            $Destination `
+            $LifecyclePid)) {
+        throw
+      }
+      $OldWasRunning = $true
+      $OldLifecycleRetirementRequired = $true
+    }
     $OldBinaryBackup = Join-Path $TempDir "previous-sana-mcp.exe"
     $OldReceiptBackup = Join-Path $TempDir "previous-receipt"
     Copy-Item -LiteralPath $Destination -Destination $OldBinaryBackup
@@ -2086,9 +2157,20 @@ try {
     if ($LegacyInstall) {
       Stop-LegacyDaemon $Destination
     } else {
-      $Stopped = Invoke-Lifecycle $Destination "stop"
-      if ($Stopped["state"] -cne "stopped") {
-        throw "The previous sana-mcp daemon did not stop."
+      try {
+        $Stopped = Invoke-Lifecycle $Destination "stop"
+        if ($Stopped["state"] -cne "stopped") {
+          throw "The previous sana-mcp daemon did not stop."
+        }
+      } catch {
+        if (-not $OldLifecycleRetirementRequired) {
+          throw
+        }
+        Stop-CanonicalRuntimeProcesses $Destination
+        $Stopped = Invoke-Lifecycle $Destination "stop"
+        if ($Stopped["state"] -cne "stopped") {
+          throw "The previous sana-mcp daemon did not stop after verified process retirement."
+        }
       }
     }
   }

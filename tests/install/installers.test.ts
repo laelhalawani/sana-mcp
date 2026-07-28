@@ -1779,6 +1779,13 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
         '  Restore-InstallerFileState $Target $Previous $OldHash $NewHash "installed binary"',
         '  $After = (Get-Item -LiteralPath $Target).LastWriteTimeUtc.Ticks',
         '  if ($After -ne $Before) { throw "already-old rollback was not a no-op" }',
+        '  $script:CanonicalDaemonRevalidation = $true',
+        '  function Get-LegacyDaemonProcesses([string] $Executable) { return @([pscustomobject]@{ ProcessId=123; CreationDate="verified-birth"; ExecutablePath=$Executable }) }',
+        '  function Get-RevalidatedCanonicalProcess([object] $Identity) { if ($script:CanonicalDaemonRevalidation) { return [pscustomobject]@{ ProcessId=$Identity.processId } }; return $null }',
+        '  if (-not (Test-RevalidatedCanonicalDaemonRunning $Target 123)) { throw "revalidated canonical daemon was not accepted as running" }',
+        '  if (Test-RevalidatedCanonicalDaemonRunning $Target 124) { throw "a different lifecycle PID authorized the canonical daemon" }',
+        '  $script:CanonicalDaemonRevalidation = $false',
+        '  if (Test-RevalidatedCanonicalDaemonRunning $Target 123) { throw "daemon without process-birth revalidation was accepted as running" }',
         "} catch {",
         '  $PrimaryError = $_.Exception',
         "} finally {",
@@ -1806,6 +1813,86 @@ test("PowerShell retires an active exact-path runtime, publishes safely, and mak
       { encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("PowerShell grants stale-daemon recovery only for the exact lifecycle failure", async () => {
+  const command =
+    process.platform === "win32"
+      ? "powershell.exe"
+      : spawnSync(
+          "/bin/sh",
+          ["-c", "command -v powershell.exe"],
+          { encoding: "utf8" },
+        ).stdout.trim();
+  const windowsInteropEnabled =
+    process.platform === "linux" &&
+    process.env.SANA_MCP_TEST_WINDOWS_INTEROP === "1";
+  if (process.platform !== "win32" && !windowsInteropEnabled) {
+    return;
+  }
+  if (command.length === 0) return;
+
+  const installer = await readFile(path.join(root, "install.ps1"), "utf8");
+  const functionStart = installer.indexOf("function Invoke-Lifecycle");
+  const functionEnd = installer.indexOf(
+    "\nfunction Set-RetainedRuntimeState",
+    functionStart,
+  );
+  assert.notEqual(functionStart, -1);
+  assert.notEqual(functionEnd, -1);
+  const lifecycleFunction = installer.slice(functionStart, functionEnd);
+  const temporary = await mkdtemp(
+    path.join(os.tmpdir(), "sana-ps-lifecycle-failure-"),
+  );
+  try {
+    const harness = path.join(temporary, "lifecycle-failure.ps1");
+    let executableHarness = harness;
+    if (
+      process.platform === "linux" &&
+      command.toLowerCase().endsWith(".exe")
+    ) {
+      const converted = spawnSync("wslpath", ["-w", harness], {
+        encoding: "utf8",
+      });
+      assert.equal(converted.status, 0, converted.stderr);
+      executableHarness = converted.stdout.trim();
+    }
+    await writeFile(
+      harness,
+      [
+        '$ErrorActionPreference = "Stop"',
+        lifecycleFunction,
+        '$Root = Join-Path ([IO.Path]::GetTempPath()) ("sana-lifecycle-failure-" + [Guid]::NewGuid().ToString("N"))',
+        '[IO.Directory]::CreateDirectory($Root) | Out-Null',
+        '$TempDir = $Root',
+        '$Fixture = Join-Path $Root "lifecycle-fixture.exe"',
+        "try {",
+        '  $FixtureSource = \'using System; public static class LifecycleFixture { public static int Main() { Console.Error.WriteLine(Environment.GetEnvironmentVariable("SANA_TEST_LIFECYCLE_ERROR")); return 1; } }\'',
+        '  Add-Type -TypeDefinition $FixtureSource -Language CSharp -OutputAssembly $Fixture -OutputType ConsoleApplication',
+        '  $env:SANA_TEST_LIFECYCLE_ERROR = "daemon control heartbeat is stale while process 123 is still running; stop it manually"',
+        '  $StaleFailure = $null',
+        '  try { Invoke-Lifecycle $Fixture "health" } catch { $StaleFailure = $_.Exception }',
+        '  if ($null -eq $StaleFailure -or $StaleFailure.Data["sanaMcpLifecycleFailure"] -cne "stale-live" -or $StaleFailure.Data["sanaMcpLifecyclePid"] -ne 123) { throw "exact stale-live lifecycle failure was not classified" }',
+        '  $env:SANA_TEST_LIFECYCLE_ERROR = "daemon control heartbeat is dated in the future"',
+        '  $OtherFailure = $null',
+        '  try { Invoke-Lifecycle $Fixture "health" } catch { $OtherFailure = $_.Exception }',
+        '  if ($null -eq $OtherFailure -or $null -ne $OtherFailure.Data["sanaMcpLifecycleFailure"] -or $null -ne $OtherFailure.Data["sanaMcpLifecyclePid"]) { throw "unrelated lifecycle failure granted stale-daemon authority" }',
+        "} finally {",
+        '  Remove-Item Env:SANA_TEST_LIFECYCLE_ERROR -ErrorAction SilentlyContinue',
+        '  Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const result = spawnSync(
+      command,
+      ["-NoProfile", "-NonInteractive", "-File", executableHarness],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
@@ -1862,7 +1949,7 @@ test("Windows compatible-update E2E configuration skips only when every exact ke
   });
 });
 
-test(`Windows full installer replaces an active receipt-backed ${predecessorTag} mcp runtime`, { timeout: 180_000 }, async () => {
+test(`Windows full installer replaces an active receipt-backed ${predecessorTag} mcp runtime`, { timeout: 240_000 }, async () => {
   const configuration =
     resolveWindowsCompatibleUpdateConfiguration(process.env);
   if (configuration.kind === "skip") return;
@@ -2283,7 +2370,8 @@ try {
       '$SetJobMethod = $JobTypeBuilder.DefinePInvokeMethod("SetInformationJobObject","kernel32.dll",$JobMethodAttributes,$JobCallingConvention,[bool],[Type[]]@([IntPtr],[int],[IntPtr],[uint32]),$NativeCallingConvention,[Runtime.InteropServices.CharSet]::Auto)',
       '$AssignJobMethod = $JobTypeBuilder.DefinePInvokeMethod("AssignProcessToJobObject","kernel32.dll",$JobMethodAttributes,$JobCallingConvention,[bool],[Type[]]@([IntPtr],[IntPtr]),$NativeCallingConvention,[Runtime.InteropServices.CharSet]::Auto)',
       '$CurrentProcessMethod = $JobTypeBuilder.DefinePInvokeMethod("GetCurrentProcess","kernel32.dll",$JobMethodAttributes,$JobCallingConvention,[IntPtr],[Type[]]@(),$NativeCallingConvention,[Runtime.InteropServices.CharSet]::Auto)',
-      'foreach ($Method in @($CreateJobMethod,$SetJobMethod,$AssignJobMethod,$CurrentProcessMethod)) { $Method.SetImplementationFlags($Method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig) }',
+      '$SuspendProcessMethod = $JobTypeBuilder.DefinePInvokeMethod("NtSuspendProcess","ntdll.dll",$JobMethodAttributes,$JobCallingConvention,[int],[Type[]]@([IntPtr]),$NativeCallingConvention,[Runtime.InteropServices.CharSet]::Auto)',
+      'foreach ($Method in @($CreateJobMethod,$SetJobMethod,$AssignJobMethod,$CurrentProcessMethod,$SuspendProcessMethod)) { $Method.SetImplementationFlags($Method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig) }',
       '$NativeJob = $JobTypeBuilder.CreateType()',
       '$JobHandle = [IntPtr]$NativeJob.GetMethod("CreateJobObjectW").Invoke($null,@([IntPtr]::Zero,$null))',
       'if ($JobHandle -eq [IntPtr]::Zero) { throw "CreateJobObjectW failed before descendant launch" }',
@@ -2330,6 +2418,9 @@ try {
       '$OtherData = Join-Path $Root "other-data"',
       '$FakeReady = Join-Path $Root "fake ready.json"',
       '$FakeState = Join-Path $Root "fake state.json"',
+      '$RestartReady = Join-Path $Root "restart ready.json"',
+      '$RestartState = Join-Path $Root "restart state.json"',
+      '$RestartRelease = Join-Path $Root "restart release.txt"',
       '$NativeRelease = Join-Path $Root "native release.txt"',
       '$DataSentinel = Join-Path $Data "compatible-auth-sentinel.bin"',
       '$TranscriptSentinel = Join-Path $Transcripts "compatible-transcript-sentinel.txt"',
@@ -2350,7 +2441,9 @@ try {
       '$OldProcess = $null',
       '$OtherProcess = $null',
       '$InstallerProcess = $null',
+      '$StaleInstallerProcess = $null',
       '$FakeProcess = $null',
+      '$RestartFakeProcess = $null',
       '$FakePid = $null',
       '$FakeStartTime = $null',
       '$FakePath = $null',
@@ -2361,7 +2454,7 @@ try {
       '$RuntimeEnvironment = $null',
       '$Ready = $null',
       '$PrimaryError = $null',
-      '$AuthorityKeys = @("GH_TOKEN","GITHUB_TOKEN","GITHUB_PAT","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy","SANA_MCP_REPLACE_INCOMPATIBLE","SANA_MCP_INCOMPATIBLE_RESET","SANA_MCP_TEST_RELEASE_DIR","SANA_MCP_VERSION","SANA_MCP_YES")',
+      '$AuthorityKeys = @("GH_TOKEN","GITHUB_TOKEN","GITHUB_PAT","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy","SANA_BASE_URL","SANA_MCP_REPLACE_INCOMPATIBLE","SANA_MCP_INCOMPATIBLE_RESET","SANA_MCP_TEST_RELEASE_DIR","SANA_MCP_VERSION","SANA_MCP_YES")',
       "function Remove-ProcessAuthority([Diagnostics.ProcessStartInfo] $Info) {",
       "  foreach ($Key in $AuthorityKeys) { [void]$Info.EnvironmentVariables.Remove($Key) }",
       "}",
@@ -2563,12 +2656,91 @@ try {
       '    if ($StableDatabaseObservations -lt 3) { Start-Sleep -Milliseconds 100 }',
       '  }',
       '  if ($StableDatabaseObservations -lt 3) { throw "daemon database files did not become quiescent after the exact response sequence" }',
+      '  $StaleDaemon = Get-Process -Id $DaemonPid -ErrorAction Stop',
+      '  if ($StaleDaemon.StartTime.ToFileTimeUtc() -ne $DaemonStartTime -or -not [string]::Equals($StaleDaemon.Path,$DaemonPath,[StringComparison]::OrdinalIgnoreCase)) { throw "daemon identity changed before stale-heartbeat suspension" }',
+      '  $SuspendStatus = [int]$NativeJob.GetMethod("NtSuspendProcess").Invoke($null,@($StaleDaemon.Handle))',
+      '  if ($SuspendStatus -ne 0) { throw "NtSuspendProcess failed with status $SuspendStatus" }',
+      '  Start-Sleep -Seconds 32',
+      '  $StaleHealth = Invoke-Isolated $InstalledBinary @("__lifecycle","health","--format","properties") $RuntimeEnvironment',
+      '  if ($StaleHealth.Status -eq 0 -or $StaleHealth.Stdout -cne "" -or ($StaleHealth.Stderr.Trim()) -cne "daemon control heartbeat is stale while process $DaemonPid is still running; stop it manually") { throw "stale daemon health precondition was not exact: $($StaleHealth.Status)`n$($StaleHealth.Stdout)`n$($StaleHealth.Stderr)" }',
+      '  $RestartPort = ([Uri]$Ready.origin).Port',
+      '  $RestartArguments = @($FakeServerSource,"--mode","daemon-restart","--scenario","happy","--ready-file",$RestartReady,"--state-file",$RestartState,"--fixture",$ObservedFixture,"--native-release-file",$RestartRelease,"--parent-pid",[string]$PID,"--lifetime-ms","90000","--port",[string]$RestartPort)',
+      '  $RestartInfo = [Diagnostics.ProcessStartInfo]::new()',
+      '  $RestartInfo.FileName = $Bun',
+      '  $RestartInfo.Arguments = Join-NativeArguments $RestartArguments',
+      '  $RestartInfo.WorkingDirectory = $Repository',
+      '  $RestartInfo.UseShellExecute = $false',
+      '  $RestartInfo.CreateNoWindow = $true',
+      '  $RestartInfo.RedirectStandardOutput = $true',
+      '  $RestartInfo.RedirectStandardError = $true',
+      '  Remove-ProcessAuthority $RestartInfo',
+      '  foreach ($Pair in @{ USERPROFILE=$Profile; HOME=$Profile; LOCALAPPDATA=$LocalAppData; APPDATA=$RoamingAppData; PATH=$IsolatedProcessPath; PATHEXT=".COM;.EXE;.BAT;.CMD"; TEMP=$TempDirectory; TMP=$TempDirectory; TMPDIR=$TempDirectory; PSModulePath=$WindowsPowerShellModulePath }.GetEnumerator()) { $RestartInfo.EnvironmentVariables[$Pair.Key] = $Pair.Value }',
+      '  $RestartFakeProcess = [Diagnostics.Process]::Start($RestartInfo)',
+      '  $RestartFakeStdoutTask = $RestartFakeProcess.StandardOutput.ReadToEndAsync()',
+      '  $RestartFakeStderrTask = $RestartFakeProcess.StandardError.ReadToEndAsync()',
+      '  Wait-Until { (Test-Path -LiteralPath $RestartReady -PathType Leaf) -or $RestartFakeProcess.HasExited } "replacement fake Sana readiness"',
+      '  if ($RestartFakeProcess.HasExited) { throw "replacement fake Sana exited before readiness: $($RestartFakeStdoutTask.GetAwaiter().GetResult())$($RestartFakeStderrTask.GetAwaiter().GetResult())" }',
+      '  $RestartReadyState = [IO.File]::ReadAllText($RestartReady) | ConvertFrom-Json',
+      '  if ($RestartReadyState.mode -cne "daemon-restart" -or $RestartReadyState.origin -cne $Ready.origin) { throw "replacement fake Sana did not bind the authenticated origin" }',
+      '  $StaleInstallerInfo = [Diagnostics.ProcessStartInfo]::new()',
+      '  $StaleInstallerInfo.FileName = (Join-Path $PSHOME "powershell.exe")',
+      '  $StaleInstallerInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"" + (Join-Path $Release "install-e2e.ps1") + "`""',
+      '  $StaleInstallerInfo.UseShellExecute = $false',
+      '  $StaleInstallerInfo.CreateNoWindow = $true',
+      '  $StaleInstallerInfo.RedirectStandardOutput = $true',
+      '  $StaleInstallerInfo.RedirectStandardError = $true',
+      ...compatibleUpdateInstallerEnvironmentLines.map((line) =>
+        line.replaceAll("$InstallerInfo", "$StaleInstallerInfo"),
+      ),
+      '  $StaleInstallerInfo.EnvironmentVariables["TEMP"] = $TempDirectory',
+      '  $StaleInstallerInfo.EnvironmentVariables["TMP"] = $TempDirectory',
+      '  $StaleInstallerInfo.EnvironmentVariables["TMPDIR"] = $TempDirectory',
+      '  foreach ($Key in $AuthorityKeys) { if ($Key -notin @("SANA_MCP_TEST_RELEASE_DIR","SANA_MCP_VERSION","SANA_MCP_YES")) { [void]$StaleInstallerInfo.EnvironmentVariables.Remove($Key) } }',
+      '  $StaleInstallerInfo.EnvironmentVariables["SANA_BASE_URL"] = $Ready.origin',
+      '  $StaleInstallerProcess = [Diagnostics.Process]::Start($StaleInstallerInfo)',
+      '  $StaleInstallerStdoutTask = $StaleInstallerProcess.StandardOutput.ReadToEndAsync()',
+      '  $StaleInstallerStderrTask = $StaleInstallerProcess.StandardError.ReadToEndAsync()',
+      '  if (-not $StaleInstallerProcess.WaitForExit(60000)) { $StaleInstallerProcess.Kill(); [void]$StaleInstallerProcess.WaitForExit(3000); throw "stale-daemon installer timed out" }',
+      '  $StaleInstallerProcess.WaitForExit()',
+      '  $StaleInstallerStdout = $StaleInstallerStdoutTask.GetAwaiter().GetResult()',
+      '  $StaleInstallerStderr = $StaleInstallerStderrTask.GetAwaiter().GetResult()',
+      '  if ($StaleInstallerProcess.ExitCode -ne 0) { throw "stale-daemon installer failed: $StaleInstallerStdout`n$StaleInstallerStderr" }',
+      '  if (-not $StaleDaemon.WaitForExit(5000)) { throw "stale daemon survived verified installer retirement" }',
+      '  if ($OtherProcess.HasExited) { throw "same-name other-path process was terminated during stale-daemon recovery" }',
+      '  $ReplacementControl = [IO.File]::ReadAllText((Join-Path $Data "daemon-control.json")) | ConvertFrom-Json',
+      '  if ($ReplacementControl.pid -eq $DaemonPid -or $ReplacementControl.instanceId -ceq $DaemonInstanceId) { throw "stale-daemon recovery did not publish a replacement identity" }',
+      '  $DaemonPid = [int]$ReplacementControl.pid',
+      '  $DaemonInstanceId = [string]$ReplacementControl.instanceId',
+      '  $ReplacementDaemon = Get-Process -Id $DaemonPid -ErrorAction Stop',
+      '  $DaemonStartTime = $ReplacementDaemon.StartTime.ToFileTimeUtc()',
+      '  $DaemonPath = $ReplacementDaemon.Path',
+      '  if (-not [string]::Equals($DaemonPath,$InstalledBinary,[StringComparison]::OrdinalIgnoreCase)) { throw "replacement daemon path is not the installed runtime" }',
+      '  $PreReleaseRestartLists = 0',
+      '  if (Test-Path -LiteralPath $RestartState -PathType Leaf) { $PreReleaseRestartState = [IO.File]::ReadAllText($RestartState) | ConvertFrom-Json; $PreReleaseRestartLists = @($PreReleaseRestartState.requests | Where-Object { $_.pathname -ceq "/x-api/trpc/asset.listRecent" }).Count }',
+      '  [IO.File]::WriteAllText($RestartRelease, "release`n", $Utf8NoBom)',
+      '  $ReplacementSynced = $false; $ReplacementSyncDeadline = [DateTime]::UtcNow.AddMilliseconds(20000)',
+      '  while (-not $ReplacementSynced -and [DateTime]::UtcNow -lt $ReplacementSyncDeadline) {',
+      '    try {',
+      '      $ObservedReplacementControl = [IO.File]::ReadAllText((Join-Path $Data "daemon-control.json")) | ConvertFrom-Json',
+      '      $ObservedRestartState = [IO.File]::ReadAllText($RestartState) | ConvertFrom-Json',
+      '      $ObservedStatus = Invoke-Isolated $InstalledBinary @("status") $RuntimeEnvironment',
+      '      $CompletedRestartLists = @($ObservedRestartState.requests | Where-Object { $_.pathname -ceq "/x-api/trpc/asset.listRecent" }).Count',
+      '      $ReplacementSynced = $ObservedReplacementControl.pid -eq $DaemonPid -and $ObservedReplacementControl.instanceId -ceq $DaemonInstanceId -and $ObservedRestartState.kind -ceq "restart-running" -and $ObservedRestartState.mode -ceq "daemon-restart" -and $CompletedRestartLists -gt $PreReleaseRestartLists -and $ObservedStatus.Status -eq 0 -and ($ObservedStatus.Stdout -replace "`r`n","`n") -ceq "Sync status: synced`nMeetings ready: 0`nTranscripts stored: 0/0`n" -and $ObservedStatus.Stderr -ceq ""',
+      '    } catch {}',
+      '    if (-not $ReplacementSynced) { Start-Sleep -Milliseconds 50 }',
+      '  }',
+      '  if (-not $ReplacementSynced) { throw "final replacement daemon did not complete a stable synced cycle" }',
       "  $BeforeStop = Get-Process -Id $DaemonPid -ErrorAction Stop",
       '  $BeforeStopControl = [IO.File]::ReadAllText((Join-Path $Data "daemon-control.json")) | ConvertFrom-Json',
       '  if ($BeforeStop.StartTime.ToFileTimeUtc() -ne $DaemonStartTime -or -not [string]::Equals($BeforeStop.Path,$DaemonPath,[StringComparison]::OrdinalIgnoreCase) -or $BeforeStopControl.pid -ne $DaemonPid -or $BeforeStopControl.instanceId -cne $DaemonInstanceId) { throw "daemon identity changed before lifecycle stop" }',
       '  $Lifecycle = Invoke-Isolated $InstalledBinary @("__lifecycle","stop","--format","properties") $RuntimeEnvironment',
       '  if ($Lifecycle.Status -ne 0 -or ($Lifecycle.Stdout -replace "`r`n","`n") -cne "lifecycleProtocol=1`nstate=stopped`nchanged=true`n" -or $Lifecycle.Stderr -cne "") { throw "lifecycle stop output mismatch: $($Lifecycle.Status)`n$($Lifecycle.Stdout)`n$($Lifecycle.Stderr)" }',
       '  Wait-Until { $null -eq (Get-Process -Id $DaemonPid -ErrorAction SilentlyContinue) } "exact daemon PID reaping" 5000',
+      '  if (-not $RestartFakeProcess.HasExited) { $RestartFakeProcess.Kill() }',
+      '  if (-not $RestartFakeProcess.WaitForExit(3000)) { throw "replacement fake Sana did not exit after owned termination" }',
+      '  $RestartFakeStdout = $RestartFakeStdoutTask.GetAwaiter().GetResult()',
+      '  $RestartFakeStderr = $RestartFakeStderrTask.GetAwaiter().GetResult()',
+      '  if ($RestartFakeStdout -cne "" -or $RestartFakeStderr -cne "") { throw "replacement fake Sana emitted unexpected output: $RestartFakeStdout$RestartFakeStderr" }',
       '  $PostStopAudit = Invoke-Isolated $Bun @($ProbePath,[string]$DaemonPid,$DaemonInstanceId) $ProbeEnvironment',
       '  if ($PostStopAudit.Status -ne 0 -or $PostStopAudit.Stderr -cne "" -or (($PostStopAudit.Stdout | ConvertFrom-Json).kind -cne "post-stop-audit")) { throw "post-stop state audit failed: $($PostStopAudit.Stdout)`n$($PostStopAudit.Stderr)" }',
       '  $SyncedStatus = Invoke-Isolated $InstalledBinary @("status") $RuntimeEnvironment',
@@ -2617,7 +2789,7 @@ try {
       '      if (-not $FakeProcess.WaitForExit(3000)) { throw "owned fake Sana handle did not exit" }',
       '    } catch { $CleanupFailures += $_.Exception.Message }',
       '  }',
-      '  foreach ($ProcessToClean in @($OldProcess,$OtherProcess,$InstallerProcess)) {',
+      '  foreach ($ProcessToClean in @($OldProcess,$OtherProcess,$InstallerProcess,$StaleInstallerProcess,$RestartFakeProcess)) {',
       '    if ($null -eq $ProcessToClean) { continue }',
       '    try {',
       '      if (-not $ProcessToClean.HasExited) { $ProcessToClean.Kill() }',
@@ -2815,7 +2987,7 @@ try {
         windowsPath(rootPublicationPath),
       ],
       {
-        timeoutMs: 120_000,
+        timeoutMs: 210_000,
       },
     );
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -3265,6 +3437,22 @@ test("PowerShell daemon policy distinguishes direct reinstalls from updater hand
   assert.match(
     installer,
     /if \(\$OldPresent -and \$ShouldRunAfterInstall\) \{/u,
+  );
+  assert.match(
+    installer,
+    /function Test-RevalidatedCanonicalDaemonRunning[\s\S]*?\$Process\.ProcessId -ne \$ExpectedPid[\s\S]*?Get-CanonicalProcessIdentity \$Process \$Executable[\s\S]*?Get-RevalidatedCanonicalProcess \$Identity/u,
+  );
+  assert.match(
+    installer,
+    /Invoke-Lifecycle[\s\S]*?\$LifecycleException\.Data\["sanaMcpLifecycleFailure"\] = "stale-live"[\s\S]*?\$LifecycleException\.Data\["sanaMcpLifecyclePid"\] = \$LifecyclePid/u,
+  );
+  assert.match(
+    installer,
+    /try \{\s+\$OldLifecycle = Invoke-Lifecycle \$Destination "health"[\s\S]*?catch \{\s+\$LifecycleFailure = \$_\.Exception\.Data\["sanaMcpLifecycleFailure"\][\s\S]*?\$LifecycleFailure -cne "stale-live"[\s\S]*?\$LifecyclePid -isnot \[int\][\s\S]*?Test-RevalidatedCanonicalDaemonRunning\s+`\s+\$Destination\s+`\s+\$LifecyclePid[\s\S]*?throw[\s\S]*?\$OldWasRunning = \$true\s+\$OldLifecycleRetirementRequired = \$true/u,
+  );
+  assert.match(
+    installer,
+    /\$TransactionActive = \$true[\s\S]*?Invoke-Lifecycle \$Destination "stop"[\s\S]*?if \(-not \$OldLifecycleRetirementRequired\) \{\s+throw\s+\}[\s\S]*?Stop-CanonicalRuntimeProcesses \$Destination[\s\S]*?Invoke-Lifecycle \$Destination "stop"[\s\S]*?Stop-CanonicalRuntimeProcesses \$Destination[\s\S]*?Publish-InstallerFile/u,
   );
 });
 
