@@ -72,6 +72,14 @@ interface ResultWindow {
   end: number;
 }
 
+interface PreparedTranscript {
+  rawLines: string[];
+  targetRawIndex: number;
+  width: number;
+  lines: string[];
+  target: number;
+}
+
 const SORTS: readonly SearchSort[] = ["best", "newest", "oldest"];
 
 function keyName(key: KeypressEvent): string {
@@ -117,6 +125,12 @@ function coverageLabel(coverage: SemanticCoverage | null): string | null {
 
 function clearInput(rl: { write: (...args: never[]) => void }): void {
   rl.write(null as never, { ctrl: true, name: "u" } as never);
+}
+
+function clearHandledShortcut(
+  rl: { line?: string; write: (...args: never[]) => void },
+): void {
+  if (rl.line) clearInput(rl);
 }
 
 function beginInput(
@@ -332,14 +346,104 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
     const editValueRef = useRef(model.editValue);
     const requestToken = useRef(0);
     const requestController = useRef<AbortController | null>(null);
+    const requestStart = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const coverageRefresh = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const preparedTranscript = useRef<PreparedTranscript | null>(null);
+    const pendingTranscriptScroll = useRef<{
+      rawLines: string[];
+      value: number;
+    } | null>(null);
+    const transcriptScrollCommit = useRef<ReturnType<typeof setTimeout> | null>(null);
     modelRef.current = model;
     editValueRef.current = model.editValue;
+
+    const transcriptLayout = (
+      transcript: TranscriptState,
+      width: number,
+    ): PreparedTranscript => {
+      const cached = preparedTranscript.current;
+      if (
+        cached !== null &&
+        cached.rawLines === transcript.rawLines &&
+        cached.targetRawIndex === transcript.targetRawIndex &&
+        cached.width === width
+      ) {
+        return cached;
+      }
+      const document = transcriptDocument(transcript, width, config.ui);
+      const prepared = {
+        rawLines: transcript.rawLines,
+        targetRawIndex: transcript.targetRawIndex,
+        width,
+        ...document,
+      };
+      preparedTranscript.current = prepared;
+      return prepared;
+    };
+
+    const cancelTranscriptScroll = (): void => {
+      if (transcriptScrollCommit.current !== null) {
+        clearTimeout(transcriptScrollCommit.current);
+      }
+      transcriptScrollCommit.current = null;
+      pendingTranscriptScroll.current = null;
+    };
+
+    const scheduleTranscriptScroll = (
+      transcript: TranscriptState,
+      value: number,
+    ): void => {
+      pendingTranscriptScroll.current = { rawLines: transcript.rawLines, value };
+      if (transcriptScrollCommit.current !== null) return;
+      transcriptScrollCommit.current = setTimeout(() => {
+        transcriptScrollCommit.current = null;
+        const pending = pendingTranscriptScroll.current;
+        pendingTranscriptScroll.current = null;
+        const latest = modelRef.current;
+        if (
+          pending === null ||
+          latest.view !== "transcript" ||
+          latest.transcript === null ||
+          latest.transcript.rawLines !== pending.rawLines ||
+          latest.transcript.scroll === pending.value
+        ) {
+          return;
+        }
+        setModel({
+          ...latest,
+          transcript: { ...latest.transcript, scroll: pending.value },
+        });
+      }, 0);
+    };
+
+    const scheduleCoverageRefresh = (token: number): void => {
+      if (coverageRefresh.current !== null) clearTimeout(coverageRefresh.current);
+      coverageRefresh.current = setTimeout(() => {
+        coverageRefresh.current = null;
+        if (requestToken.current !== token) return;
+        const coverage = semanticCoverage(config.runtime);
+        const latest = modelRef.current;
+        if (
+          latest.view !== "results" ||
+          (latest.coverage?.enabled === coverage?.enabled &&
+            latest.coverage?.embedded === coverage?.embedded &&
+            latest.coverage?.total === coverage?.total)
+        ) {
+          return;
+        }
+        setModel({ ...latest, coverage });
+      }, 0);
+    };
 
     const runSearch = (
       query: string,
       page: number,
       sort: SearchSort,
     ): void => {
+      if (requestStart.current !== null) clearTimeout(requestStart.current);
+      requestStart.current = null;
+      if (coverageRefresh.current !== null) clearTimeout(coverageRefresh.current);
+      coverageRefresh.current = null;
       requestController.current?.abort();
       const controller = new AbortController();
       requestController.current = controller;
@@ -356,12 +460,16 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
         response: null,
         failure: null,
         inputError: null,
-        coverage: semanticCoverage(config.runtime),
+        coverage: current.coverage,
         transcript: null,
       });
-      void config.runtime
-        .search({ query, page, limit: pageSize, sort }, controller.signal)
-        .then(
+      // Let Inquirer paint the loading state before any synchronous database
+      // prefix in the runtime search occupies the event loop.
+      requestStart.current = setTimeout(() => {
+        requestStart.current = null;
+        void config.runtime
+          .search({ query, page, limit: pageSize, sort }, controller.signal)
+          .then(
           (response) => {
             const latest = modelRef.current;
             if (
@@ -383,6 +491,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
               selected: 0,
               listTop: 0,
             });
+            scheduleCoverageRefresh(token);
           },
           (error: unknown) => {
             const latest = modelRef.current;
@@ -403,11 +512,15 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
               selected: 0,
               listTop: 0,
             });
+            scheduleCoverageRefresh(token);
           },
-        );
+          );
+      }, 0);
     };
 
     const editQuery = (rl: { write: (...args: never[]) => void }): void => {
+      if (requestStart.current !== null) clearTimeout(requestStart.current);
+      requestStart.current = null;
       requestController.current?.abort();
       requestController.current = null;
       requestToken.current += 1;
@@ -456,6 +569,8 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
         targetRawIndex,
         scroll: null,
       };
+      preparedTranscript.current = null;
+      cancelTranscriptScroll();
       setModel({ ...current, view: "transcript", transcript: draft });
     };
 
@@ -497,13 +612,24 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
       }
 
       if (key.ctrl && name === "c") {
+        cancelTranscriptScroll();
+        if (coverageRefresh.current !== null) clearTimeout(coverageRefresh.current);
+        coverageRefresh.current = null;
+        if (requestStart.current !== null) clearTimeout(requestStart.current);
+        requestStart.current = null;
         requestController.current?.abort();
         requestController.current = null;
         requestToken.current += 1;
         done({ action: "quit" });
         return;
       }
+      clearHandledShortcut(rl);
       if (name === "q") {
+        cancelTranscriptScroll();
+        if (coverageRefresh.current !== null) clearTimeout(coverageRefresh.current);
+        coverageRefresh.current = null;
+        if (requestStart.current !== null) clearTimeout(requestStart.current);
+        requestStart.current = null;
         requestController.current?.abort();
         requestController.current = null;
         requestToken.current += 1;
@@ -518,6 +644,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
 
       if (current.view === "transcript") {
         if (name === "escape") {
+          cancelTranscriptScroll();
           setModel({ ...current, view: "results", transcript: null });
           return;
         }
@@ -526,9 +653,12 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
         const measured = dimensions(config.output);
         const width = Math.max(1, measured.columns - 1);
         const capacity = Math.max(1, measured.rows - 2);
-        const document = transcriptDocument(transcript, width, config.ui);
+        const document = transcriptLayout(transcript, width);
         const maximum = Math.max(0, document.lines.length - capacity);
-        let scroll = transcript.scroll === null
+        const pending = pendingTranscriptScroll.current;
+        let scroll = pending?.rawLines === transcript.rawLines
+          ? pending.value
+          : transcript.scroll === null
           ? Math.max(
               0,
               Math.min(
@@ -537,6 +667,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
               ),
             )
           : transcript.scroll;
+        const previousScroll = scroll;
         if (isUpKey(key) || name === "k") scroll -= 1;
         else if (isDownKey(key) || name === "j") scroll += 1;
         else if (name === "pageup") scroll -= capacity;
@@ -544,13 +675,9 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
         else if (name === "home") scroll = 0;
         else if (name === "end") scroll = maximum;
         else return;
-        setModel({
-          ...current,
-          transcript: {
-            ...transcript,
-            scroll: Math.max(0, Math.min(maximum, scroll)),
-          },
-        });
+        const nextScroll = Math.max(0, Math.min(maximum, scroll));
+        if (nextScroll === previousScroll) return;
+        scheduleTranscriptScroll(transcript, nextScroll);
         return;
       }
 
@@ -622,6 +749,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
         width,
         config.ui,
       );
+      if (selected === current.selected && nextWindow.top === current.listTop) return;
       setModel({ ...current, selected, listTop: nextWindow.top });
     });
 
@@ -648,7 +776,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
       }
       while (lines.length < Math.max(0, rows - 2)) lines.push("");
       if (rows >= 2) {
-        lines.push(ui.color.dim(ui.truncate("Enter search  Esc menu", width)).text);
+        lines.push(ui.color.dim(ui.truncate("Enter - search | Esc - menu |", width)).text);
       }
       lines.push(inputLine);
       return lines.slice(0, rows).join("\n");
@@ -662,13 +790,13 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
         lines.push(ui.truncate(`Searching for "${model.query}"...`, width));
       }
       if (coverage && rows >= 4) lines.push(ui.color.dim(ui.truncate(coverage, width)).text);
-      return padScreen(lines, rows, "Esc edit query  q quit", width, ui);
+      return padScreen(lines, rows, "Esc - edit query | q - quit |", width, ui);
     }
 
     if (model.view === "transcript" && model.transcript !== null) {
       const transcript = model.transcript;
       const capacity = Math.max(0, rows - 2);
-      const document = transcriptDocument(transcript, width, ui);
+      const document = transcriptLayout(transcript, width);
       const maximum = Math.max(0, document.lines.length - capacity);
       const scroll = transcript.scroll === null
         ? Math.max(
@@ -686,7 +814,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
       return padScreen(
         [ui.color.bold(ui.truncate(transcript.title, width)).text, ...body],
         rows,
-        "Up/Down scroll  PgUp/PgDn page  Esc results  q quit",
+        `${ui.policy.unicode ? "↑/↓" : "Up/Down"} - scroll | PgUp/PgDn - page | Esc - results | q - quit |`,
         width,
         ui,
       );
@@ -695,7 +823,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
     const response = model.response;
     let header = "Search transcripts";
     const body: string[] = [];
-    let footer = "r retry  / or e edit  Esc query  q quit";
+    let footer = "r - retry | / - edit | Esc - query | q - quit |";
     if (model.failure !== null) {
       header += " | error";
       body.push("Search failed:", model.failure);
@@ -747,7 +875,7 @@ const searchPromptInternal = createPrompt<SearchPromptResult, SearchPromptConfig
           );
         }
       }
-      footer = "Up/Down j/k  PgUp/PgDn Home/End  [ prev  ] next  Enter open  s sort  / edit  q quit";
+      footer = `${ui.policy.unicode ? "↑/↓" : "Up/Down"} - navigate | Enter - open | s - sort | q - quit |`;
     }
     const safeBody = body.map((line) =>
       line.includes("\x1b[") ? line : ui.truncate(line, width),

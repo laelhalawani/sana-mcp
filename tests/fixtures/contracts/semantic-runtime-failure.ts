@@ -5,6 +5,14 @@ export class SemanticUnavailableError extends Error {
   }
 }
 
+export const EMBED_DIM = 384;
+export const EMBED_MODEL = "fixture-model";
+export const SEMANTIC_INDEX_VERSION = 2;
+
+export function vectorBackendForPlatform(): "sqlite-vec" {
+  return "sqlite-vec";
+}
+
 export function semanticCapabilityState(): { kind: "available" } {
   return { kind: "available" };
 }

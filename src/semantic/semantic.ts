@@ -3,7 +3,7 @@
 import path from "node:path";
 import { SQLiteError, type Database } from "bun:sqlite";
 import { dataDirectory } from "../config.js";
-import { RUNTIME_ENV } from "../runtime/env.js";
+import { RUNTIME_ENV, SEMANTIC_DETAIL_MAX_WORDS } from "../runtime/env.js";
 import { BUILD_INFO, type SemanticCapability } from "../runtime/build-info.js";
 import type { Bindings } from "../store/db.js";
 import {
@@ -16,10 +16,107 @@ import {
 
 export const EMBED_MODEL = RUNTIME_ENV.embedModel;
 export const EMBED_DIM = RUNTIME_ENV.embedDimension;
+export const SEMANTIC_INDEX_VERSION = 2;
 // Lines shorter than this many words are too noisy to embed and are skipped.
 const MIN_WORDS = RUNTIME_ENV.embedMinWords;
+const LARGE_CHUNK_WORDS = 96;
+const DETAIL_CHUNK_WORDS = SEMANTIC_DETAIL_MAX_WORDS;
 // Warm load is ~150ms, so we keep the model in RAM only briefly after use.
 const IDLE_UNLOAD_MS = RUNTIME_ENV.embedIdleMs;
+
+export type SemanticChunkKind = "large" | "small";
+
+export interface SemanticChunk {
+  readonly kind: SemanticChunkKind;
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly text: string;
+}
+
+interface ChunkUnit {
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly text: string;
+  readonly words: number;
+}
+
+function textWords(text: string): string[] {
+  return text.trim().split(/\s+/u).filter(Boolean);
+}
+
+function lineUnits(
+  line: { n: number; text: string },
+  maximumWords: number,
+): ChunkUnit[] {
+  const words = textWords(line.text);
+  const units: ChunkUnit[] = [];
+  for (let index = 0; index < words.length; index += maximumWords) {
+    const slice = words.slice(index, index + maximumWords);
+    units.push({
+      startLine: line.n,
+      endLine: line.n,
+      text: slice.join(" "),
+      words: slice.length,
+    });
+  }
+  return units;
+}
+
+function packChunks(
+  units: readonly ChunkUnit[],
+  kind: SemanticChunkKind,
+  maximumWords: number,
+  overlapUnits: number,
+): SemanticChunk[] {
+  const chunks: SemanticChunk[] = [];
+  let start = 0;
+  while (start < units.length) {
+    let end = start;
+    let words = 0;
+    while (
+      end < units.length &&
+      (end === start || words + units[end]!.words <= maximumWords)
+    ) {
+      words += units[end]!.words;
+      end++;
+    }
+    const selected = units.slice(start, end);
+    if (words >= MIN_WORDS) {
+      chunks.push({
+        kind,
+        startLine: selected[0]!.startLine,
+        endLine: selected.at(-1)!.endLine,
+        text: selected.map((unit) => unit.text).join(" "),
+      });
+    }
+    if (end >= units.length) break;
+    start = Math.max(start + 1, end - overlapUnits);
+  }
+  return chunks;
+}
+
+/** Build thematic speaker-turn chunks and smaller overlapping detail chunks. */
+export function semanticChunks(
+  lines: readonly { n: number; speaker: string; text: string }[],
+): SemanticChunk[] {
+  const chunks: SemanticChunk[] = [];
+  let start = 0;
+  while (start < lines.length) {
+    let end = start + 1;
+    while (end < lines.length && lines[end]!.speaker === lines[start]!.speaker) {
+      end++;
+    }
+    const turn = lines.slice(start, end);
+    const largeUnits = turn.flatMap((line) => lineUnits(line, LARGE_CHUNK_WORDS));
+    const detailUnits = turn.flatMap((line) => lineUnits(line, DETAIL_CHUNK_WORDS));
+    chunks.push(
+      ...packChunks(largeUnits, "large", LARGE_CHUNK_WORDS, 0),
+      ...packChunks(detailUnits, "small", DETAIL_CHUNK_WORDS, 1),
+    );
+    start = end;
+  }
+  return chunks;
+}
 
 export interface SemanticUnavailableContext {
   readonly operation:
@@ -541,15 +638,22 @@ export function vectorBackendForPlatform(
 
 export function createPortableVectorSchema(db: Database): void {
   db.exec(
-    `CREATE TABLE IF NOT EXISTS vec_lines_portable (
+    `CREATE TABLE IF NOT EXISTS vec_chunks_v2_portable (
        meeting_id TEXT NOT NULL,
-       line_no INTEGER NOT NULL,
+       chunk_kind TEXT NOT NULL CHECK (chunk_kind IN ('large', 'small')),
+       chunk_no INTEGER NOT NULL,
+       start_line INTEGER NOT NULL,
+       end_line INTEGER NOT NULL,
        created_at INTEGER NOT NULL,
+       index_version INTEGER NOT NULL,
        embedding BLOB NOT NULL,
-       PRIMARY KEY (meeting_id, line_no)
-     );
-     CREATE INDEX IF NOT EXISTS idx_vec_lines_portable_created
-       ON vec_lines_portable(created_at);`,
+       PRIMARY KEY (meeting_id, chunk_kind, chunk_no)
+      );
+     CREATE INDEX IF NOT EXISTS idx_vec_chunks_v2_portable_created
+       ON vec_chunks_v2_portable(created_at);
+     CREATE INDEX IF NOT EXISTS idx_vec_chunks_v2_portable_kind
+       ON vec_chunks_v2_portable(chunk_kind);
+     DROP TABLE IF EXISTS vec_lines_portable;`,
   );
 }
 
@@ -569,62 +673,119 @@ function decodeVector(bytes: Uint8Array): Float32Array {
   return vector;
 }
 
-export function portableKnn(
+export interface SemanticHit {
+  readonly meeting_id: string;
+  readonly kind: SemanticChunkKind;
+  readonly start_line: number;
+  readonly end_line: number;
+  readonly distance: number;
+}
+
+export async function portableKnn(
   db: Database,
   queryVec: Uint8Array,
   opts: {
     k: number;
+    kind: SemanticChunkKind;
     dateFrom?: number;
     dateTo?: number;
     fence?: <Value>(operation: () => Value) => Value;
+    signal?: AbortSignal;
+    completedOnly?: boolean;
   },
-): { meeting_id: string; line_no: number; distance: number }[] {
+): Promise<SemanticHit[]> {
   const query = decodeVector(queryVec);
-  const clauses = ["rowid > $after"];
-  const baseParams: Bindings = {};
+  const clauses = [
+    "v.rowid > $after",
+    "v.chunk_kind = $kind",
+    "v.index_version = $indexVersion",
+  ];
+  const baseParams: Bindings = {
+    kind: opts.kind,
+    indexVersion: SEMANTIC_INDEX_VERSION,
+  };
+  if (opts.completedOnly === true) {
+    clauses.push(
+      "e.dim = $dimension",
+      "e.model = $model",
+      "e.index_version = $indexVersion",
+      "e.vector_backend = $backend",
+    );
+    baseParams.dimension = EMBED_DIM;
+    baseParams.model = EMBED_MODEL;
+    baseParams.backend = "portable";
+  }
   if (opts.dateFrom != null) {
-    clauses.push("created_at >= $dateFrom");
-    baseParams.$dateFrom = opts.dateFrom;
+    clauses.push("v.created_at >= $dateFrom");
+    baseParams.dateFrom = opts.dateFrom;
   }
   if (opts.dateTo != null) {
-    clauses.push("created_at <= $dateTo");
-    baseParams.$dateTo = opts.dateTo;
+    clauses.push("v.created_at <= $dateTo");
+    baseParams.dateTo = opts.dateTo;
   }
   const statement = db
     .prepare(
-      `SELECT rowid, meeting_id, line_no, embedding
-       FROM vec_lines_portable
+       `SELECT v.rowid, v.meeting_id, v.chunk_kind, v.start_line, v.end_line, v.embedding
+        FROM vec_chunks_v2_portable v
+        ${opts.completedOnly === true
+          ? "JOIN line_embeddings e ON e.meeting_id = v.meeting_id"
+          : ""}
        WHERE ${clauses.join(" AND ")}
-       ORDER BY rowid
+        ORDER BY v.rowid
        LIMIT $batch`,
     );
   type PortableRow = {
     rowid: number;
     meeting_id: string;
-    line_no: number;
+    chunk_kind: SemanticChunkKind;
+    start_line: number;
+    end_line: number;
     embedding: Uint8Array;
   };
   const limit = Math.max(1, opts.k);
-  const nearest: Array<{
-    meeting_id: string;
-    line_no: number;
-    distance: number;
-  }> = [];
+  const nearest: SemanticHit[] = [];
   const compare = (
     left: (typeof nearest)[number],
     right: (typeof nearest)[number],
   ): number =>
     left.distance - right.distance ||
     left.meeting_id.localeCompare(right.meeting_id) ||
-    left.line_no - right.line_no;
+    left.start_line - right.start_line ||
+    left.end_line - right.end_line;
+  const worse = (left: SemanticHit, right: SemanticHit): boolean =>
+    compare(left, right) > 0;
+  const swap = (left: number, right: number): void => {
+    [nearest[left], nearest[right]] = [nearest[right]!, nearest[left]!];
+  };
+  const siftUp = (index: number): void => {
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (!worse(nearest[index]!, nearest[parent]!)) break;
+      swap(index, parent);
+      index = parent;
+    }
+  };
+  const siftDown = (index: number): void => {
+    for (;;) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let worst = index;
+      if (left < nearest.length && worse(nearest[left]!, nearest[worst]!)) worst = left;
+      if (right < nearest.length && worse(nearest[right]!, nearest[worst]!)) worst = right;
+      if (worst === index) return;
+      swap(index, worst);
+      index = worst;
+    }
+  };
   let after = 0;
   const batch = 256;
   for (;;) {
+    opts.signal?.throwIfAborted();
     const read = () =>
       statement.all({
         ...baseParams,
-        $after: after,
-        $batch: batch,
+        after,
+        batch,
       }) as PortableRow[];
     const rows = opts.fence ? opts.fence(read) : read();
     if (rows.length === 0) break;
@@ -636,16 +797,25 @@ export function portableKnn(
         const delta = query[index]! - candidate[index]!;
         squaredDistance += delta * delta;
       }
-      nearest.push({
+      const hit: SemanticHit = {
         meeting_id: row.meeting_id,
-        line_no: row.line_no,
+        kind: row.chunk_kind,
+        start_line: row.start_line,
+        end_line: row.end_line,
         distance: Math.sqrt(squaredDistance),
-      });
-      nearest.sort(compare);
-      if (nearest.length > limit) nearest.pop();
+      };
+      if (nearest.length < limit) {
+        nearest.push(hit);
+        siftUp(nearest.length - 1);
+      } else if (compare(hit, nearest[0]!) < 0) {
+        nearest[0] = hit;
+        siftDown(0);
+      }
     }
+    opts.signal?.throwIfAborted();
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
-  return nearest;
+  return nearest.sort(compare);
 }
 
 function isMissingVecModule(cause: unknown): boolean {
@@ -701,12 +871,41 @@ export function createVectorExtensionRuntime(
         extensionLoaded.add(db);
       }
       try {
-        const createSchema = () =>
+        const createSchema = (): void => {
+          const existing = db.prepare(
+            `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_chunks_v2'`,
+          ).get() as { sql: string } | null;
+          if (existing !== null) {
+            const dimension = /\bembedding\s+float\[(\d+)\]/iu.exec(existing.sql)?.[1];
+            if (dimension === undefined) {
+              throw new Error(
+                "Existing sqlite-vec chunk schema does not declare an embedding dimension",
+              );
+            }
+            if (Number(dimension) !== EMBED_DIM) {
+              db.exec(`DROP TABLE vec_chunks_v2`);
+              const markersExist = db.prepare(
+                `SELECT 1 AS present
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'line_embeddings'`,
+              ).get();
+              if (markersExist !== null) {
+                db.exec(
+                  `DELETE FROM line_embeddings WHERE vector_backend = 'sqlite-vec'`,
+                );
+              }
+            }
+          }
           db.exec(
-            `CREATE VIRTUAL TABLE IF NOT EXISTS vec_lines USING vec0(
-               embedding float[${EMBED_DIM}], meeting_id TEXT, line_no INTEGER, created_at INTEGER
-             )`,
+            `CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks_v2 USING vec0(
+               embedding float[${EMBED_DIM}], meeting_id TEXT, chunk_kind TEXT,
+               chunk_no INTEGER,
+               start_line INTEGER, end_line INTEGER, created_at INTEGER,
+               index_version INTEGER
+              )`,
           );
+          db.exec(`DROP TABLE IF EXISTS vec_lines`);
+        };
         if (fence) fence(createSchema);
         else createSchema();
       } catch (cause) {
@@ -758,80 +957,159 @@ export async function ensureVec(
   return "sqlite-vec";
 }
 
-/** Embed a meeting's lines (skipping trivially short ones) and store vectors. */
+/** Embed one meeting's thematic and detail chunks, then publish them atomically. */
 export async function embedMeeting(
   db: Database,
   meetingId: string,
   createdAtMs: number,
-  lines: { n: number; text: string }[],
+  transcriptFetchedMs: number,
+  lines: { n: number; speaker: string; text: string }[],
   commit: <Value>(write: () => Value) => Value,
 ): Promise<void> {
   const backend = await ensureVec(db, commit);
-  const table = backend === "sqlite-vec" ? "vec_lines" : "vec_lines_portable";
-  const usable = lines.filter((l) => l.text.split(/\s+/).length >= MIN_WORDS);
-  if (usable.length === 0) {
-    commit(() => {
-      db.prepare(`DELETE FROM ${table} WHERE meeting_id = ?`).run(meetingId);
-    });
-    return;
-  }
-
+  const table = backend === "sqlite-vec"
+    ? "vec_chunks_v2"
+    : "vec_chunks_v2_portable";
+  const chunks = semanticChunks(lines);
   const ins = db.prepare(
-    `INSERT INTO ${table}(embedding, meeting_id, line_no, created_at) VALUES (?, ?, ?, ?)`
+    `INSERT INTO ${table}(
+       embedding, meeting_id, chunk_kind, chunk_no, start_line, end_line,
+       created_at, index_version
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const BATCH = 128;
-  for (let i = 0; i < usable.length; i += BATCH) {
-    const slice = usable.slice(i, i + BATCH);
-    const vecs = await embed(slice.map((l) => l.text));
-    commit(() => {
-      if (i === 0) {
-        db.prepare(`DELETE FROM ${table} WHERE meeting_id = ?`).run(meetingId);
-      }
-      const tx = db.transaction(() => {
-        for (let j = 0; j < slice.length; j++) {
-          ins.run(toBuf(vecs[j]), meetingId, BigInt(slice[j].n), BigInt(createdAtMs));
-        }
-      });
-      tx();
-    });
+  const vectors: Float32Array[] = [];
+  for (let index = 0; index < chunks.length; index += BATCH) {
+    vectors.push(
+      ...await embed(chunks.slice(index, index + BATCH).map((chunk) => chunk.text)),
+    );
   }
+  commit(() => {
+    const tx = db.transaction(() => {
+      db.prepare(`DELETE FROM ${table} WHERE meeting_id = ?`).run(meetingId);
+      const chunkNumbers: Record<SemanticChunkKind, number> = { large: 0, small: 0 };
+      for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index]!;
+        ins.run(
+          toBuf(vectors[index]!),
+          meetingId,
+          chunk.kind,
+          BigInt(++chunkNumbers[chunk.kind]),
+          BigInt(chunk.startLine),
+          BigInt(chunk.endLine),
+          BigInt(createdAtMs),
+          BigInt(SEMANTIC_INDEX_VERSION),
+        );
+      }
+      db.prepare(
+        `INSERT INTO line_embeddings (
+           meeting_id, dim, model, done_ms, transcript_fetched_ms, index_version,
+           vector_backend
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(meeting_id) DO UPDATE SET
+           dim = excluded.dim,
+           model = excluded.model,
+           done_ms = excluded.done_ms,
+           transcript_fetched_ms = excluded.transcript_fetched_ms,
+           index_version = excluded.index_version,
+           vector_backend = excluded.vector_backend`,
+      ).run(
+        meetingId,
+        EMBED_DIM,
+        EMBED_MODEL,
+        Date.now(),
+        transcriptFetchedMs,
+        SEMANTIC_INDEX_VERSION,
+        backend,
+      );
+    });
+    tx();
+  });
 }
 
-/** KNN search over stored line vectors. */
+/** KNN search over one semantic chunk granularity. */
 export async function searchKnn(
   db: Database,
   queryVec: Buffer,
   opts: {
     k: number;
+    kind: SemanticChunkKind;
     dateFrom?: number;
     dateTo?: number;
     fence?: <Value>(operation: () => Value) => Value;
+    signal?: AbortSignal;
   }
-): Promise<{ meeting_id: string; line_no: number; distance: number }[]> {
+): Promise<SemanticHit[]> {
   const backend = await ensureVec(db, opts.fence);
   if (backend === "portable") {
-    return portableKnn(db, queryVec, opts);
+    return portableKnn(db, queryVec, { ...opts, completedOnly: true });
   }
-  const clauses = ["embedding MATCH @q"];
-  const params: Bindings = { q: queryVec, k: BigInt(Math.max(1, opts.k)) };
+  const clauses = [
+    "v.embedding MATCH @q",
+    "v.chunk_kind = @kind",
+    "v.index_version = @indexVersion",
+    "e.dim = @dimension",
+    "e.model = @model",
+    "e.index_version = @indexVersion",
+    "e.vector_backend = @backend",
+  ];
+  const storageClauses = [
+    "v.chunk_kind = @kind",
+    "v.index_version = @indexVersion",
+  ];
+  const storageParams: Bindings = {
+    kind: opts.kind,
+    indexVersion: BigInt(SEMANTIC_INDEX_VERSION),
+  };
+  const params: Bindings = {
+    q: queryVec,
+    kind: opts.kind,
+    indexVersion: BigInt(SEMANTIC_INDEX_VERSION),
+    dimension: BigInt(EMBED_DIM),
+    model: EMBED_MODEL,
+    backend,
+    k: BigInt(Math.max(1, opts.k)),
+  };
   if (opts.dateFrom != null) {
-    clauses.push("created_at >= @from");
+    clauses.push("v.created_at >= @from");
+    storageClauses.push("v.created_at >= @from");
     params.from = BigInt(opts.dateFrom);
+    storageParams.from = BigInt(opts.dateFrom);
   }
   if (opts.dateTo != null) {
-    clauses.push("created_at <= @to");
+    clauses.push("v.created_at <= @to");
+    storageClauses.push("v.created_at <= @to");
     params.to = BigInt(opts.dateTo);
+    storageParams.to = BigInt(opts.dateTo);
   }
   const read = () =>
     db
       .prepare(
-        `SELECT meeting_id, CAST(line_no AS INTEGER) AS line_no, distance
-         FROM vec_lines WHERE ${clauses.join(" AND ")} AND k = @k ORDER BY distance`,
+        `SELECT v.meeting_id, v.chunk_kind AS kind,
+                CAST(v.start_line AS INTEGER) AS start_line,
+                CAST(v.end_line AS INTEGER) AS end_line, v.distance
+         FROM vec_chunks_v2 v
+         JOIN line_embeddings e ON e.meeting_id = v.meeting_id
+         WHERE ${clauses.join(" AND ")} AND k = @k ORDER BY distance`,
       )
-      .all(params) as {
-      meeting_id: string;
-      line_no: number;
-      distance: number;
-    }[];
-  return opts.fence ? opts.fence(read) : read();
+      .all(params) as SemanticHit[];
+  opts.signal?.throwIfAborted();
+  let rows = opts.fence ? opts.fence(read) : read();
+  const requested = Math.max(1, opts.k);
+  if (rows.length >= requested) return rows.slice(0, requested);
+  const count = () => (
+    db.prepare(
+      `SELECT COUNT(*) AS count FROM vec_chunks_v2 v
+       WHERE ${storageClauses.join(" AND ")}`,
+    ).get(storageParams) as { count: number }
+  ).count;
+  const stored = opts.fence ? opts.fence(count) : count();
+  let candidateCount = requested;
+  while (candidateCount < stored && rows.length < requested) {
+    opts.signal?.throwIfAborted();
+    candidateCount = Math.min(stored, Math.max(candidateCount + 1, candidateCount * 2));
+    params.k = BigInt(candidateCount);
+    rows = opts.fence ? opts.fence(read) : read();
+  }
+  return rows.slice(0, requested);
 }

@@ -99,7 +99,7 @@ describe("runtime environment", () => {
     ["SANA_REQUEST_DELAY_MS", "60001"],
     ["SANA_MAX_NEW_TRANSCRIPTS", "100001"],
     ["SANA_EMBED_DIM", "16385"],
-    ["SANA_EMBED_MIN_WORDS", "10001"],
+    ["SANA_EMBED_MIN_WORDS", "33"],
     ["SANA_EMBED_IDLE_MS", "86400001"],
   ])("rejects runtime-unsafe numeric %s=%s", (name, value) => {
     expect(() => parseRuntimeEnvironment({ [name]: value })).toThrow(

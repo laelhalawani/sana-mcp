@@ -11,6 +11,7 @@ import type { DaemonControlObservation } from "../../src/sync/control.js";
 const embedCalls: Array<{ meetingId: string; createdAtMs: number }> = [];
 const embeddedWrites: string[] = [];
 let beforeEmbedCommit: (() => void) | undefined;
+let testVectorBackend: "sqlite-vec" | "portable" = "sqlite-vec";
 const temporaryRoots: string[] = [];
 const REPOSITORY_ROOT = path.resolve(import.meta.dir, "../..");
 const TEST_DAEMON_INSTANCE =
@@ -23,10 +24,13 @@ class TestSemanticUnavailableError extends Error {}
 mock.module("../../src/semantic/semantic.js", () => ({
   semanticEnabled: () => true,
   semanticCapabilityState: () => ({ kind: "available" as const }),
+  ensureVec: async () => "sqlite-vec" as const,
+  vectorBackendForPlatform: () => testVectorBackend,
   embedMeeting: async (
     _db: unknown,
     meetingId: string,
     createdAtMs: number,
+    _transcriptFetchedMs: number,
     _lines: unknown,
     commit: (write: () => void) => void,
   ): Promise<void> => {
@@ -38,6 +42,7 @@ mock.module("../../src/semantic/semantic.js", () => ({
   },
   EMBED_DIM: 384,
   EMBED_MODEL: "test-model",
+  SEMANTIC_INDEX_VERSION: 2,
   SemanticUnavailableError: TestSemanticUnavailableError,
 }));
 
@@ -73,6 +78,7 @@ afterEach(async () => {
   embedCalls.length = 0;
   embeddedWrites.length = 0;
   beforeEmbedCommit = undefined;
+  testVectorBackend = "sqlite-vec";
   for (const root of temporaryRoots.splice(0)) {
     await removeTemporaryRoot(root);
   }
@@ -86,6 +92,45 @@ test("daemon startup resets retry history exactly once", () => {
     },
   });
   expect(resets).toBe(1);
+});
+
+test("portable runtime refuses cross-account replacement while sqlite vectors remain", async () => {
+  testVectorBackend = "portable";
+  let mutations = 0;
+  let listings = 0;
+  const store = {
+    getSyncState: () => syncState({
+      auth_generation: 1,
+      auth_publication_token: "11111111-1111-4111-8111-111111111111",
+      auth_user_id: "user-new",
+      auth_workspace_id: "workspace-new",
+      cache_user_id: "user-old",
+      cache_workspace_id: "workspace-old",
+    }),
+    vectorStorageBackends: () => new Set(["sqlite-vec"]),
+    writeSyncGeneration: () => {
+      mutations++;
+    },
+    writeCacheGeneration: () => {
+      mutations++;
+    },
+  } as unknown as SanaStore;
+  const client = {
+    walkMeetings: async () => {
+      listings++;
+    },
+  } as unknown as SanaClient;
+
+  await expect(syncOnce(store, client, {
+    generation: 1,
+    publicationToken: "11111111-1111-4111-8111-111111111111",
+    userId: "user-new",
+    workspaceId: "workspace-new",
+  }, TEST_DAEMON_INSTANCE)).rejects.toThrow(
+    "Cannot replace the active cache from a portable runtime while sqlite-vec storage is present",
+  );
+  expect(mutations).toBe(0);
+  expect(listings).toBe(0);
 });
 
 test("partial artifact success remains retrying and avoids transcript redownload", async () => {
@@ -106,6 +151,7 @@ test("partial artifact success remains retrying and avoids transcript redownload
     cache_workspace_id: "workspace-a",
   });
   const store = {
+    vectorStorageBackends: () => new Set(),
     db: {},
     getSyncState: () => state,
     writeSyncGeneration: (_cycle: unknown, operation: () => unknown) => operation(),
@@ -325,6 +371,7 @@ test("embedding errors are retried without mutating artifact failures", async ()
   ]);
 
   const store = {
+    vectorStorageBackends: () => new Set(),
     db: {},
     getSyncState: () =>
       syncState({
@@ -411,7 +458,7 @@ test("embedding errors are retried without mutating artifact failures", async ()
       createdAtMs: 1_725_000_000_000,
     },
   ]);
-  expect(marked).toEqual(["meeting-valid"]);
+  expect(marked).toEqual([]);
   expect(cleared).toEqual([]);
   expect(missingEmbeddingCalls.count).toBe(1);
 });
@@ -435,6 +482,7 @@ test("stale cycle cannot commit vector rows after embedding await", async () => 
     generation = 2;
   };
   const store = {
+    vectorStorageBackends: () => new Set(),
     db: {},
     getSyncState: () =>
       syncState({
@@ -550,6 +598,7 @@ test("complete listing releases the cache before artifact requests", async () =>
     updateSyncState: () => {},
     assertSyncGeneration: () => {},
     activateCacheIdentity: () => "unchanged",
+    vectorStorageBackends: () => new Set(),
     upsertMeeting: () => {},
     countMeetings: () => 1,
     countTranscripts: () => (transcriptSaved ? 1 : 0),

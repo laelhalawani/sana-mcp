@@ -6,12 +6,12 @@ import {
   type CacheOperationGuard,
   type SanaStore,
 } from "../store/db.js";
-import { transcriptLines } from "../sana/transcript.js";
 import {
   semanticCapabilityState,
   embedQuery,
   searchKnn,
   SemanticUnavailableError,
+  type SemanticHit,
 } from "../semantic/semantic.js";
 import type { SemanticCapabilityState } from "../semantic/semantic.js";
 import { posInt, parseFilters } from "./args.js";
@@ -155,8 +155,8 @@ export async function runSearch(
     );
   }
 
-  // --- hybrid (BM25 + semantic vectors, fused via Reciprocal Rank Fusion) ---
-  const POOL = 60;
+  // --- hybrid (BM25 + thematic chunks + detail chunks) --------------------
+  const POOL = Math.min(300, Math.max(60, offset + limit * 3));
   const RRF_K = 60;
   let kw: SearchRow[];
   try {
@@ -168,6 +168,7 @@ export async function runSearch(
         sort: "best",
         dateFrom,
         dateTo,
+        fusionPool: true,
       });
     kw = runtime.guard
       ? store.withCacheOperation(runtime.guard, read)
@@ -178,56 +179,81 @@ export async function runSearch(
     return { kind: "error", query, message: (e as Error).message };
   }
 
-  const meetingCache = new Map<string, ReturnType<typeof store.getMeeting>>();
-  const linesCache = new Map<string, { n: number; text: string }[]>();
-  const resolve = (mid: string, ln: number): SearchRow | null => {
-    let m = meetingCache.get(mid);
-    if (m === undefined) {
-      m = store.getMeeting(mid);
-      meetingCache.set(mid, m);
+  type Source = "bm25" | "large" | "small";
+  interface Candidate {
+    meetingId: string;
+    lineNo: number;
+    row: SearchRow | null;
+    ranks: Partial<Record<Source, number>>;
+  }
+  const fused = new Map<string, Candidate>();
+  const byMeeting = new Map<string, Set<number>>();
+  const candidate = (meetingId: string, lineNo: number): Candidate => {
+    const key = `${meetingId}:${lineNo}`;
+    let current = fused.get(key);
+    if (current === undefined) {
+      current = { meetingId, lineNo, row: null, ranks: {} };
+      fused.set(key, current);
+      const lines = byMeeting.get(meetingId) ?? new Set<number>();
+      lines.add(lineNo);
+      byMeeting.set(meetingId, lines);
     }
-    if (!m) return null;
-    let lines = linesCache.get(mid);
-    if (!lines) {
-      const t = store.getTranscript(mid);
-      lines = t
-        ? transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text }))
-        : [];
-      linesCache.set(mid, lines);
-    }
-    const line = lines.find((l) => l.n === ln);
-    return line
-      ? { meeting_id: mid, line_no: ln, text: line.text, created_at_ms: m.created_at_ms, name: m.name }
-      : null;
+    return current;
   };
+  const add = (
+    meetingId: string,
+    lineNo: number,
+    source: Source,
+    rank: number,
+    row?: SearchRow,
+  ): void => {
+    const current = candidate(meetingId, lineNo);
+    const previous = current.ranks[source];
+    if (previous === undefined || rank < previous) current.ranks[source] = rank;
+    if (row !== undefined) current.row = row;
+  };
+  kw.forEach((row, index) =>
+    add(row.meeting_id, row.line_no, "bm25", index + 1, row)
+  );
 
-  const fused = new Map<string, { row: SearchRow; score: number }>();
-  const add = (row: SearchRow, rank: number) => {
-    const key = `${row.meeting_id}:${row.line_no}`;
-    const inc = 1 / (RRF_K + rank);
-    const cur = fused.get(key);
-    if (cur) cur.score += inc;
-    else fused.set(key, { row, score: inc });
+  const project = (hit: SemanticHit, source: "large" | "small", rank: number): void => {
+    const targets = [...(byMeeting.get(hit.meeting_id) ?? [])].filter(
+      (lineNo) => lineNo >= hit.start_line && lineNo <= hit.end_line,
+    );
+    if (targets.length === 0) targets.push(hit.start_line);
+    for (const lineNo of targets) add(hit.meeting_id, lineNo, source, rank);
   };
-  kw.forEach((r, i) => add(r, i));
 
   try {
     checkpoint();
     const qv = await (runtime.embedQuery ?? embedQuery)(query, runtime.signal);
     checkpoint();
-    const knn = await (runtime.searchKnn ?? searchKnn)(
+    const semanticSearch = runtime.searchKnn ?? searchKnn;
+    const small = await semanticSearch(
       store.db,
       qv,
-      { k: POOL, dateFrom, dateTo, fence },
+      { k: POOL, kind: "small", dateFrom, dateTo, fence, signal: runtime.signal },
     );
     checkpoint();
-    const resolveRows = () =>
-      knn.forEach((h, i) => {
-        const row = resolve(h.meeting_id, h.line_no);
-        if (row) add(row, i);
-      });
-    if (runtime.guard) store.withCacheOperation(runtime.guard, resolveRows);
-    else resolveRows();
+    small.forEach((hit, index) => project(hit, "small", index + 1));
+    const large = await semanticSearch(
+      store.db,
+      qv,
+      { k: POOL, kind: "large", dateFrom, dateTo, fence, signal: runtime.signal },
+    );
+    checkpoint();
+    large.forEach((hit, index) => project(hit, "large", index + 1));
+
+    const unresolved = [...fused.values()]
+      .filter((item) => item.row === null)
+      .map((item) => ({ meeting_id: item.meetingId, line_no: item.lineNo }));
+    const resolveRows = () => store.resolveSearchLines(unresolved);
+    const resolved = runtime.guard
+      ? store.withCacheOperation(runtime.guard, resolveRows)
+      : resolveRows();
+    for (const row of resolved) {
+      candidate(row.meeting_id, row.line_no).row = row;
+    }
   } catch (e) {
     if (e instanceof CacheOperationChangedError) throw e;
     if (runtime.signal?.aborted) throw runtime.signal.reason;
@@ -245,13 +271,42 @@ export async function runSearch(
     });
   }
 
-  const itemsAll = [...fused.values()];
+  const evidenceTier = (ranks: Candidate["ranks"]): number => {
+    const bm25 = ranks.bm25 !== undefined;
+    const large = ranks.large !== undefined;
+    const small = ranks.small !== undefined;
+    if (bm25 && large && small) return 4;
+    if (large && small) return 3;
+    if (bm25 && large) return 2;
+    if (bm25 && small) return 1;
+    return 0;
+  };
+  const score = (ranks: Candidate["ranks"]): number =>
+    Object.values(ranks).reduce(
+      (total, rank) => total + 1 / (RRF_K + rank),
+      0,
+    );
+  const bestRank = (ranks: Candidate["ranks"]): number =>
+    Math.min(...Object.values(ranks));
+  const itemsAll = [...fused.values()]
+    .filter((item): item is Candidate & { row: SearchRow } => item.row !== null)
+    .map((item) => ({
+      ...item,
+      tier: evidenceTier(item.ranks),
+      score: score(item.ranks),
+      bestRank: bestRank(item.ranks),
+    }));
   itemsAll.sort((a, b) =>
     sort === "newest"
       ? b.row.created_at_ms - a.row.created_at_ms
       : sort === "oldest"
         ? a.row.created_at_ms - b.row.created_at_ms
-        : b.score - a.score
+        : b.tier - a.tier ||
+          b.score - a.score ||
+          a.bestRank - b.bestRank ||
+          b.row.created_at_ms - a.row.created_at_ms ||
+          a.row.meeting_id.localeCompare(b.row.meeting_id) ||
+          a.row.line_no - b.row.line_no
   );
   const total = itemsAll.length;
   const rows = itemsAll.slice(offset, offset + limit).map((x) => x.row);
