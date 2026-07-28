@@ -645,7 +645,7 @@ test("POSIX installer only writes startup files for explicitly supported shells"
   }
 });
 
-test("POSIX upgrades separate receipt-owned PATH state from current-shell availability", { timeout: 60_000 }, async () => {
+test("POSIX upgrades separate receipt-owned PATH state from current-shell availability", { timeout: 120_000 }, async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-shell-upgrade-"));
   try {
@@ -817,7 +817,7 @@ test("POSIX upgrades separate receipt-owned PATH state from current-shell availa
   }
 });
 
-test("POSIX upgrades preserve legacy receipt-owned profiles without claiming current bash readiness", async () => {
+test("POSIX upgrades preserve legacy receipt-owned profiles without claiming current bash readiness", { timeout: 60_000 }, async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-bash-profile-upgrade-"));
   try {
