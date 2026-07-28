@@ -6,6 +6,7 @@ import path from "node:path";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 const FIXTURE = path.join(ROOT, "tests/fixtures/cli-output-dispatch.ts");
+const CLI_PROCESS_TIMEOUT_MS = 10_000;
 let temporaryRoot = "";
 let cli = "";
 
@@ -48,27 +49,36 @@ afterAll(() => {
 });
 
 function run(tool: string, json?: string): ReturnType<typeof spawnSync> {
-  return spawnSync(process.execPath, [cli, tool, ...(json ? [json] : [])], {
-    cwd: temporaryRoot,
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-    env: {
-      HOME: temporaryRoot,
-      USERPROFILE: temporaryRoot,
-      XDG_CONFIG_HOME: path.join(temporaryRoot, ".config"),
-      XDG_DATA_HOME: path.join(temporaryRoot, ".local", "share"),
-      XDG_CACHE_HOME: path.join(temporaryRoot, ".cache"),
-      APPDATA: path.join(temporaryRoot, "appdata"),
-      LOCALAPPDATA: path.join(temporaryRoot, "localappdata"),
-      TMP: path.join(temporaryRoot, "tmp"),
-      TEMP: path.join(temporaryRoot, "tmp"),
-      TMPDIR: path.join(temporaryRoot, "tmp"),
-      PATH: path.dirname(process.execPath),
-      SANA_DATA_DIR: path.join(temporaryRoot, "data"),
-      SANA_TRANSCRIPTS_DIR: path.join(temporaryRoot, "transcripts"),
-      SANA_SEMANTIC: "0",
+  const result = spawnSync(
+    process.execPath,
+    [cli, tool, ...(json ? [json] : [])],
+    {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: CLI_PROCESS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      env: {
+        HOME: temporaryRoot,
+        USERPROFILE: temporaryRoot,
+        XDG_CONFIG_HOME: path.join(temporaryRoot, ".config"),
+        XDG_DATA_HOME: path.join(temporaryRoot, ".local", "share"),
+        XDG_CACHE_HOME: path.join(temporaryRoot, ".cache"),
+        APPDATA: path.join(temporaryRoot, "appdata"),
+        LOCALAPPDATA: path.join(temporaryRoot, "localappdata"),
+        TMP: path.join(temporaryRoot, "tmp"),
+        TEMP: path.join(temporaryRoot, "tmp"),
+        TMPDIR: path.join(temporaryRoot, "tmp"),
+        PATH: path.dirname(process.execPath),
+        SANA_DATA_DIR: path.join(temporaryRoot, "data"),
+        SANA_TRANSCRIPTS_DIR: path.join(temporaryRoot, "transcripts"),
+        SANA_SEMANTIC: "0",
+      },
     },
-  });
+  );
+  if (result.error !== undefined) throw result.error;
+  return result;
 }
 
 const sanitizedOutputs = {
@@ -134,6 +144,9 @@ test("one-shot flags preserve page, limit, and timestamp semantics", () => {
     {
       cwd: temporaryRoot,
       encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: CLI_PROCESS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
       env: {
         HOME: temporaryRoot,
         USERPROFILE: temporaryRoot,
@@ -152,6 +165,7 @@ test("one-shot flags preserve page, limit, and timestamp semantics", () => {
       },
     },
   );
+  if (result.error !== undefined) throw result.error;
   expect(result.status, result.stderr).toBe(0);
   expect(JSON.parse(result.stdout)).toEqual({
     page: 2,
