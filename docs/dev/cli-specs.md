@@ -425,9 +425,10 @@ Argument detail:
 
 Search defaults to hybrid keyword and semantic ranking (SQLite FTS5 + BM25 plus
 vector results fused by Reciprocal Rank Fusion). Compiled binaries bundle the
-semantic runtime and target sqlite-vec extension, then download and verify the
-exact pinned model revision on first use. `SANA_SEMANTIC=0` selects keyword-only
-search. Runtime failures degrade explicitly to keyword results.
+semantic runtime, using sqlite-vec where Bun supports dynamic extensions and a
+portable local vector backend otherwise, then download and verify the exact
+pinned model revision on first use. `SANA_SEMANTIC=0` selects keyword-only search.
+Runtime failures degrade explicitly to keyword results.
 
 ---
 

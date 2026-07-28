@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   authorize:
     runs-on: ubuntu-24.04
@@ -177,6 +181,9 @@ jobs:
     needs: authorize
     if: needs.authorize.outputs.skip != 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SANA_SEMANTIC: "0"
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

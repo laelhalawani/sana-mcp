@@ -532,8 +532,11 @@ export type VectorBackend = "sqlite-vec" | "portable";
 
 export function vectorBackendForPlatform(
   platform: NodeJS.Platform = process.platform,
+  target: string | null = BUILD_INFO.target,
 ): VectorBackend {
-  return platform === "darwin" ? "portable" : "sqlite-vec";
+  return platform === "darwin" || target?.endsWith("-musl") === true
+    ? "portable"
+    : "sqlite-vec";
 }
 
 export function createPortableVectorSchema(db: Database): void {

@@ -169,9 +169,10 @@ export async function createAttestation(options: {
       `executed binary target ${inspect.target} does not match requested target ${options.target}`,
     );
   }
-  const expectedVectorBackend = options.target.startsWith("bun-darwin-")
-    ? "portable"
-    : "sqlite-vec";
+  const expectedVectorBackend =
+    options.target.startsWith("bun-darwin-") || options.target.endsWith("-musl")
+      ? "portable"
+      : "sqlite-vec";
   if (
     semanticSmokeOutput.vectorBackend !== expectedVectorBackend ||
     semanticSmokeOutput.sqliteVec !==
@@ -242,7 +243,9 @@ function canonicalAttestation(
     },
     semanticSmoke: {
       ...standaloneSemanticSmokeEvidence(
-        target.startsWith("bun-darwin-") ? "portable" : "sqlite-vec",
+        target.startsWith("bun-darwin-") || target.endsWith("-musl")
+          ? "portable"
+          : "sqlite-vec",
       ),
       target,
       executedSha256: sha256,

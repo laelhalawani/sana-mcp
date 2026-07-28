@@ -257,10 +257,10 @@ after roughly a minute of idle (about 150 MB only while active); vectors are
 stored in the same SQLite database via `sqlite-vec`. When enabled, embeddings are
 built as part of the login catch-up because they are required for hybrid ranking.
 
-> Prebuilt binaries bundle the semantic runtime and platform-specific
-> `sqlite-vec` extension. Initial semantic indexing or search downloads the
-> exact pinned model revision (about 23.7 MB) over HTTPS and verifies every
-> file's size and SHA-256.
+> Prebuilt binaries bundle the semantic runtime, using `sqlite-vec` where Bun
+> supports dynamic extensions and a portable local vector backend otherwise.
+> Initial semantic indexing or search downloads the exact pinned model revision
+> (about 23.7 MB) over HTTPS and verifies every file's size and SHA-256.
 > If semantic initialization fails, `search` returns keyword (BM25) results with
 > an explicit degradation notice; it never presents those results as hybrid.
 

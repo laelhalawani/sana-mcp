@@ -48,12 +48,15 @@ export function createSemanticBuildPlugin(target: ReleaseTarget): Bun.BunPlugin 
       build.onLoad(
         { filter: /.*/u, namespace: "sana-embedded-sqlite-vec" },
         () => {
-          if (target.startsWith("bun-darwin-")) {
+          if (
+            target.startsWith("bun-darwin-") ||
+            target.endsWith("-musl")
+          ) {
             return {
               loader: "ts",
               contents: `
 export function load() {
-  throw new Error("Darwin standalone builds use the bundled portable vector backend");
+  throw new Error("This standalone target uses the bundled portable vector backend");
 }
 `,
             };
