@@ -1153,6 +1153,76 @@ function printSetupSummary(
   presentation.print("Next: sana-mcp");
 }
 
+async function showSetupSummary(
+  interaction: InstallInteraction,
+  presentation: ConfigurerPresentation,
+  options: {
+    connectedClients: number;
+    signedIn: boolean;
+    reloadHints: readonly string[];
+  },
+): Promise<void> {
+  const useLiveStatus =
+    options.signedIn &&
+    presentation.policy.interactive &&
+    interaction.openAuthSession === undefined &&
+    interaction.syncStatusSnapshot === undefined &&
+    interaction.writeLine === undefined &&
+    interaction.promptDriver === undefined &&
+    interaction.prompt === undefined &&
+    interaction.confirm === undefined &&
+    interaction.input === undefined &&
+    interaction.chooseClients === undefined;
+  if (!useLiveStatus) {
+    printSetupSummary(presentation, {
+      ...options,
+      syncComplete: await syncIsComplete(interaction),
+    });
+    return;
+  }
+
+  const [{ LocalAppRuntime }, { syncStatusPrompt }] = await Promise.all([
+    import("../app/runtime.js"),
+    import("../app/status-prompt.js"),
+  ]);
+  const runtime = new LocalAppRuntime();
+  try {
+    let finalStatus = runtime.status();
+    await syncStatusPrompt(
+      {
+        getStatus: () => {
+          runtime.refresh();
+          finalStatus = runtime.status();
+          return finalStatus;
+        },
+        output: presentation.terminal.output,
+        ui: presentation.ui,
+        mode: "setup",
+        setup: {
+          connectedClients: options.connectedClients,
+          signedIn: options.signedIn,
+        },
+      },
+      presentation.promptContext(),
+    );
+    presentation.blank();
+    presentation.print(
+      finalStatus.phase === "synced" && finalStatus.remaining === 0
+        ? presentation.ui.color.green("Meeting sync complete.")
+        : "Meeting sync continues in the background.",
+    );
+    if (options.reloadHints.length > 0) {
+      presentation.print(
+        "Reload  ",
+        [...new Set(options.reloadHints)].join("; "),
+      );
+    }
+    presentation.print("Run: sana-mcp");
+  } finally {
+    runtime.close();
+  }
+}
+
 async function promptWizard(
   interaction: InstallInteraction,
   presentation: ConfigurerPresentation,
@@ -1877,12 +1947,11 @@ export async function runInstall(
       presentation.print(
         "Sana sign-in cancelled. Client configuration changes were kept.",
       );
-      printSetupSummary(presentation, {
+      await showSetupSummary(interaction, presentation, {
         connectedClients: collected.rows.filter(
           (row) => selection.desired[row.id] === true,
         ).length,
         signedIn: false,
-        syncComplete: await syncIsComplete(interaction),
         reloadHints: acted.flatMap((client, index) =>
           results[index]?.state === "applied" && client.reloadHint
             ? [client.reloadHint]
@@ -1904,12 +1973,11 @@ export async function runInstall(
     };
   }
   try {
-    printSetupSummary(presentation, {
+    await showSetupSummary(interaction, presentation, {
       connectedClients: collected.rows.filter(
         (row) => selection.desired[row.id] === true,
       ).length,
       signedIn: login.outcome !== "skipped",
-      syncComplete: await syncIsComplete(interaction),
       reloadHints: acted.flatMap((client, index) =>
         results[index]?.state === "applied" && client.reloadHint
           ? [client.reloadHint]

@@ -11,6 +11,10 @@ import {
   type MeetingBrowserResult,
 } from "./browser-prompt.js";
 import type { AppRuntime } from "./runtime.js";
+import {
+  syncStatusPrompt,
+  type SyncStatusPromptResult,
+} from "./status-prompt.js";
 
 export interface AppPromptChoice<Value extends string> {
   readonly name: string;
@@ -26,6 +30,7 @@ export interface AppPrompts {
   }): Promise<Value>;
   input(message: string): Promise<string>;
   meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult>;
+  syncStatus(runtime: AppRuntime): Promise<SyncStatusPromptResult>;
 }
 
 /** Apply the shared terminal policy to every interactive app prompt. */
@@ -117,6 +122,24 @@ export class TerminalAppPrompts implements AppPrompts {
   meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult> {
     return meetingBrowserPrompt(
       { runtime, output: this.outputStream, ui: this.ui },
+      {
+        input: this.inputStream as NodeJS.ReadableStream,
+        output: this.outputStream as NodeJS.WritableStream,
+      },
+    );
+  }
+
+  syncStatus(runtime: AppRuntime): Promise<SyncStatusPromptResult> {
+    return syncStatusPrompt(
+      {
+        getStatus: () => {
+          runtime.refresh();
+          return runtime.status();
+        },
+        output: this.outputStream,
+        ui: this.ui,
+        mode: "status",
+      },
       {
         input: this.inputStream as NodeJS.ReadableStream,
         output: this.outputStream as NodeJS.WritableStream,

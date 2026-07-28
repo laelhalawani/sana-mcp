@@ -1,22 +1,27 @@
 import {
   createPrompt,
+  ExitPromptError,
   isDownKey,
   isEnterKey,
   isUpKey,
+  useEffect,
   useKeypress,
   useRef,
   useState,
   type KeypressEvent,
 } from "@inquirer/core";
 import { rowStatus, type ArtifactProblem } from "../core/meetings.js";
-import type { MeetingListRow } from "../store/db.js";
+import {
+  retryDelayMs,
+  type MeetingListOpts,
+  type MeetingListRow,
+} from "../store/db.js";
 import type { AppRuntime } from "./runtime.js";
 import type { TerminalOutput, TerminalUi } from "./ui.js";
 
 export type MeetingBrowserResult =
   | { action: "quit" }
-  | { action: "account" }
-  | { action: "configure" };
+  | { action: "back" };
 
 export interface MeetingBrowserConfig {
   runtime: AppRuntime;
@@ -28,7 +33,18 @@ type BrowserView =
   | { kind: "list" }
   | { kind: "status" }
   | { kind: "help" }
+  | { kind: "sync"; id: string }
   | { kind: "detail"; id: string; title: string; lines: string[]; loading: boolean };
+
+type StatusFilter = NonNullable<MeetingListOpts["status"]>;
+type StatusFilterChoice = StatusFilter | "all";
+const STATUS_FILTERS: readonly StatusFilterChoice[] = [
+  "all",
+  "ready",
+  "downloading",
+  "processing",
+  "retrying",
+];
 
 interface BrowserModel {
   status: ReturnType<AppRuntime["status"]>;
@@ -36,8 +52,12 @@ interface BrowserModel {
   selectedId: string | null;
   filter: string;
   filterInput: string | null;
+  statusFilter: StatusFilter | null;
+  statusFilterInput: StatusFilterChoice | null;
   listTop: number;
   scroll: number;
+  refreshError: string | null;
+  updatedAt: number;
   view: BrowserView;
 }
 
@@ -64,11 +84,15 @@ function layoutDimensions(
   };
 }
 
-function meetingArgs(filter: string): Record<string, unknown> {
+function meetingArgs(
+  filter: string,
+  statusFilter: StatusFilter | null,
+): Record<string, unknown> {
   return {
     limit: 1000,
     page: 1,
     ...(filter ? { query: filter } : {}),
+    ...(statusFilter ? { filter: { status: statusFilter } } : {}),
   };
 }
 
@@ -76,7 +100,7 @@ function initialModel(runtime: AppRuntime): BrowserModel {
   const status = runtime.status();
   const page =
     status.session.loggedIn && !status.blocking
-      ? runtime.meetings(meetingArgs(""))
+      ? runtime.meetings(meetingArgs("", null))
       : null;
   return {
     status,
@@ -84,8 +108,12 @@ function initialModel(runtime: AppRuntime): BrowserModel {
     selectedId: page?.rows[0]?.id ?? null,
     filter: "",
     filterInput: null,
+    statusFilter: null,
+    statusFilterInput: null,
     listTop: 0,
     scroll: 0,
+    refreshError: null,
+    updatedAt: Date.now(),
     view: { kind: "list" },
   };
 }
@@ -116,6 +144,40 @@ function artifactLines(problem: ArtifactProblem): string[] {
     ...(problem.detail ? [problem.detail] : []),
     "Re-sync the meeting cache before retrying.",
   ];
+}
+
+function syncDetailLines(row: MeetingListRow | undefined): string[] {
+  if (!row) return ["This meeting is no longer present in the current filter."];
+  const status = rowStatus(row);
+  const lines = [
+    `Status: ${status}`,
+    `Transcript: ${row.has_transcript ? "ready" : "missing"}`,
+    `Metadata: ${row.has_metadata ? "ready" : "missing"}`,
+  ];
+  if (status === "ready") {
+    lines.push("This meeting is fully downloaded and available.");
+    return lines;
+  }
+  if (status === "processing") {
+    lines.push("Sana is still processing this meeting; it is not in the download queue yet.");
+    return lines;
+  }
+  lines.push("Queue: meetings are processed one at a time.");
+  if (row.attempts > 0) lines.push(`Attempts: ${row.attempts}`);
+  if (row.last_attempt_ms !== null) {
+    lines.push(`Last attempt: ${new Date(row.last_attempt_ms).toLocaleString()}`);
+    const retryAt = row.last_attempt_ms + retryDelayMs(row.attempts);
+    lines.push(
+      retryAt > Date.now()
+        ? `Next retry: ${new Date(retryAt).toLocaleString()}`
+        : "Retry eligibility: ready now; waiting for its turn in the queue.",
+    );
+  }
+  if (row.last_error) lines.push(`Last error: ${row.last_error}`);
+  if (status === "downloading") {
+    lines.push("Waiting for its turn in the sequential download queue.");
+  }
+  return lines;
 }
 
 function transcriptDetail(runtime: AppRuntime, id: string): BrowserView {
@@ -177,10 +239,15 @@ function participantsDetail(runtime: AppRuntime, id: string): BrowserView {
       id,
       result.name,
       result.participants.map(
-        (participant) =>
-          `${participant.displayName}${participant.email ? `  ${participant.email}` : ""}${
+        (participant) => {
+          const label =
+            participant.displayName ??
+            participant.email ??
+            "Unnamed participant";
+          return `${label}${participant.displayName && participant.email ? `  ${participant.email}` : ""}${
             participant.isHost ? "  (host)" : ""
-          }`,
+          }`;
+        },
       ),
     );
   }
@@ -224,14 +291,27 @@ function statusLines(status: BrowserModel["status"]): string[] {
         : "You are not signed in to Sana.",
     ];
   }
+  if (status.authTransition) {
+    return [`Authentication is not ready: ${status.authTransition.message}`];
+  }
   return [
+    "Sana session: signed in; access is checked before every sync cycle.",
     `Sync: ${status.phase.replaceAll("_", " ")}`,
-    ...(status.meetings === null ? [] : [`Meetings: ${status.meetings}`]),
+    ...(status.meetings === null ? [] : [`Meetings ready: ${status.meetings}`]),
+    ...(status.remaining === null || status.remaining === 0
+      ? []
+      : [
+          `Pending: ${status.remaining}${status.retrying ? ` (${status.retrying} retrying)` : ""}`,
+        ]),
     ...(status.transcriptsDone === null || status.transcriptsTotal === null
       ? []
-      : [`Transcripts: ${status.transcriptsDone}/${status.transcriptsTotal}`]),
-    ...(status.authTransition
-      ? [`Authentication: ${status.authTransition.message}`]
+        : [`Transcripts stored: ${status.transcriptsDone}/${status.transcriptsTotal}`]),
+    ...(status.message ? [status.message] : []),
+    ...(status.lastIncrementalMs
+      ? [`Last completed sync: ${new Date(status.lastIncrementalMs).toLocaleString()}`]
+      : []),
+    ...(status.daemonHeartbeatMs
+      ? [`Daemon heartbeat: ${new Date(status.daemonHeartbeatMs).toLocaleString()}`]
       : []),
     ...(status.error ? [`Sync error: ${status.error}`] : []),
     ...(status.syncUnavailable
@@ -242,9 +322,9 @@ function statusLines(status: BrowserModel["status"]): string[] {
 
 const HELP_LINES = [
   "up/down or j/k move; pgup/pgdn/home/end jump",
-  "enter/t transcript; s summary; p participants; o recording",
-  "/ filter titles; r refresh; i status; a account; c configure",
-  "esc back; q quit",
+  "enter/t transcript; d sync details; s summary; p participants; o recording",
+  "/ filter name; f filter status; c clear filters; r refresh; i status",
+  "esc menu; q quit",
 ];
 
 function clearInput(rl: { write: (...args: never[]) => void }): void {
@@ -267,39 +347,53 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
 
     const bodyRows = () =>
       Math.max(0, layoutDimensions(config.output).rows - 2);
-    const refresh = () => {
-      requestToken.current += 1;
+    const refresh = (view?: BrowserView, showError = false) => {
+      const current = modelRef.current;
       try {
         config.runtime.refresh();
         const status = config.runtime.status();
         const page =
           status.session.loggedIn && !status.blocking
-            ? config.runtime.meetings(meetingArgs(modelRef.current.filter))
+            ? config.runtime.meetings(
+                meetingArgs(current.filter, current.statusFilter),
+              )
             : null;
         setModel({
-          ...modelRef.current,
+          ...current,
           status,
           page,
           selectedId: keepSelection(
             page?.rows ?? [],
-            modelRef.current.selectedId,
+            current.selectedId,
           ),
-          listTop: 0,
-          scroll: 0,
-          view: { kind: "list" },
+          refreshError: null,
+          updatedAt: Date.now(),
+          view: view ?? current.view,
         });
       } catch (error) {
+        if (!showError) {
+          setModel({
+            ...current,
+            refreshError: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
         setModel({
-          ...modelRef.current,
+          ...current,
           scroll: 0,
           view: detail(
-            modelRef.current.selectedId ?? "",
+            current.selectedId ?? "",
             "Refresh failed",
             [error instanceof Error ? error.message : String(error)],
           ),
         });
       }
     };
+
+    useEffect(() => {
+      const timer = setInterval(() => refresh(undefined, false), 1_000);
+      return () => clearInterval(timer);
+    }, []);
 
     const openSelected = (kind: "transcript" | "summary" | "participants") => {
       const id = modelRef.current.selectedId;
@@ -375,6 +469,12 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       const name = keyName(key);
       const current = modelRef.current;
 
+      if (key.ctrl && name === "c") {
+        requestToken.current += 1;
+        done({ action: "quit" });
+        return;
+      }
+
       if (current.filterInput !== null) {
         if (isEnterKey(key)) {
           const filter = current.filterInput.trim();
@@ -384,7 +484,9 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
             return;
           }
           try {
-            const page = config.runtime.meetings(meetingArgs(filter));
+            const page = config.runtime.meetings(
+              meetingArgs(filter, current.statusFilter),
+            );
             setModel({
               ...current,
               page,
@@ -414,28 +516,61 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
         return;
       }
 
+      if (current.statusFilterInput !== null) {
+        const index = STATUS_FILTERS.indexOf(current.statusFilterInput);
+        if (isEnterKey(key)) {
+          const statusFilter =
+            current.statusFilterInput === "all"
+              ? null
+              : current.statusFilterInput;
+          try {
+            const page = config.runtime.meetings(
+              meetingArgs(current.filter, statusFilter),
+            );
+            setModel({
+              ...current,
+              page,
+              selectedId: keepSelection(page.rows, current.selectedId),
+              statusFilter,
+              statusFilterInput: null,
+              listTop: 0,
+            });
+          } catch (error) {
+            setModel({
+              ...current,
+              statusFilterInput: null,
+              scroll: 0,
+              view: detail(current.selectedId ?? "", "Status filter failed", [
+                error instanceof Error ? error.message : String(error),
+              ]),
+            });
+          }
+          return;
+        }
+        if (name === "escape") {
+          setModel({ ...current, statusFilterInput: null });
+          return;
+        }
+        if (isUpKey(key) || isDownKey(key) || name === "j" || name === "k") {
+          const delta = isUpKey(key) || name === "k" ? -1 : 1;
+          const next =
+            (index + delta + STATUS_FILTERS.length) % STATUS_FILTERS.length;
+          setModel({ ...current, statusFilterInput: STATUS_FILTERS[next]! });
+        }
+        return;
+      }
+
       if (name === "q") {
         requestToken.current += 1;
         done({ action: "quit" });
         return;
       }
-      if (name === "a") {
-        requestToken.current += 1;
-        done({ action: "account" });
-        return;
-      }
-      if (name === "c") {
-        requestToken.current += 1;
-        done({ action: "configure" });
-        return;
-      }
       if (name === "r") {
-        refresh();
+        refresh(undefined, true);
         return;
       }
       if (name === "i") {
-        requestToken.current += 1;
-        setModel({ ...current, view: { kind: "status" }, scroll: 0 });
+        refresh({ kind: "status" }, true);
         return;
       }
       if (name === "?") {
@@ -450,9 +585,14 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
           setModel({ ...current, view: { kind: "list" }, scroll: 0 });
           return;
         }
+        const syncId = current.view.kind === "sync" ? current.view.id : null;
         const viewLines =
           current.view.kind === "detail"
             ? current.view.lines
+            : current.view.kind === "sync"
+              ? syncDetailLines(
+                  current.page?.rows.find((row) => row.id === syncId),
+                )
             : current.view.kind === "status"
               ? statusLines(current.status)
               : HELP_LINES;
@@ -482,16 +622,59 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       }
 
       if (current.status.blocking) {
-        if (name === "escape") done({ action: "quit" });
+        if (name === "escape") done({ action: "back" });
         return;
       }
       if (name === "escape") {
-        done({ action: "quit" });
+        done({ action: "back" });
         return;
       }
       if (name === "/") {
         clearInput(rl);
-        setModel({ ...current, filterInput: "" });
+        if (current.filter) rl.write(current.filter as never);
+        setModel({ ...current, filterInput: current.filter });
+        return;
+      }
+      if (name === "f") {
+        setModel({
+          ...current,
+          statusFilterInput: current.statusFilter ?? "all",
+        });
+        return;
+      }
+      if (name === "c") {
+        if ((!current.filter && !current.statusFilter) || current.status.blocking) {
+          return;
+        }
+        try {
+          const page = config.runtime.meetings(meetingArgs("", null));
+          setModel({
+            ...current,
+            page,
+            selectedId: keepSelection(page.rows, current.selectedId),
+            filter: "",
+            filterInput: null,
+            statusFilter: null,
+            listTop: 0,
+          });
+        } catch (error) {
+          setModel({
+            ...current,
+            view: detail(current.selectedId ?? "", "Clear filters failed", [
+              error instanceof Error ? error.message : String(error),
+            ]),
+          });
+        }
+        return;
+      }
+      if (name === "d") {
+        if (current.selectedId !== null) {
+          setModel({
+            ...current,
+            view: { kind: "sync", id: current.selectedId },
+            scroll: 0,
+          });
+        }
         return;
       }
       if (isEnterKey(key) || name === "t") {
@@ -542,19 +725,41 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
     const capacity = Math.max(0, availableRows - 2);
     let header = "sana-mcp";
     let body: string[] = [];
-    let footer = "q quit  a account  c configure";
+    let footer = "esc menu  q quit";
 
     if (model.filterInput !== null) {
       header =
         capacity === 0
           ? `Filter: ${model.filterInput}`
           : "Filter meetings";
-      body = capacity > 0 ? [`/ ${model.filterInput}`] : [];
+      body =
+        capacity > 1
+          ? ["Type part of a meeting title", `/ ${model.filterInput}`]
+          : capacity > 0
+            ? [`/ ${model.filterInput}`]
+            : [];
       footer = "enter apply  esc cancel";
+    } else if (model.statusFilterInput !== null) {
+      const selectedIndex = STATUS_FILTERS.indexOf(model.statusFilterInput);
+      const top = Math.max(
+        0,
+        Math.min(
+          selectedIndex - Math.max(0, capacity - 1),
+          Math.max(0, STATUS_FILTERS.length - capacity),
+        ),
+      );
+      header = `Filter meetings by status (${selectedIndex + 1}/${STATUS_FILTERS.length})`;
+      body = STATUS_FILTERS.slice(top, top + capacity).map((status) => {
+        const selected = status === model.statusFilterInput;
+        const label = status === "all" ? "All statuses" : status;
+        return `${selected ? ui.glyphs.pointer : " "} ${label}`;
+      });
+      footer = "up/down choose  enter apply  esc cancel";
     } else if (model.view.kind === "status") {
       header = "Sync status";
       body = statusLines(model.status).slice(model.scroll, model.scroll + capacity);
-      footer = "r refresh  esc meetings  a account  c configure  q quit";
+      if (model.refreshError) body.push(`Refresh failed: ${model.refreshError}`);
+      footer = "auto-refreshing  r refresh  esc meetings  q quit";
     } else if (model.view.kind === "help") {
       header = "Keyboard help";
       body = HELP_LINES.slice(model.scroll, model.scroll + capacity);
@@ -565,14 +770,25 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       const scroll = Math.max(0, Math.min(maximum, model.scroll));
       body = model.view.lines.slice(scroll, scroll + capacity);
       footer = "up/down scroll  pgup/pgdn page  esc meetings  q quit";
+    } else if (model.view.kind === "sync") {
+      const syncId = model.view.id;
+      const row = model.page?.rows.find((item) => item.id === syncId);
+      header = `Sync details | ${row?.name ?? syncId}`;
+      const lines = syncDetailLines(row);
+      const maximum = Math.max(0, lines.length - capacity);
+      const scroll = Math.max(0, Math.min(maximum, model.scroll));
+      body = lines.slice(scroll, scroll + capacity);
+      footer = "auto-refreshing  pgup/pgdn page  esc meetings  q quit";
     } else if (model.status.blocking) {
       header = "sana-mcp | preparing meeting cache";
       body = statusLines(model.status).slice(0, capacity);
-      footer = "r refresh  i status  a account  c configure  q quit";
+      footer = "auto-refreshing  r refresh  i status  esc menu  q quit";
     } else {
       const meetingRows = model.page?.rows ?? [];
-      header = `Meetings (${model.page?.total ?? 0})${
-        model.filter ? ` | filter: ${model.filter}` : ""
+      header = `Meetings | ${model.status.meetings ?? 0} ready${
+        model.status.remaining ? ` | ${model.status.remaining} syncing` : ""
+      }${model.filter ? ` | name: ${model.filter}` : ""}${
+        model.statusFilter ? ` | status: ${model.statusFilter}` : ""
       }`;
       const index = selectedIndex(model);
       let top = Math.max(
@@ -585,11 +801,32 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       }
       body = meetingRows.slice(top, top + capacity).map((row) => {
         const pointer = row.id === model.selectedId ? ui.glyphs.pointer : " ";
-        const date = new Date(row.created_at_ms).toLocaleDateString();
-        return `${pointer} ${date}  ${row.name}  [${rowStatus(row)}]`;
+        const date = new Date(row.created_at_ms).toISOString().slice(0, 10);
+        const status = rowStatus(row);
+        const statusToken = `[${status.padEnd(11)}]`;
+        const raw = ui.truncate(
+          `${pointer} ${date}  ${statusToken} ${row.name}`,
+          renderWidth,
+        );
+        const styledStatus =
+          status === "ready"
+            ? ui.color.green(statusToken).text
+            : status === "downloading"
+              ? ui.color.cyan(statusToken).text
+              : ui.color.yellow(statusToken).text;
+        const withStatus = raw.replace(statusToken, styledStatus);
+        return row.id === model.selectedId
+          ? withStatus.replace(pointer, ui.color.cyan(pointer).text)
+          : withStatus;
       });
-      if (body.length === 0 && capacity > 0) body = ["No synced meetings found."];
-      footer = "/ filter  enter transcript  s summary  p people  o recording  ? help";
+      if (body.length === 0 && capacity > 0) {
+        body = [
+          model.filter || model.statusFilter
+            ? "No meetings match the current filters. Press / or f to edit, or c to clear."
+            : "No ready or syncing meetings found.",
+        ];
+      }
+      footer = "PgUp/PgDn page  / name  f status  d details  enter open  ? help";
     }
 
     const rendered: string[] = [];
@@ -600,7 +837,9 @@ const browserPrompt = createPrompt<MeetingBrowserResult, MeetingBrowserConfig>(
       rendered.push(
         ...body
           .slice(0, capacity)
-          .map((line) => ui.truncate(line, renderWidth)),
+          .map((line) =>
+            line.includes("\x1b[") ? line : ui.truncate(line, renderWidth),
+          ),
       );
       while (rendered.length < availableRows - 1) rendered.push("");
     }
@@ -615,5 +854,10 @@ export function meetingBrowserPrompt(
   config: MeetingBrowserConfig,
   context: Parameters<typeof browserPrompt>[1] = {},
 ): ReturnType<typeof browserPrompt> {
-  return browserPrompt(config, { ...context, clearPromptOnDone: true });
+  return browserPrompt(config, { ...context, clearPromptOnDone: true }).catch(
+    (error) => {
+      if (error instanceof ExitPromptError) return { action: "quit" } as const;
+      throw error;
+    },
+  );
 }

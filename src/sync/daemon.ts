@@ -242,6 +242,7 @@ export async function syncOnce(
   // fetch just the missing part so existing transcripts are not re-downloaded.
   let incomplete = store.meetingsDue(Date.now());
   const pending = store.countIncomplete();
+  const eligible = incomplete.length;
   const cap = RUNTIME_ENV.maxNewTranscripts;
   if (cap > 0) incomplete = incomplete.slice(0, cap);
   write(() => {
@@ -251,9 +252,9 @@ export async function syncOnce(
       transcripts_done: store.countTranscripts(),
       message:
         incomplete.length > 0
-          ? `Downloading meetings: 0/${incomplete.length}...`
+          ? `Sync queue: ${pending} pending; ${incomplete.length} queued this cycle${eligible > incomplete.length ? ` (${eligible - incomplete.length} deferred by the configured cycle limit)` : ""}. Processing one meeting at a time.`
           : pending > 0
-            ? `${pending} meeting(s) pending; waiting for processing or retry delay.`
+            ? `${pending} meeting(s) pending; waiting for Sana processing or the next retry time. One meeting is processed at a time.`
             : "Up to date.",
     });
   });
@@ -264,6 +265,12 @@ export async function syncOnce(
   let processed = 0;
   for (const id of incomplete) {
     let lastError: unknown;
+    write(() => {
+      const currentPending = store.countIncomplete();
+      store.updateSyncState({
+        message: `Sync queue: processing ${processed + 1}/${incomplete.length} this cycle. ${currentPending} currently pending.`,
+      });
+    });
 
     // Transcript — fetched and saved independently.
     if (!store.getTranscript(id)) {
@@ -331,13 +338,14 @@ export async function syncOnce(
       failed++;
     }
     processed++;
-    if (processed % 3 === 0 || processed === incomplete.length) {
-      write(() => {
-        store.updateSyncState({
-          transcripts_done: store.countTranscripts(),
-          message: `Downloading meetings: ${processed}/${incomplete.length}${failed ? ` (${failed} retrying)` : ""}...`,
-        });
+    write(() => {
+      const currentPending = store.countIncomplete();
+      store.updateSyncState({
+        transcripts_done: store.countTranscripts(),
+        message: `Sync queue: processed ${processed}/${incomplete.length} this cycle; ${currentPending} currently pending${failed ? `; ${failed} failed this cycle` : ""}. One meeting is processed at a time.`,
       });
+    });
+    if (processed % 3 === 0 || processed === incomplete.length) {
       heartbeatOrStop();
     }
   }

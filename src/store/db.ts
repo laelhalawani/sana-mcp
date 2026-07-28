@@ -34,6 +34,8 @@ export type MeetingListRow = MeetingRow & {
   has_metadata: number;
   word_count: number | null;
   attempts: number;
+  last_error: string | null;
+  last_attempt_ms: number | null;
 };
 
 const RETRY_BASE_DELAY_MS = 10 * 60_000;
@@ -572,9 +574,10 @@ export class SanaStore {
     const { where, params } = this.meetingFilter(opts);
     return this.db
       .prepare(
-        `SELECT m.*, (t.meeting_id IS NOT NULL) AS has_transcript,
+         `SELECT m.*, (t.meeting_id IS NOT NULL) AS has_transcript,
                 (mm.meeting_id IS NOT NULL) AS has_metadata, t.word_count,
-                 COALESCE(ff.attempts, 0) AS attempts
+                 COALESCE(ff.attempts, 0) AS attempts,
+                 ff.last_error, ff.last_attempt_ms
          FROM meetings m
          LEFT JOIN transcripts t ON t.meeting_id = m.id
          LEFT JOIN meeting_metadata mm ON mm.meeting_id = m.id
@@ -1861,6 +1864,7 @@ export class SanaStore {
       const transcripts = this.countTranscripts();
       const complete = this.countComplete();
       const pending = this.countIncomplete();
+      const retrying = this.countRetrying();
       return this.db
         .prepare(
         `UPDATE sync_state SET
@@ -1900,9 +1904,9 @@ export class SanaStore {
         .run({
           phase: pending === 0 ? "synced" : "downloading",
           message:
-            pending === 0
-              ? `Up to date - ${meetings} meetings, ${complete} complete.`
-              : `Sync continuing - ${complete}/${meetings} meetings complete; ${pending} pending.`,
+             pending === 0
+               ? `Up to date - ${meetings} meetings, ${complete} complete.`
+               : `Sync continuing - ${complete}/${meetings} meetings ready; ${pending} pending${retrying > 0 ? ` (${retrying} waiting to retry)` : ""}. One meeting is processed at a time.`,
           meetings_total: meetings,
           transcripts_total: meetings,
           transcripts_done: transcripts,

@@ -2572,7 +2572,7 @@ try {
       '  $PostStopAudit = Invoke-Isolated $Bun @($ProbePath,[string]$DaemonPid,$DaemonInstanceId) $ProbeEnvironment',
       '  if ($PostStopAudit.Status -ne 0 -or $PostStopAudit.Stderr -cne "" -or (($PostStopAudit.Stdout | ConvertFrom-Json).kind -cne "post-stop-audit")) { throw "post-stop state audit failed: $($PostStopAudit.Stdout)`n$($PostStopAudit.Stderr)" }',
       '  $SyncedStatus = Invoke-Isolated $InstalledBinary @("status") $RuntimeEnvironment',
-      '  if ($SyncedStatus.Status -ne 0 -or ($SyncedStatus.Stdout -replace "`r`n","`n") -cne "Sync status: synced`nMeetings: 0`nTranscripts: 0/0`n" -or $SyncedStatus.Stderr -cne "") { throw "generation-three synced status mismatch: $($SyncedStatus.Status)`n$($SyncedStatus.Stdout)`n$($SyncedStatus.Stderr)" }',
+      '  if ($SyncedStatus.Status -ne 0 -or ($SyncedStatus.Stdout -replace "`r`n","`n") -cne "Sync status: synced`nMeetings ready: 0`nTranscripts stored: 0/0`n" -or $SyncedStatus.Stderr -cne "") { throw "generation-three synced status mismatch: $($SyncedStatus.Status)`n$($SyncedStatus.Stdout)`n$($SyncedStatus.Stderr)" }',
       '  $List = Invoke-Isolated $InstalledBinary @("list") $RuntimeEnvironment',
       '  if ($List.Status -ne 0 -or ($List.Stdout -replace "`r`n","`n") -cne "No synced meetings found.`n" -or $List.Stderr -cne "") { throw "installed list output mismatch: $($List.Status)`n$($List.Stdout)`n$($List.Stderr)" }',
       '  $Uninstall = Invoke-Isolated $InstalledBinary @("uninstall","--yes") $RuntimeEnvironment',
