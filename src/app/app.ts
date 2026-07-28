@@ -120,7 +120,9 @@ async function showSearch(
   runtime: AppRuntime,
   prompts: AppPrompts,
 ): Promise<void> {
-  const query = (await prompts.input("Search your transcripts:")).trim();
+  const input = await prompts.input("Search your transcripts");
+  if (input === null) return;
+  const query = input.trim();
   if (!query) return;
   if (!/[\p{L}\p{N}]/u.test(query)) {
     line("Enter at least one word to search.");
@@ -162,7 +164,9 @@ async function showMeeting(
   runtime: AppRuntime,
   prompts: AppPrompts,
 ): Promise<void> {
-  const id = (await prompts.input("Meeting ID:")).trim();
+  const input = await prompts.input("Meeting ID");
+  if (input === null) return;
+  const id = input.trim();
   if (!id) return;
   const action = await prompts.select({
     message: "Meeting view:",
@@ -281,7 +285,9 @@ async function signIn(
   runtime: AppRuntime,
   prompts: AppPrompts,
 ): Promise<void> {
-  const email = (await prompts.input("Email for your Sana account:")).trim();
+  const emailInput = await prompts.input("Email for your Sana account");
+  if (emailInput === null) return;
+  const email = emailInput.trim();
   if (!email) return;
   if (!z.string().email().safeParse(email.toLowerCase()).success) {
     line("Enter a valid email address.");
@@ -289,7 +295,9 @@ async function signIn(
   }
   await runtime.requestCode(email);
   line(`We emailed a 6-digit code to ${email}.`);
-  const code = (await prompts.input("6-digit code:")).trim();
+  const codeInput = await prompts.input("6-digit code");
+  if (codeInput === null) return;
+  const code = codeInput.trim();
   if (!code) {
     line("Sign-in paused. Run sana-mcp and choose Sign in when ready.");
     return;
@@ -310,6 +318,31 @@ async function signIn(
   } else {
     line("Your meetings are syncing in the background.");
   }
+}
+
+async function showAccount(
+  runtime: AppRuntime,
+  prompts: AppPrompts,
+): Promise<void> {
+  runtime.refresh();
+  const status = runtime.status();
+  const state = status.session.loggedIn
+    ? "signed in"
+    : status.session.expired
+      ? "session expired"
+      : "not signed in";
+  const action = await prompts.select({
+    message: `Sana account - ${state}`,
+    choices: [
+      { name: "Back", value: "back" },
+      {
+        name: status.session.loggedIn ? "Sign in again" : "Sign in",
+        value: "login",
+      },
+    ],
+    pageSize: 2,
+  });
+  if (action === "login") await signIn(runtime, prompts);
 }
 
 function signedOutChoices(expired: boolean): Array<{
@@ -371,7 +404,13 @@ export async function runApp(
       }
       if (choice === "quit") return;
       try {
-        if (choice === "login") await signIn(activeRuntime, prompts);
+        if (choice === "login") {
+          if (status.session.loggedIn) {
+            await showAccount(activeRuntime, prompts);
+          } else {
+            await signIn(activeRuntime, prompts);
+          }
+        }
         else if (choice === "configure") await activeRuntime.configure();
         else if (choice === "status") {
           const result = await prompts.syncStatus(activeRuntime);
