@@ -95,11 +95,13 @@ export function sanitizeTerminalText(
   return output.replace(BIDI_CONTROL_RE, "");
 }
 
+const graphemeSegmenter = Intl.Segmenter
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : null;
+
 function graphemes(value: string): string[] {
-  const Segmenter = Intl.Segmenter;
-  if (Segmenter) {
-    const segmenter = new Segmenter(undefined, { granularity: "grapheme" });
-    return [...segmenter.segment(value)].map(({ segment }) => segment);
+  if (graphemeSegmenter) {
+    return [...graphemeSegmenter.segment(value)].map(({ segment }) => segment);
   }
   const characters = Array.from(value);
   const output: string[] = [];
@@ -177,6 +179,10 @@ function graphemeWidth(grapheme: string): number {
 
 export function displayWidth(value: unknown): number {
   const text = sanitizeTerminalText(value);
+  return safeDisplayWidth(text);
+}
+
+function safeDisplayWidth(text: string): number {
   return graphemes(text).reduce((width, grapheme) => width + graphemeWidth(grapheme), 0);
 }
 
@@ -205,9 +211,9 @@ export function truncateText(
 ): string {
   assertWidth(width);
   const text = sanitizeTerminalText(value);
-  if (displayWidth(text) <= width) return text;
+  if (safeDisplayWidth(text) <= width) return text;
   const marker = sanitizeTerminalText(options.marker);
-  const markerWidth = displayWidth(marker);
+  const markerWidth = safeDisplayWidth(marker);
   if (markerWidth >= width) return takeWidth(marker, width);
   return takeWidth(text, width - markerWidth) + marker;
 }
@@ -253,16 +259,20 @@ export function wrapText(
       continue;
     }
     let current = "";
+    let currentWidth = 0;
     for (const token of sourceLine.split(/(\s+)/u).filter(Boolean)) {
       const normalized = /^\s+$/u.test(token) ? " " : token;
       if (normalized === " " && !current) continue;
-      if (displayWidth(current + normalized) <= width) {
+      const tokenWidth = normalized === " " ? 1 : safeDisplayWidth(normalized);
+      if (currentWidth + tokenWidth <= width) {
         current += normalized;
+        currentWidth += tokenWidth;
         continue;
       }
       if (current) {
         output.push(current.trimEnd());
         current = "";
+        currentWidth = 0;
       }
       if (normalized === " ") continue;
       const pieces = hardWrapToken(
@@ -272,6 +282,7 @@ export function wrapText(
       );
       output.push(...pieces.slice(0, -1));
       current = pieces[pieces.length - 1]!;
+      currentWidth = safeDisplayWidth(current);
     }
     output.push(current.trimEnd());
   }

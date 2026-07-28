@@ -20,9 +20,13 @@ import {
   semanticEnabled,
   semanticCapabilityState,
   embedMeeting,
+  ensureVec,
   EMBED_DIM,
   EMBED_MODEL,
+  SEMANTIC_INDEX_VERSION,
   SemanticUnavailableError,
+  type VectorBackend,
+  vectorBackendForPlatform,
 } from "../semantic/semantic.js";
 import { RUNTIME_ENV } from "../runtime/env.js";
 import { dataDirectory, ensureDataDir } from "../config.js";
@@ -193,6 +197,29 @@ export async function syncOnce(
     store.writeSyncGeneration(cycle, operation);
   const write = <Value>(operation: () => Value): Value =>
     store.writeCacheGeneration(cycle, operation);
+  let preparedVectorBackend: VectorBackend | null = null;
+  const selectedVectorBackend = vectorBackendForPlatform();
+  const storedVectorBackends = store.vectorStorageBackends();
+  if (
+    identityChanged &&
+    selectedVectorBackend === "portable" &&
+    storedVectorBackends.has("sqlite-vec")
+  ) {
+    throw new Error(
+      "Cannot replace the active cache from a portable runtime while sqlite-vec storage is present. Use a sqlite-vec-capable build to complete the account cache replacement.",
+    );
+  }
+  if (storedVectorBackends.has(selectedVectorBackend)) {
+    try {
+      preparedVectorBackend = await ensureVec(store.db, writeAuthState);
+    } catch (error) {
+      if (identityChanged || !(error instanceof SemanticUnavailableError)) throw error;
+      log(
+        "semantic vector storage unavailable, continuing canonical sync with keyword search:",
+        error.message,
+      );
+    }
+  }
   // --- refresh the complete meeting list so source processing phases advance ---
   writeAuthState(() => {
     store.updateSyncState({
@@ -227,7 +254,7 @@ export async function syncOnce(
   if (identityChanged) {
     // The complete listing succeeded for the authoritative identity, so the
     // previous rebuildable cache can now be replaced without exposing it.
-    store.activateCacheIdentity(cycle);
+    store.activateCacheIdentity(cycle, preparedVectorBackend ?? undefined);
   }
   write(() => {
     for (const meeting of listedAssets) store.upsertMeeting(meeting);
@@ -285,7 +312,7 @@ export async function syncOnce(
             json: JSON.stringify(segs),
             word_count: countWords(segs),
             segment_count: segs.length,
-          }),
+          }, preparedVectorBackend ?? undefined),
         );
         done++;
       } catch (e) {
@@ -364,7 +391,13 @@ export async function syncOnce(
     );
   }
   if (semanticUsable) {
-    const needEmbed = store.meetingsMissingEmbedding();
+    const vectorBackend = preparedVectorBackend ?? vectorBackendForPlatform();
+    const needEmbed = store.meetingsMissingEmbedding(
+      EMBED_DIM,
+      EMBED_MODEL,
+      SEMANTIC_INDEX_VERSION,
+      vectorBackend,
+    );
     let emb = 0;
     for (const id of needEmbed) {
       try {
@@ -376,17 +409,19 @@ export async function syncOnce(
             "Cannot create a semantic embedding because the meeting has no authoritative creation timestamp; refresh the meeting list before retrying.",
           );
         }
-        const lines = transcriptLines(JSON.parse(t.json)).map((l) => ({ n: l.n, text: l.text }));
+        const lines = transcriptLines(JSON.parse(t.json)).map((l) => ({
+          n: l.n,
+          speaker: l.speaker,
+          text: l.text,
+        }));
         await embedMeeting(
           store.db,
           id,
           meeting.created_at_ms,
+          t.fetched_ms,
           lines,
           (commit) => write(commit),
         );
-        write(() => {
-          store.markEmbedded(id, EMBED_DIM, EMBED_MODEL);
-        });
         emb++;
       } catch (e) {
         if (e instanceof SyncGenerationChangedError) throw e;

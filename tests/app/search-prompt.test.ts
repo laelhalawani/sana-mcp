@@ -269,6 +269,9 @@ describe("searchPrompt", () => {
     expect(frame).toContain("2026-01-01  line 3");
     expect(frame).toContain("literal query appears");
     expect(latestRawFrame(app.output, "hybrid | best")).toContain("\x1b[33mquery\x1b[0m");
+    expect(frame).toContain(
+      "↑/↓ - navigate | Enter - open | s - sort | q - quit |",
+    );
 
     await app.key("q");
     expect(await app.result).toEqual({ action: "quit" });
@@ -503,5 +506,37 @@ describe("searchPrompt", () => {
     expect(latestFrame(app.output, "> q")).toContain("> q");
     await app.key("\x1b");
     expect(await app.result).toEqual({ action: "back" });
+  });
+
+  test("handles burst transcript navigation without losing later input", async () => {
+    const runtime = new FakeRuntime();
+    runtime.transcript = (id): TranscriptView => ({
+      kind: "ok",
+      meeting: null,
+      id,
+      name: "Long transcript",
+      dateMs: null,
+      lineCount: 500,
+      wordCount: 2_000,
+      lines: Array.from({ length: 500 }, (_, index) => ({
+        n: index + 1,
+        timeSec: index,
+        time: `00:${String(index).padStart(2, "0")}`,
+        speaker: "Speaker",
+        text: `transcript line ${index + 1} with query context`,
+      })),
+    });
+    const app = await harness(runtime, { rows: 10, columns: 76 });
+
+    await app.key("query\r");
+    await app.key("\r");
+    await app.key("\x1b[B".repeat(40));
+    expect(latestFrame(app.output, "Long transcript")).toContain(
+      "transcript line 41",
+    );
+
+    await app.key("j".repeat(100));
+    await app.key("q");
+    expect(await app.result).toEqual({ action: "quit" });
   });
 });

@@ -20,6 +20,8 @@ export const RUNTIME_DEFAULTS = Object.freeze({
   semanticEnabled: true,
 });
 
+export const SEMANTIC_DETAIL_MAX_WORDS = 32;
+
 export class EnvironmentConfigError extends Error {
   readonly code = "INVALID_ENVIRONMENT";
 
@@ -281,7 +283,7 @@ function parseRuntimeSettings(
       "SANA_EMBED_MIN_WORDS",
       RUNTIME_DEFAULTS.embedMinWords,
       1,
-      10_000,
+      SEMANTIC_DETAIL_MAX_WORDS,
     ),
     embedIdleMs: integer(
       source,

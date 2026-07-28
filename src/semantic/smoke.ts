@@ -11,6 +11,7 @@ import { standaloneSemanticSmokeEvidence } from "./smoke-contract.js";
 import {
   createPortableVectorSchema,
   portableKnn,
+  SEMANTIC_INDEX_VERSION,
   vectorBackendForPlatform,
 } from "./semantic.js";
 
@@ -58,7 +59,7 @@ export async function runStandaloneSemanticSmoke(): Promise<void> {
     throw new Error(`Unexpected embedding shape: ${JSON.stringify(output.dims)}`);
   }
 
-  const db = new Database(":memory:");
+  const db = new Database(":memory:", { strict: true });
   try {
     const query = output.data.slice(0, 384);
     const vectorBackend = vectorBackendForPlatform();
@@ -66,24 +67,28 @@ export async function runStandaloneSemanticSmoke(): Promise<void> {
     if (vectorBackend === "portable") {
       createPortableVectorSchema(db);
       const insert = db.prepare(
-        `INSERT INTO vec_lines_portable
-           (meeting_id, line_no, created_at, embedding)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO vec_chunks_v2_portable
+           (meeting_id, chunk_kind, chunk_no, start_line, end_line, created_at, index_version, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (let index = 0; index < 2; index++) {
         const vector = output.data.slice(index * 384, (index + 1) * 384);
         insert.run(
           `row-${index}`,
+          "small",
+          index + 1,
+          1,
           1,
           index,
+          SEMANTIC_INDEX_VERSION,
           Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength),
         );
       }
-      const hit = portableKnn(
+      const hit = (await portableKnn(
         db,
         Buffer.from(query.buffer, query.byteOffset, query.byteLength),
-        { k: 1 },
-      )[0];
+        { k: 1, kind: "small" },
+      ))[0];
       nearest = hit
         ? { label: hit.meeting_id, distance: hit.distance }
         : null;

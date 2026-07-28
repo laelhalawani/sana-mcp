@@ -6,9 +6,13 @@ import {
   createVectorExtensionRuntime,
   EMBED_DIM,
   EMBED_MODEL,
+  ensureVec,
   loadEmbeddingPipe,
   portableKnn,
   resolveSemanticCapability,
+  semanticChunks,
+  SEMANTIC_INDEX_VERSION,
+  searchKnn,
   SemanticUnavailableError,
   validateEmbeddingOutput,
   vectorBackendForPlatform,
@@ -154,7 +158,7 @@ describe("semantic build capability", () => {
     expect(keywordFallbacks).toBe(0);
   });
 
-  test("reports transcript corruption and returns authoritative keyword results", async () => {
+  test("resolves semantic candidates from canonical indexed lines without reparsing transcripts", async () => {
     const row = {
       meeting_id: "meeting-1",
       line_no: 1,
@@ -162,23 +166,11 @@ describe("semantic build capability", () => {
       created_at_ms: 1,
       name: "Fixture",
     };
-    const corruptJson = "{";
-    let parseCause!: SyntaxError;
-    try {
-      JSON.parse(corruptJson);
-    } catch (error) {
-      parseCause = error as SyntaxError;
-    }
     const store = {
       db: {},
       countLineMatches: () => 1,
       searchLines: () => [row],
-      getMeeting: () => ({
-        meeting_id: row.meeting_id,
-        created_at_ms: row.created_at_ms,
-        name: row.name,
-      }),
-      getTranscript: () => ({ json: corruptJson }),
+      resolveSearchLines: () => [row],
     } as unknown as SanaStore;
 
     const result = await runSearch(
@@ -187,27 +179,128 @@ describe("semantic build capability", () => {
       {
         semanticState: { kind: "available" },
         embedQuery: async () => Buffer.alloc(EMBED_DIM * Float32Array.BYTES_PER_ELEMENT),
-        searchKnn: async () => [
-          { meeting_id: row.meeting_id, line_no: row.line_no, distance: 0 },
-        ],
+        searchKnn: async (_db, _query, options) => [{
+          meeting_id: row.meeting_id,
+          kind: options.kind,
+          start_line: row.line_no,
+          end_line: row.line_no,
+          distance: 0,
+        }],
       },
     );
 
     expect(result.kind).toBe("ok");
     if (result.kind === "ok") {
-      expect(result.mode).toBe("keyword");
+      expect(result.mode).toBe("hybrid");
       expect(result.rows).toEqual([row]);
       expect(result.total).toBe(1);
-      expect(result.degradation).toEqual({
-        code: "SEMANTIC_RUNTIME_ERROR",
-        message: parseCause.message,
-        cause: {
-          kind: "ERROR",
-          name: "SyntaxError",
-          message: parseCause.message,
-        },
-      });
+      expect(result.degradation).toBeUndefined();
     }
+  });
+
+  test("orders combined BM25, thematic, and detail evidence by the requested tiers", async () => {
+    const rows = ["bls", "bl", "bs", "ls"].map((id, index) => ({
+      meeting_id: id,
+      line_no: 1,
+      text: `${id} result`,
+      created_at_ms: index + 1,
+      name: id.toUpperCase(),
+    }));
+    const byId = new Map(rows.map((row) => [row.meeting_id, row]));
+    const store = {
+      db: {},
+      searchLines: () => [byId.get("bs"), byId.get("bl"), byId.get("bls")],
+      resolveSearchLines: (refs: Array<{ meeting_id: string }>) =>
+        refs.flatMap((ref) => byId.get(ref.meeting_id) ?? []),
+    } as unknown as SanaStore;
+
+    const result = await runSearch(
+      store,
+      { query: "result", limit: 10 },
+      {
+        semanticState: { kind: "available" },
+        embedQuery: async () => Buffer.alloc(EMBED_DIM * Float32Array.BYTES_PER_ELEMENT),
+        searchKnn: async (_db, _query, options) => {
+          const ids = options.kind === "small"
+            ? ["bs", "ls", "bls"]
+            : ["bl", "ls", "bls"];
+          return ids.map((id, index) => ({
+            meeting_id: id,
+            kind: options.kind,
+            start_line: 1,
+            end_line: 1,
+            distance: index,
+          }));
+        },
+      },
+    );
+
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.rows.map((row) => row.meeting_id)).toEqual([
+        "bls",
+        "ls",
+        "bl",
+        "bs",
+      ]);
+    }
+  });
+});
+
+describe("semantic transcript chunking", () => {
+  test("merges consecutive speech by one speaker and keeps smaller detail windows", () => {
+    const chunks = semanticChunks([
+      { n: 1, speaker: "Person 1", text: "Hi." },
+      { n: 2, speaker: "Person 1", text: "How's it going?" },
+      { n: 3, speaker: "Person 1", text: "I haven't seen you in a while." },
+      { n: 4, speaker: "Person 2", text: "Hey, it's all good today." },
+    ]);
+
+    expect(chunks.filter((chunk) => chunk.kind === "large")).toEqual([
+      {
+        kind: "large",
+        startLine: 1,
+        endLine: 3,
+        text: "Hi. How's it going? I haven't seen you in a while.",
+      },
+      {
+        kind: "large",
+        startLine: 4,
+        endLine: 4,
+        text: "Hey, it's all good today.",
+      },
+    ]);
+    expect(chunks.filter((chunk) => chunk.kind === "small")).toEqual([
+      {
+        kind: "small",
+        startLine: 1,
+        endLine: 3,
+        text: "Hi. How's it going? I haven't seen you in a while.",
+      },
+      {
+        kind: "small",
+        startLine: 4,
+        endLine: 4,
+        text: "Hey, it's all good today.",
+      },
+    ]);
+  });
+
+  test("uses overlapping detail windows and leaves tiny turns to BM25", () => {
+    const longTurn = Array.from({ length: 6 }, (_, index) => ({
+      n: index + 1,
+      speaker: "Speaker",
+      text: Array.from({ length: 10 }, (__, word) => `w${index}-${word}`).join(" "),
+    }));
+    const details = semanticChunks(longTurn).filter((chunk) => chunk.kind === "small");
+    expect(details.map((chunk) => [chunk.startLine, chunk.endLine])).toEqual([
+      [1, 3],
+      [3, 5],
+      [5, 6],
+    ]);
+    expect(semanticChunks([
+      { n: 1, speaker: "Speaker", text: "one two three" },
+    ])).toEqual([]);
   });
 });
 
@@ -462,8 +555,123 @@ describe("semantic embedding lifecycle", () => {
 });
 
 describe("semantic optional dependency boundaries", () => {
-  test("portable vector storage returns the nearest persisted embedding", () => {
-    const db = new Database(":memory:");
+  test("rebuilds sqlite-vec chunk storage when its fixed dimension is stale", async () => {
+    if (vectorBackendForPlatform() !== "sqlite-vec") return;
+    const db = new Database(":memory:", { strict: true });
+    try {
+      const sqliteVec = await import("sqlite-vec");
+      sqliteVec.load(db);
+      db.exec(
+        `CREATE VIRTUAL TABLE vec_chunks_v2 USING vec0(
+           embedding float[${EMBED_DIM + 1}], meeting_id TEXT
+         );
+         CREATE TABLE line_embeddings (
+           meeting_id TEXT PRIMARY KEY,
+           vector_backend TEXT NOT NULL
+         );
+         INSERT INTO line_embeddings VALUES ('meeting', 'sqlite-vec')`,
+      );
+      const ensure = createVectorExtensionRuntime(async () => sqliteVec);
+      await ensure(db);
+      const schema = db.prepare(
+        `SELECT sql FROM sqlite_master WHERE name = 'vec_chunks_v2'`,
+      ).get() as { sql: string };
+      expect(schema.sql).toContain(`embedding float[${EMBED_DIM}]`);
+      expect(schema.sql).not.toContain(`embedding float[${EMBED_DIM + 1}]`);
+      expect(
+        (db.prepare(`SELECT COUNT(*) AS count FROM line_embeddings`).get() as {
+          count: number;
+        }).count,
+      ).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("production KNN exposes vectors only after the matching backend marker is complete", async () => {
+    const db = new Database(":memory:", { strict: true });
+    try {
+      db.exec(
+        `CREATE TABLE line_embeddings (
+           meeting_id TEXT PRIMARY KEY,
+           dim INTEGER NOT NULL,
+           model TEXT NOT NULL,
+           done_ms INTEGER NOT NULL,
+           transcript_fetched_ms INTEGER NOT NULL,
+           index_version INTEGER NOT NULL,
+           vector_backend TEXT NOT NULL
+         )`,
+      );
+      const backend = await ensureVec(db);
+      const vector = Buffer.from(new Float32Array(EMBED_DIM).buffer);
+      const farther = new Float32Array(EMBED_DIM);
+      farther[0] = 1;
+      const table = backend === "sqlite-vec"
+        ? "vec_chunks_v2"
+        : "vec_chunks_v2_portable";
+      const insert = db.prepare(
+        `INSERT INTO ${table} (
+           embedding, meeting_id, chunk_kind, chunk_no, start_line, end_line,
+           created_at, index_version
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      insert.run(vector, "meeting", "large", 1, 3, 5, 10, SEMANTIC_INDEX_VERSION);
+      insert.run(
+        Buffer.from(farther.buffer),
+        "valid",
+        "large",
+        1,
+        7,
+        8,
+        10,
+        SEMANTIC_INDEX_VERSION,
+      );
+      expect(await searchKnn(db, vector, { k: 1, kind: "large" })).toEqual([]);
+
+      db.prepare(
+        `INSERT INTO line_embeddings VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "valid",
+        EMBED_DIM,
+        EMBED_MODEL,
+        1,
+        1,
+        SEMANTIC_INDEX_VERSION,
+        backend,
+      );
+      expect(await searchKnn(db, vector, { k: 1, kind: "large" })).toEqual([{
+        meeting_id: "valid",
+        kind: "large",
+        start_line: 7,
+        end_line: 8,
+        distance: 1,
+      }]);
+
+      db.prepare(
+        `INSERT INTO line_embeddings VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "meeting",
+        EMBED_DIM,
+        EMBED_MODEL,
+        1,
+        1,
+        SEMANTIC_INDEX_VERSION,
+        backend,
+      );
+      expect(await searchKnn(db, vector, { k: 1, kind: "large" })).toEqual([{
+        meeting_id: "meeting",
+        kind: "large",
+        start_line: 3,
+        end_line: 5,
+        distance: 0,
+      }]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("portable vector storage returns the nearest persisted embedding", async () => {
+    const db = new Database(":memory:", { strict: true });
     try {
       createPortableVectorSchema(db);
       const first = new Float32Array(EMBED_DIM);
@@ -471,63 +679,153 @@ describe("semantic optional dependency boundaries", () => {
       first[0] = 1;
       second[1] = 1;
       const insert = db.prepare(
-        `INSERT INTO vec_lines_portable
-           (meeting_id, line_no, created_at, embedding)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO vec_chunks_v2_portable
+           (meeting_id, chunk_kind, chunk_no, start_line, end_line, created_at, index_version, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
-      insert.run("first", 1, 10, Buffer.from(first.buffer));
-      insert.run("second", 2, 20, Buffer.from(second.buffer));
+      insert.run("first", "small", 1, 1, 1, 10, SEMANTIC_INDEX_VERSION, Buffer.from(first.buffer));
+      insert.run("second", "small", 1, 2, 2, 20, SEMANTIC_INDEX_VERSION, Buffer.from(second.buffer));
 
-      expect(portableKnn(db, Buffer.from(first.buffer), { k: 1 })).toEqual([
-        { meeting_id: "first", line_no: 1, distance: 0 },
+      expect(await portableKnn(db, Buffer.from(first.buffer), { k: 1, kind: "small" })).toEqual([
+        { meeting_id: "first", kind: "small", start_line: 1, end_line: 1, distance: 0 },
       ]);
       expect(
-        portableKnn(db, Buffer.from(first.buffer), {
+        await portableKnn(db, Buffer.from(first.buffer), {
           k: 2,
+          kind: "small",
           dateFrom: 15,
         }),
       ).toEqual([
         {
           meeting_id: "second",
-          line_no: 2,
+          kind: "small",
+          start_line: 2,
+          end_line: 2,
           distance: Math.sqrt(2),
         },
       ]);
+
+      db.exec(
+        `CREATE TABLE line_embeddings (
+           meeting_id TEXT PRIMARY KEY,
+           dim INTEGER NOT NULL,
+           model TEXT NOT NULL,
+           done_ms INTEGER NOT NULL,
+           transcript_fetched_ms INTEGER NOT NULL,
+           index_version INTEGER NOT NULL,
+           vector_backend TEXT NOT NULL
+         )`,
+      );
+      expect(await portableKnn(db, Buffer.from(first.buffer), {
+        k: 1,
+        kind: "small",
+        completedOnly: true,
+      })).toEqual([]);
+      db.prepare(`INSERT INTO line_embeddings VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+        "first",
+        EMBED_DIM,
+        EMBED_MODEL,
+        1,
+        1,
+        SEMANTIC_INDEX_VERSION,
+        "portable",
+      );
+      expect(await portableKnn(db, Buffer.from(first.buffer), {
+        k: 1,
+        kind: "small",
+        completedOnly: true,
+      })).toEqual([{
+        meeting_id: "first",
+        kind: "small",
+        start_line: 1,
+        end_line: 1,
+        distance: 0,
+      }]);
     } finally {
       db.close();
     }
   });
 
-  test("portable KNN scans in bounded fenced batches and keeps only top k", () => {
-    const db = new Database(":memory:");
+  test("portable KNN scans in bounded fenced batches and keeps only top k", async () => {
+    const db = new Database(":memory:", { strict: true });
     try {
       createPortableVectorSchema(db);
       const insert = db.prepare(
-        `INSERT INTO vec_lines_portable
-           (meeting_id, line_no, created_at, embedding)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO vec_chunks_v2_portable
+           (meeting_id, chunk_kind, chunk_no, start_line, end_line, created_at, index_version, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (let index = 0; index < 300; index++) {
         const vector = new Float32Array(EMBED_DIM);
         vector[0] = 300 - index;
-        insert.run(`row-${index}`, index + 1, index, Buffer.from(vector.buffer));
+        insert.run(
+          `row-${index}`,
+          "small",
+          index + 1,
+          index + 1,
+          index + 1,
+          index,
+          SEMANTIC_INDEX_VERSION,
+          Buffer.from(vector.buffer),
+        );
       }
       const query = new Float32Array(EMBED_DIM);
       let fences = 0;
 
       expect(
-        portableKnn(db, Buffer.from(query.buffer), {
+        await portableKnn(db, Buffer.from(query.buffer), {
           k: 2,
+          kind: "small",
           fence: (read) => {
             fences++;
             return read();
           },
         }),
       ).toEqual([
-        { meeting_id: "row-299", line_no: 300, distance: 1 },
-        { meeting_id: "row-298", line_no: 299, distance: 2 },
+        { meeting_id: "row-299", kind: "small", start_line: 300, end_line: 300, distance: 1 },
+        { meeting_id: "row-298", kind: "small", start_line: 299, end_line: 299, distance: 2 },
       ]);
       expect(fences).toBe(3);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("portable KNN observes cancellation between bounded batches", async () => {
+    const db = new Database(":memory:", { strict: true });
+    try {
+      createPortableVectorSchema(db);
+      const insert = db.prepare(
+        `INSERT INTO vec_chunks_v2_portable
+           (meeting_id, chunk_kind, chunk_no, start_line, end_line, created_at, index_version, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const vector = Buffer.from(new Float32Array(EMBED_DIM).buffer);
+      for (let index = 0; index < 300; index++) {
+        insert.run(
+          `row-${index}`,
+          "large",
+          index + 1,
+          index + 1,
+          index + 1,
+          index,
+          SEMANTIC_INDEX_VERSION,
+          vector,
+        );
+      }
+      const controller = new AbortController();
+      const cancelled = new Error("search cancelled");
+
+      await expect(portableKnn(db, vector, {
+        k: 10,
+        kind: "large",
+        signal: controller.signal,
+        fence: (read) => {
+          const rows = read();
+          controller.abort(cancelled);
+          return rows;
+        },
+      })).rejects.toBe(cancelled);
     } finally {
       db.close();
     }
@@ -536,6 +834,7 @@ describe("semantic optional dependency boundaries", () => {
   test("post-import vector load and schema creation run inside the supplied fence", async () => {
     const events: string[] = [];
     const db = {
+      prepare: () => ({ get: () => null }),
       exec: () => {
         events.push("schema");
       },
@@ -561,6 +860,7 @@ describe("semantic optional dependency boundaries", () => {
       "load",
       "fence:end",
       "fence:start",
+      "schema",
       "schema",
       "fence:end",
     ]);
@@ -601,7 +901,10 @@ describe("semantic optional dependency boundaries", () => {
     ["sqlite-vec-load", "load"],
   ] as const)("normalizes %s failures and preserves their cause", async (operation, stage) => {
     const cause = new Error(`${stage} failed`);
-    const db = { exec: () => {} };
+    const db = {
+      prepare: () => ({ get: () => null }),
+      exec: () => {},
+    };
     const ensure = createVectorExtensionRuntime(async () => {
       if (stage === "import") throw cause;
       return {
@@ -656,6 +959,7 @@ describe("semantic optional dependency boundaries", () => {
   ] as const)("preserves the original %s schema error", async (_name, code, message) => {
     const cause = Object.assign(new Error(message), { code });
     const db = {
+      prepare: () => ({ get: () => null }),
       exec: () => {
         throw cause;
       },
@@ -668,6 +972,7 @@ describe("semantic optional dependency boundaries", () => {
   test("preserves a non-Error missing-module lookalike", async () => {
     const cause = { code: "SQLITE_ERROR", message: "no such module: vec0" };
     const db = {
+      prepare: () => ({ get: () => null }),
       exec: () => {
         throw cause;
       },
@@ -691,6 +996,7 @@ describe("semantic optional dependency boundaries", () => {
     expect(cause.message).toBe("no such module: vec0 ");
 
     const db = {
+      prepare: () => ({ get: () => null }),
       exec: () => {
         throw cause;
       },
@@ -703,6 +1009,7 @@ describe("semantic optional dependency boundaries", () => {
     let loads = 0;
     let schemaCreates = 0;
     const db = {
+      prepare: () => ({ get: () => null }),
       exec: () => {
         schemaCreates++;
       },
@@ -715,7 +1022,7 @@ describe("semantic optional dependency boundaries", () => {
     await ensure(db as never);
     await ensure(db as never);
     expect(loads).toBe(1);
-    expect(schemaCreates).toBe(1);
+    expect(schemaCreates).toBe(2);
   });
 
   test("retries schema creation without reloading a successfully loaded extension", async () => {
@@ -723,6 +1030,7 @@ describe("semantic optional dependency boundaries", () => {
     let loads = 0;
     let schemaCreates = 0;
     const db = {
+      prepare: () => ({ get: () => null }),
       exec: () => {
         schemaCreates++;
         if (schemaCreates === 1) throw firstSchemaFailure;
@@ -737,6 +1045,6 @@ describe("semantic optional dependency boundaries", () => {
     await expect(ensure(db as never)).rejects.toBe(firstSchemaFailure);
     await ensure(db as never);
     expect(loads).toBe(1);
-    expect(schemaCreates).toBe(2);
+    expect(schemaCreates).toBe(3);
   });
 });

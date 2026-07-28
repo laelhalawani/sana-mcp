@@ -324,9 +324,10 @@ created_at_ms }`. This submenu is the hub for screens 4-7.
 ## 3. SEARCH
 
 Query -> results list -> selecting a hit opens READ centered on that line.
-Supports pagination and re-search. Mirrors `handleSearch` semantics (keyword
-BM25, or hybrid when `semanticEnabled()`), but the hybrid RRF fusion lives in
-the presenter/data layer; this screen just asks for "page P of results for Q".
+Supports pagination and re-search. Mirrors `handleSearch` semantics (line-level
+BM25, or hybrid BM25 + thematic speaker-turn + detail chunks when
+`semanticEnabled()`), but fusion lives in the presenter/data layer; this screen
+just asks for "page P of results for Q".
 
 ### Flow
 

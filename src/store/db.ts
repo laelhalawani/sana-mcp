@@ -368,7 +368,10 @@ export class SanaStore {
         meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
         dim INTEGER NOT NULL,
         model TEXT NOT NULL,
-        done_ms INTEGER NOT NULL
+        done_ms INTEGER NOT NULL,
+        transcript_fetched_ms INTEGER NOT NULL DEFAULT 0,
+        index_version INTEGER NOT NULL DEFAULT 0,
+        vector_backend TEXT NOT NULL DEFAULT ''
       );
 
       -- Full-text index over transcript lines (one row per spoken turn) for
@@ -486,6 +489,12 @@ export class SanaStore {
       this.db.exec(`ALTER TABLE meetings ADD COLUMN processing_phase TEXT`);
     if (!hasCol("meeting_metadata", "has_recording"))
       this.db.exec(`ALTER TABLE meeting_metadata ADD COLUMN has_recording INTEGER NOT NULL DEFAULT 0`);
+    if (!hasCol("line_embeddings", "transcript_fetched_ms"))
+      this.db.exec(`ALTER TABLE line_embeddings ADD COLUMN transcript_fetched_ms INTEGER NOT NULL DEFAULT 0`);
+    if (!hasCol("line_embeddings", "index_version"))
+      this.db.exec(`ALTER TABLE line_embeddings ADD COLUMN index_version INTEGER NOT NULL DEFAULT 0`);
+    if (!hasCol("line_embeddings", "vector_backend"))
+      this.db.exec(`ALTER TABLE line_embeddings ADD COLUMN vector_backend TEXT NOT NULL DEFAULT ''`);
   }
 
   // ---- meetings ----------------------------------------------------------
@@ -701,7 +710,10 @@ export class SanaStore {
 
   // ---- transcripts -------------------------------------------------------
 
-  saveTranscript(row: Omit<TranscriptRow, "fetched_ms">): void {
+  saveTranscript(
+    row: Omit<TranscriptRow, "fetched_ms">,
+    vectorBackend?: "sqlite-vec" | "portable",
+  ): void {
     const fetchedMs = Date.now();
     const tx = this.db.transaction(() => {
       this.db
@@ -718,37 +730,75 @@ export class SanaStore {
       this.markSearchIndexed(row.meeting_id, fetchedMs);
       // Transcript changed -> its embeddings are stale; force a re-embed.
       this.db.prepare(`DELETE FROM line_embeddings WHERE meeting_id = ?`).run(row.meeting_id);
+      if (vectorBackend !== undefined) {
+        const table = vectorBackend === "sqlite-vec"
+          ? "vec_chunks_v2"
+          : "vec_chunks_v2_portable";
+        const exists = this.db.prepare(
+          `SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?`,
+        ).get(table);
+        if (exists !== null) {
+          this.db.prepare(`DELETE FROM ${table} WHERE meeting_id = ?`).run(row.meeting_id);
+        }
+      }
     });
     tx();
   }
 
   /** Meetings that have a transcript but have not been embedded yet. */
-  meetingsMissingEmbedding(): string[] {
+  meetingsMissingEmbedding(
+    dim: number,
+    model: string,
+    indexVersion: number,
+    vectorBackend: string,
+  ): string[] {
     return (
       this.db
         .prepare(
           `SELECT t.meeting_id AS id FROM transcripts t
-           LEFT JOIN line_embeddings e ON e.meeting_id = t.meeting_id
+           LEFT JOIN line_embeddings e
+             ON e.meeting_id = t.meeting_id
+            AND e.dim = @dim
+            AND e.model = @model
+            AND e.index_version = @index_version
+            AND e.vector_backend = @vector_backend
+            AND e.transcript_fetched_ms = t.fetched_ms
            JOIN meetings m ON m.id = t.meeting_id
            WHERE e.meeting_id IS NULL
            ORDER BY m.created_at_ms DESC`
          )
-        .all() as { id: string }[]
+        .all({
+          dim,
+          model,
+          index_version: indexVersion,
+          vector_backend: vectorBackend,
+        }) as { id: string }[]
     ).map((r) => r.id);
   }
 
-  markEmbedded(meetingId: string, dim: number, model: string): void {
-    this.db
-      .prepare(
-        `INSERT INTO line_embeddings (meeting_id, dim, model, done_ms)
-         VALUES (@id, @dim, @model, @ts)
-         ON CONFLICT(meeting_id) DO UPDATE SET dim=@dim, model=@model, done_ms=@ts`
-      )
-      .run({ id: meetingId, dim, model, ts: Date.now() });
-  }
-
-  countEmbedded(): number {
-    return (this.db.prepare(`SELECT COUNT(*) n FROM line_embeddings`).get() as { n: number }).n;
+  countEmbedded(
+    dim: number,
+    model: string,
+    indexVersion: number,
+    vectorBackend: string,
+  ): number {
+    return (
+      this.db.prepare(
+        `SELECT COUNT(*) n
+         FROM line_embeddings e
+         JOIN transcripts t ON t.meeting_id = e.meeting_id
+         WHERE e.dim = @dim
+           AND e.model = @model
+           AND e.index_version = @index_version
+           AND e.vector_backend = @vector_backend
+           AND e.transcript_fetched_ms = t.fetched_ms`,
+      ).get({
+        dim,
+        model,
+        index_version: indexVersion,
+        vector_backend: vectorBackend,
+      }) as { n: number }
+    ).n;
   }
 
   /** (Re)index one meeting's transcript lines into the FTS table. */
@@ -925,10 +975,13 @@ export class SanaStore {
       sort?: "best" | "newest" | "oldest";
       dateFrom?: number;
       dateTo?: number;
+      /** Internal hybrid-search retrieval; public search pages remain capped at 100. */
+      fusionPool?: boolean;
     } = {}
   ): { meeting_id: string; line_no: number; text: string; created_at_ms: number; name: string }[] {
     this.ensureSearchIndex();
-    const lim = Math.min(Math.max(opts.limit ?? 10, 1), 100);
+    const maximum = opts.fusionPool === true ? 300 : 100;
+    const lim = Math.min(Math.max(opts.limit ?? 10, 1), maximum);
     const off = Math.max(opts.offset ?? 0, 0);
     const { where, params } = this.searchWhere(match, opts.dateFrom, opts.dateTo);
     const order =
@@ -952,7 +1005,52 @@ export class SanaStore {
       text: string;
       created_at_ms: number;
       name: string;
-    }[];
+      }[];
+  }
+
+  /** Resolve canonical FTS lines in one bounded query for semantic candidates. */
+  resolveSearchLines(
+    references: readonly { meeting_id: string; line_no: number }[],
+  ): { meeting_id: string; line_no: number; text: string; created_at_ms: number; name: string }[] {
+    this.ensureSearchIndex();
+    const unique = new Map<string, { meeting_id: string; line_no: number }>();
+    for (const reference of references) {
+      unique.set(`${reference.meeting_id}:${reference.line_no}`, reference);
+    }
+    const wanted = [...unique.values()];
+    if (wanted.length === 0) return [];
+    const rows: Array<{
+      meeting_id: string;
+      line_no: number;
+      text: string;
+      created_at_ms: number;
+      name: string;
+    }> = [];
+    const BATCH = 300;
+    for (let start = 0; start < wanted.length; start += BATCH) {
+      const batch = wanted.slice(start, start + BATCH);
+      const params: Bindings = {};
+      const values = batch.map((reference, index) => {
+        params[`meeting${index}`] = reference.meeting_id;
+        params[`line${index}`] = reference.line_no;
+        return `(@meeting${index}, @line${index})`;
+      });
+      rows.push(
+        ...(this.db.prepare(
+          `WITH wanted(meeting_id, line_no) AS (VALUES ${values.join(", ")})
+           SELECT f.meeting_id AS meeting_id,
+                  CAST(f.line_no AS INTEGER) AS line_no,
+                  f.text AS text,
+                  m.created_at_ms AS created_at_ms,
+                  m.name AS name
+           FROM wanted w
+           JOIN line_fts f
+             ON f.meeting_id = w.meeting_id AND f.line_no = w.line_no
+           JOIN meetings m ON m.id = f.meeting_id`,
+        ).all(params) as typeof rows),
+      );
+    }
+    return rows;
   }
 
   // ---- sync state --------------------------------------------------------
@@ -1757,7 +1855,27 @@ export class SanaStore {
     }
   }
 
-  activateCacheIdentity(cycle: SyncCycleIdentity): "unchanged" | "replaced" {
+  vectorStorageBackends(): Set<"sqlite-vec" | "portable"> {
+    const rows = this.db.prepare(
+      `SELECT name
+       FROM sqlite_master
+       WHERE type = 'table'
+         AND name IN (
+           'vec_lines', 'vec_lines_portable',
+           'vec_chunks_v2', 'vec_chunks_v2_portable'
+         )`,
+    ).all() as { name: string }[];
+    const backends = new Set<"sqlite-vec" | "portable">();
+    for (const row of rows) {
+      backends.add(row.name.endsWith("_portable") ? "portable" : "sqlite-vec");
+    }
+    return backends;
+  }
+
+  activateCacheIdentity(
+    cycle: SyncCycleIdentity,
+    vectorBackend?: "sqlite-vec" | "portable",
+  ): "unchanged" | "replaced" {
     return this.writeSyncGeneration(cycle, () => {
       const state = this.getSyncState();
       if (
@@ -1777,7 +1895,22 @@ export class SanaStore {
         DELETE FROM fetch_failures;
         DELETE FROM meetings;
       `);
-      for (const table of ["vec_lines", "vec_lines_portable"]) {
+      const vectorTables = vectorBackend === "portable"
+        ? ["vec_lines_portable", "vec_chunks_v2_portable"]
+        : vectorBackend === "sqlite-vec"
+          ? [
+              "vec_lines",
+              "vec_chunks_v2",
+              "vec_lines_portable",
+              "vec_chunks_v2_portable",
+            ]
+          : [
+              "vec_lines",
+              "vec_lines_portable",
+              "vec_chunks_v2",
+              "vec_chunks_v2_portable",
+            ];
+      for (const table of vectorTables) {
         const vectorTable = this.db
           .prepare(
             `SELECT 1 AS present

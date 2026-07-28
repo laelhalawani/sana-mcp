@@ -54,7 +54,7 @@ not launch the configurer. A compatible Windows updater is silent about setup an
 preserves registrations and local state; only an incompatible Windows updater
 prints the deferred command to configure clients and sign in.
 
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.14` to pin an install. Linux
+Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.15` to pin an install. Linux
 x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
 published. On Alpine, install Bun's required C++ runtime first with
 `apk add --no-cache libstdc++ libgcc gcompat`; the installer detects and reports this
@@ -103,8 +103,9 @@ headless on macOS, Linux, Windows, and WSL.
   on-demand **recording** links.
 - **Keyword search always available** - line-level SQLite FTS5 with BM25 ranking,
   whole-word matching, phrase, date-range, and sort options.
-- **Optional semantic / hybrid search** - keyword + vector results fused by
-  Reciprocal Rank Fusion (RRF). Off by default; no cost until you enable it.
+- **Semantic / hybrid search** - BM25 line hits combine with thematic
+  speaker-turn and smaller detail vectors. Enabled by default; set
+  `SANA_SEMANTIC=0` for keyword-only search.
 - **Automatic sync** - the daemon polls for new meetings and keeps retrying
   incomplete downloads in the background without blocking ready meetings.
 - **Works with your client** - auto-registers with Claude Desktop, Claude Code,

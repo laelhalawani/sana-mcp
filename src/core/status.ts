@@ -7,7 +7,13 @@ import {
   type SyncState,
   type SyncPhase,
 } from "../store/db.js";
-import { semanticCapabilityState } from "../semantic/semantic.js";
+import {
+  EMBED_DIM,
+  EMBED_MODEL,
+  SEMANTIC_INDEX_VERSION,
+  semanticCapabilityState,
+  vectorBackendForPlatform,
+} from "../semantic/semantic.js";
 import { inspectCurrentSession } from "../sana/session-publication.js";
 
 export interface SessionInfo {
@@ -257,7 +263,14 @@ function buildStatus(
     semantic: {
       enabled: semanticOn,
       embedded:
-        semanticOn && exposeMetrics ? store.countEmbedded() : null,
+        semanticOn && exposeMetrics
+          ? store.countEmbedded(
+              EMBED_DIM,
+              EMBED_MODEL,
+              SEMANTIC_INDEX_VERSION,
+              vectorBackendForPlatform(),
+            )
+          : null,
       total: exposeMetrics ? transcripts : null,
       ...(semanticState.kind === "unsupported"
         ? {
