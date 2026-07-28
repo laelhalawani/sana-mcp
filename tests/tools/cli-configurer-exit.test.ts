@@ -87,7 +87,7 @@ beforeAll(async () => {
       __SANA_LIFECYCLE_PROTOCOL__: "1",
       __SANA_INSPECT_PROTOCOL__: "1",
       __SANA_STATE_COMPATIBILITY__: "1",
-      __SANA_SEMANTIC_CAPABILITY__: JSON.stringify("keyword"),
+      __SANA_SEMANTIC_CAPABILITY__: JSON.stringify("bundled"),
     },
   });
   if (!result.success)
@@ -264,7 +264,7 @@ test("standalone inspect protocol stdout remains exact", () => {
       lifecycleProtocol: 1,
       inspectProtocol: 1,
       stateCompatibility: 1,
-      semanticCapability: "keyword",
+      semanticCapability: "bundled",
     })}\n`,
   );
 });

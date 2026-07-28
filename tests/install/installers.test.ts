@@ -196,7 +196,7 @@ async function createOfflineRelease(
   const binary = [
     "#!/bin/sh",
     'if [ "${1:-}" = "__inspect" ]; then',
-    `  printf '%s\\n' inspectProtocol=1 version=${version} target=bun-linux-x64 installerProtocol=1 lifecycleProtocol=1 stateCompatibility=1 semanticCapability=keyword`,
+    `  printf '%s\\n' inspectProtocol=1 version=${version} target=bun-linux-x64 installerProtocol=1 lifecycleProtocol=1 stateCompatibility=1 semanticCapability=bundled`,
     "  exit 0",
     "fi",
     'if [ "${1:-}" = "__lifecycle" ]; then',
@@ -319,7 +319,7 @@ async function createOfflineRelease(
     "lifecycleProtocol=1",
     "inspectProtocol=1",
     "stateCompatibility=1",
-    "semanticCapability=keyword",
+    "semanticCapability=bundled",
     "installerAssetName=install.sh",
     `installerSha256=${installerHash}`,
     "target=bun-linux-x64",
@@ -4489,7 +4489,7 @@ test("POSIX retains transactional configuration while Windows defers public setu
   const windows = await readFile(path.join(root, "install.ps1"), "utf8");
   assert.match(
     posix,
-    /command -v apk[\s\S]*apk info --exists libstdc\+\+[\s\S]*apk info --exists libgcc[\s\S]*apk add --no-cache libstdc\+\+ libgcc/,
+    /command -v apk[\s\S]*apk info --exists libstdc\+\+[\s\S]*apk info --exists libgcc[\s\S]*apk info --exists gcompat[\s\S]*apk add --no-cache libstdc\+\+ libgcc gcompat/,
   );
   assert.match(
     posix,
@@ -4560,13 +4560,13 @@ test("POSIX installer checks Alpine runtime packages before release downloads", 
         },
       });
 
-    for (const missingPackage of ["libstdc++", "libgcc"]) {
+    for (const missingPackage of ["libstdc++", "libgcc", "gcompat"]) {
       await writeFile(log, "");
       const missing = run(missingPackage);
       assert.notEqual(missing.status, 0);
       assert.match(
         missing.stderr,
-        /apk add --no-cache libstdc\+\+ libgcc/,
+        /apk add --no-cache libstdc\+\+ libgcc gcompat/,
       );
       assert.doesNotMatch(await readFile(log, "utf8"), /curl/);
     }
@@ -4577,7 +4577,7 @@ test("POSIX installer checks Alpine runtime packages before release downloads", 
     assert.match(present.stderr, /could not download release metadata/);
     assert.deepEqual(
       (await readFile(log, "utf8")).trim().split("\n"),
-      ["apk:libstdc++", "apk:libgcc", "curl"],
+      ["apk:libstdc++", "apk:libgcc", "apk:gcompat", "curl"],
     );
   } finally {
     await rm(temporary, { recursive: true, force: true });

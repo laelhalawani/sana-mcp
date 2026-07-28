@@ -15,7 +15,7 @@ flags, environment variables, and exit/edge behaviour.
 
 Status legend used throughout:
 
-- [shipped] - implemented in the current `v0.4.13` release candidate.
+- [shipped] - implemented in the current `v0.4.14` release candidate.
 - [planned] - designed in the per-area documents but not implemented in the
   current release candidate.
 
@@ -40,7 +40,7 @@ Style: hyphens only, never em/en dashes. All timestamps are UTC unless stated.
 The binary is produced with `bun build --compile` for seven verified targets:
 Linux x64/ARM64 with glibc or musl, macOS x64/Apple Silicon, and Windows x64.
 Windows ARM64 is not currently published. It embeds the Bun runtime. Alpine
-also requires its `libstdc++` and `libgcc` runtime packages; the POSIX installer
+also requires its `libstdc++`, `libgcc`, and `gcompat` runtime packages; the POSIX installer
 checks them before downloading release metadata or binary assets and prints the
 exact `apk add` command when absent.
 
@@ -419,14 +419,15 @@ Argument detail:
 - `meeting_id` is also accepted as `id`; `confirmation_code` also as `code`.
 - Pagination/limit args tolerate numeric strings; non-numeric values fall back to
   the default (they never crash the query).
-- `recording` is the only tool that hits the network; the URL expires after a few
-  hours.
+- `recording` fetches a live Sana URL that expires after a few hours. Initial
+  semantic indexing or search may also download the pinned public embedding
+  model; no transcript or query data is sent with that model request.
 
-Search: keyword (SQLite FTS5 + BM25, whole-word, unicode61 + diacritic folding)
-is always available. When `SANA_SEMANTIC=1`, `search` becomes hybrid (keyword +
-vector results fused by Reciprocal Rank Fusion). In the compiled binary the
-embedding deps are not bundled; enabling semantic there degrades gracefully to
-keyword.
+Search defaults to hybrid keyword and semantic ranking (SQLite FTS5 + BM25 plus
+vector results fused by Reciprocal Rank Fusion). Compiled binaries bundle the
+semantic runtime and target sqlite-vec extension, then download and verify the
+exact pinned model revision on first use. `SANA_SEMANTIC=0` selects keyword-only
+search. Runtime failures degrade explicitly to keyword results.
 
 ---
 
@@ -479,8 +480,8 @@ prompt re-login (human wording in the CLI, agent wording in the MCP tool).
   delay. `SANA_MAX_ATTEMPTS` controls when that delay stops increasing, not
   whether another attempt will happen. Login or daemon restart retries them
   immediately.
-- If semantic embeddings cannot run (deps unavailable in the compiled binary),
-  the daemon degrades to keyword-only for that run rather than blocking forever.
+- If semantic embeddings cannot run, the daemon degrades to keyword-only for
+  that run rather than blocking forever.
 - Auto-spawn: read commands and login call `ensureDaemonRunning()`, which spawns
   a detached, unref'd daemon (hidden window on Windows; output to
   `daemon.log`) if none is alive. Liveness = a heartbeat within 30s AND the PID
@@ -499,7 +500,7 @@ All optional.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `SANA_SEMANTIC` | off | `1`/`true`/`yes`/`on` enables semantic/hybrid search. |
+| `SANA_SEMANTIC` | on | `0`/`false`/`no`/`off` disables semantic/hybrid search. |
 | `SANA_SYNC_INTERVAL_MS` | `600000` | Incremental sync check interval. |
 | `SANA_REQUEST_DELAY_MS` | `150` | Delay between Sana artifact requests. |
 | `SANA_MAX_ATTEMPTS` | `5` | Failures before the retry delay stops increasing. |

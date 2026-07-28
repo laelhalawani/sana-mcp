@@ -37,7 +37,7 @@ export interface AppRuntime {
   refresh(): void;
   status(): StatusInfo;
   meetings(args: Record<string, unknown>): MeetingPage;
-  search(args: Record<string, unknown>): Promise<SearchResult>;
+  search(args: Record<string, unknown>, signal?: AbortSignal): Promise<SearchResult>;
   transcript(id: string): TranscriptView;
   summary(id: string): SummaryResult;
   participants(id: string): ParticipantsResult;
@@ -107,9 +107,12 @@ export class LocalAppRuntime implements AppRuntime {
     );
   }
 
-  async search(args: Record<string, unknown>): Promise<SearchResult> {
+  async search(
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<SearchResult> {
     const guard = this.captureGuard();
-    const result = await runSearch(this.store, args, { guard });
+    const result = await runSearch(this.store, args, { guard, signal });
     this.store.assertCacheOperation(guard);
     return result;
   }

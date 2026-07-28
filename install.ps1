@@ -386,7 +386,7 @@ function Read-ReleaseProperties([string] $File, [string] $ExpectedTarget) {
   if ($Values["stateCompatibility"] -cnotmatch '^[1-9][0-9]*$') {
     throw "Release state compatibility is invalid."
   }
-  if ($Values["semanticCapability"] -cne "keyword") { throw "Unsupported binary capability." }
+  if ($Values["semanticCapability"] -cne "bundled") { throw "Unsupported binary capability." }
   if ($Values["installerAssetName"] -cne "install.ps1" -or
       $Values["installerSha256"] -cnotmatch '^[a-f0-9]{64}$') {
     throw "Release metadata does not bind the Windows installer."
@@ -1952,7 +1952,9 @@ try {
         $OldInspect["stateCompatibility"] -cne
           $OldReceipt["stateCompatibility"] -or
         $OldInspect["target"] -cne $OldReceipt["target"] -or
-        $OldInspect["version"] -cne $OldReceipt["version"]) {
+        $OldInspect["version"] -cne $OldReceipt["version"] -or
+        @("keyword", "bundled") -cnotcontains
+          $OldInspect["semanticCapability"]) {
       throw "The existing binary identity does not match its installer receipt."
     }
 

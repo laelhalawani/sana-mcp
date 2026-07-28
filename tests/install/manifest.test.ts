@@ -331,7 +331,7 @@ test("parses the versioned manifest and preserves every exact declared mapping",
   assert.equal(manifest.installerProtocol, 1);
   assert.equal(manifest.lifecycleProtocol, 1);
   assert.equal(manifest.inspectProtocol, 1);
-  assert.equal(manifest.semanticCapability, "keyword");
+  assert.equal(manifest.semanticCapability, "bundled");
   assert.deepEqual(
     manifest.assets.map((asset) => asset.target),
     RELEASE_TARGETS,

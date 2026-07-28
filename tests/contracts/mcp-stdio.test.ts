@@ -12,13 +12,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  createStandaloneBuildConfig,
-} from "../../src/runtime/build-info.js";
-import {
-  releaseTargetForRuntime,
-  type ReleaseTarget,
-} from "../../src/release/contract.js";
-import {
   renderLoginWaitResult,
   renderStatusInfo,
 } from "../../src/tools/dispatch.js";
@@ -301,102 +294,6 @@ async function runProcess(
   }
 }
 
-function linuxLibcFromRuntimeReport(): "glibc" | "musl" {
-  const runtimeReport = process.report?.getReport();
-  if (!runtimeReport || typeof runtimeReport !== "object") {
-    throw new Error("contract test cannot identify Linux libc: runtime report is unavailable");
-  }
-  const header =
-    "header" in runtimeReport &&
-      runtimeReport.header &&
-      typeof runtimeReport.header === "object"
-      ? runtimeReport.header
-      : undefined;
-  if (!header) {
-    throw new Error("contract test cannot identify Linux libc: runtime report header is absent");
-  }
-  if ("glibcVersionRuntime" in header) {
-    const glibcVersion = header.glibcVersionRuntime;
-    if (
-      typeof glibcVersion !== "string" ||
-      !/^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){1,3}$/.test(glibcVersion)
-    ) {
-      throw new Error(
-        "contract test cannot identify Linux libc: glibcVersionRuntime is invalid"
-      );
-    }
-    return "glibc";
-  }
-  const sharedObjects =
-    "sharedObjects" in runtimeReport && Array.isArray(runtimeReport.sharedObjects)
-      ? runtimeReport.sharedObjects
-      : undefined;
-  if (
-    sharedObjects?.some(
-      (library): library is string =>
-        typeof library === "string" &&
-        /(?:^|[/\\])(?:ld-musl-[^/\\]+|libc\.musl-[^/\\]+)\.so\.1$/.test(library)
-    )
-  ) {
-    return "musl";
-  }
-  throw new Error(
-    "contract test cannot identify Linux libc: no validated glibc or musl evidence"
-  );
-}
-
-function standaloneTargetForRuntime(
-  platform: NodeJS.Platform,
-  architecture: string,
-  linuxLibc?: "glibc" | "musl",
-): ReleaseTarget {
-  if (
-    platform === "linux" &&
-    (architecture === "x64" || architecture === "arm64")
-  ) {
-    if (linuxLibc === undefined) {
-      throw new Error("contract test requires validated libc for a Linux target");
-    }
-    return releaseTargetForRuntime({
-      platform: "linux",
-      architecture,
-      libc: linuxLibc,
-    });
-  }
-  if (platform === "darwin" && architecture === "x64") {
-    return releaseTargetForRuntime({
-      platform: "darwin",
-      architecture: "x64",
-      libc: null,
-    });
-  }
-  if (platform === "darwin" && architecture === "arm64") {
-    return releaseTargetForRuntime({
-      platform: "darwin",
-      architecture: "arm64",
-      libc: null,
-    });
-  }
-  if (platform === "win32" && architecture === "x64") {
-    return releaseTargetForRuntime({
-      platform: "win32",
-      architecture: "x64",
-      libc: null,
-    });
-  }
-  throw new Error(
-    `contract test has no canonical standalone target for ${platform}/${architecture}`,
-  );
-}
-
-function currentStandaloneTarget(): ReleaseTarget {
-  return standaloneTargetForRuntime(
-    process.platform,
-    process.arch,
-    process.platform === "linux" ? linuxLibcFromRuntimeReport() : undefined,
-  );
-}
-
 async function writeDispatcherBundle(
   dataDir: string,
   filename: string,
@@ -432,14 +329,6 @@ async function writeDispatcherBundle(
     );
   }
   return outfile;
-}
-
-async function buildStandaloneDispatcher(dataDir: string): Promise<string> {
-  const production = createStandaloneBuildConfig(currentStandaloneTarget());
-  return await writeDispatcherBundle(dataDir, "standalone-dispatch.js", {
-    external: [...(production.external ?? [])],
-    define: production.define,
-  });
 }
 
 async function buildSourceFailureDispatcher(dataDir: string): Promise<string> {
@@ -989,12 +878,6 @@ describe.serial("MCP stdio contract", () => {
     expected.push("Sana client fetch", "production daemon spawn");
     expect(JSON.parse(result.stdout)).toEqual(expected);
   }, outerTestBudget(2));
-
-  test("rejects runtimes outside the canonical standalone target set", () => {
-    expect(() => standaloneTargetForRuntime("win32", "arm64")).toThrow(
-      "contract test has no canonical standalone target for win32/arm64",
-    );
-  });
 
   test(
     "terminates and reaps a timed-out isolated build worker",
@@ -2044,45 +1927,6 @@ describe.serial("MCP stdio contract", () => {
     ) as Record<string, string>;
     expect(toolText(result.messages, 64)).toBe(expected.readStillListing);
   }, outerTestBudget(2, 1));
-
-  test(
-    "freezes explicit semantic degradation in a keyword-only standalone build",
-    async () => {
-      const dataDir = createDataDir();
-      const dispatcher = await buildStandaloneDispatcher(dataDir);
-      const expected = JSON.parse(fixture("semantic-degradation.json")) as Record<
-        string,
-        string
-      >;
-      const calls = [
-        { key: "status", tool: "status", args: {} },
-        {
-          key: "searchWithResults",
-          tool: "search",
-          args: { query: "coverage" },
-        },
-        {
-          key: "searchWithoutMatches",
-          tool: "search",
-          args: { query: "unmatched" },
-        },
-        {
-          key: "searchEmptyPage",
-          tool: "search",
-          args: { query: "contract", limit: 1, page: 3 },
-        },
-      ] as const;
-
-      const outputs = await runDispatcherBatch(
-        dataDir,
-        calls,
-        dispatcher,
-        true,
-      );
-      expect(outputs).toEqual(calls.map((call) => expected[call.key]));
-    },
-    outerTestBudget(1, 0, 1),
-  );
 
   test(
     "freezes source semantic runtime degradation through production rendering",

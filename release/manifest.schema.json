@@ -52,7 +52,7 @@
       "minimum": 1
     },
     "semanticCapability": {
-      "const": "keyword"
+      "const": "bundled"
     },
     "assets": {
       "type": "array",

@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing package-matching tag to release (for example v0.4.13)"
+        description: "Existing package-matching tag to release (for example v0.4.14)"
         required: true
         type: string
 
@@ -240,20 +240,30 @@ jobs:
           chmod +x "$ASSET"
           PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
           EXECUTED_SHA256="$(sha256sum "$ASSET" | awk '{print $1}')"
+          SEMANTIC_SMOKE_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$SEMANTIC_SMOKE_ROOT"' EXIT
           if [ "$LIBC" = musl ]; then
-            docker run --rm -v "$PWD/$ASSET:/execution/artifact:ro" -w /execution \
+            docker run --rm -v "$PWD/$ASSET:/execution/artifact:ro" \
+              -v "$SEMANTIC_SMOKE_ROOT:/execution/semantic-smoke" -w /execution \
               -e "EXPECTED_SHA256=$EXECUTED_SHA256" -e "PACKAGE_VERSION=$PACKAGE_VERSION" \
+              -e "SANA_SEMANTIC_SMOKE_ROOT=/execution/semantic-smoke" \
+              -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
               alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce \
               sh -eu -c '
-                apk add --no-cache libstdc++ libgcc >/dev/null
+                trap '\''chown -R "$HOST_UID:$HOST_GID" /execution/semantic-smoke'\'' EXIT
+                apk add --no-cache libstdc++ libgcc gcompat >/dev/null
                 [ "$(sha256sum "$1" | awk "{print \$1}")" = "$EXPECTED_SHA256" ]
                 [ "$("$1" --version)" = "$PACKAGE_VERSION" ]
                 "$1" --help >/dev/null
+                "$1" __semantic-smoke > /execution/semantic-smoke/evidence.json
                 "$1" __inspect --format json
               ' _ /execution/artifact > "inspect-$TARGET.json"
+            cp "$SEMANTIC_SMOKE_ROOT/evidence.json" "semantic-smoke-$TARGET.json"
           else
             [ "$("./$ASSET" --version)" = "$PACKAGE_VERSION" ]
             "./$ASSET" --help >/dev/null
+            SANA_SEMANTIC_SMOKE_ROOT="$SEMANTIC_SMOKE_ROOT" \
+              "./$ASSET" __semantic-smoke > "semantic-smoke-$TARGET.json"
             "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
           fi
           [ "$(sha256sum "$ASSET" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
@@ -261,6 +271,7 @@ jobs:
             --target "$TARGET" \
             --artifact "$ASSET" \
             --inspect-file "inspect-$TARGET.json" \
+            --semantic-smoke-file "semantic-smoke-$TARGET.json" \
             --commit-sha "$SOURCE_SHA" \
             --executed-sha256 "$EXECUTED_SHA256" \
             --output "attestation-$TARGET.json"
@@ -312,14 +323,19 @@ jobs:
           chmod +x "$ASSET"
           PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
           EXECUTED_SHA256="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
+          SEMANTIC_SMOKE_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$SEMANTIC_SMOKE_ROOT"' EXIT
           [ "$("./$ASSET" --version)" = "$PACKAGE_VERSION" ]
           "./$ASSET" --help >/dev/null
+          SANA_SEMANTIC_SMOKE_ROOT="$SEMANTIC_SMOKE_ROOT" \
+            "./$ASSET" __semantic-smoke > "semantic-smoke-$TARGET.json"
           "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
           [ "$(shasum -a 256 "$ASSET" | awk '{print $1}')" = "$EXECUTED_SHA256" ]
           bun scripts/release.ts attest \
             --target "$TARGET" \
             --artifact "$ASSET" \
             --inspect-file "inspect-$TARGET.json" \
+            --semantic-smoke-file "semantic-smoke-$TARGET.json" \
             --commit-sha "$SOURCE_SHA" \
             --executed-sha256 "$EXECUTED_SHA256" \
             --output "attestation-$TARGET.json"
@@ -378,10 +394,22 @@ jobs:
             ConvertFrom-Json).version
           $InspectPath = Join-Path $PWD "inspect-bun-windows-x64.json"
           $AttestationPath = Join-Path $PWD "attestation-bun-windows-x64.json"
+          $SemanticSmokePath = Join-Path $PWD "semantic-smoke-bun-windows-x64.json"
           $ExecutedSha256 = (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLower()
+          $SemanticSmokeRoot = Join-Path $env:RUNNER_TEMP ("sana-semantic-smoke-" + [Guid]::NewGuid().ToString("N"))
+          [IO.Directory]::CreateDirectory($SemanticSmokeRoot) | Out-Null
           $ObservedVersion = (& $Binary --version | Out-String).Trim()
           if ($LASTEXITCODE -ne 0 -or $ObservedVersion -cne $PackageVersion) {
             throw "Standalone version mismatch: expected $PackageVersion, received $ObservedVersion."
+          }
+          try {
+            $env:SANA_SEMANTIC_SMOKE_ROOT = $SemanticSmokeRoot
+            $SemanticSmokeJson = (& $Binary __semantic-smoke | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { throw "Standalone semantic smoke failed: $LASTEXITCODE" }
+            [IO.File]::WriteAllText($SemanticSmokePath, $SemanticSmokeJson + "`n", [Text.UTF8Encoding]::new($false))
+          } finally {
+            Remove-Item Env:SANA_SEMANTIC_SMOKE_ROOT -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $SemanticSmokeRoot -Recurse -Force -ErrorAction SilentlyContinue
           }
           $InspectJson = (& $Binary __inspect --format json | Out-String).Trim()
           if ($LASTEXITCODE -ne 0) { throw "Standalone inspect failed: $LASTEXITCODE" }
@@ -397,7 +425,7 @@ jobs:
               $Inspect.version -cne $PackageVersion -or $Inspect.target -cne "bun-windows-x64" -or
               $Inspect.installerProtocol -ne 1 -or $Inspect.lifecycleProtocol -ne 1 -or
               $Inspect.inspectProtocol -ne 1 -or $Inspect.stateCompatibility -ne 1 -or
-              $Inspect.semanticCapability -cne "keyword") {
+              $Inspect.semanticCapability -cne "bundled") {
             throw "Standalone inspect tuple is not the exact Windows release identity."
           }
           & $Binary --help | Out-Null
@@ -410,6 +438,7 @@ jobs:
             "--target","bun-windows-x64",
             "--artifact",$Binary,
             "--inspect-file",$InspectPath,
+            "--semantic-smoke-file",$SemanticSmokePath,
             "--commit-sha",$env:SOURCE_SHA,
             "--executed-sha256",$ExecutedSha256,
             "--output",$AttestationPath

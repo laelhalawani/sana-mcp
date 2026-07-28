@@ -10,6 +10,7 @@ import {
 describe("runtime environment", () => {
   test("uses intentional product defaults only for absent variables", () => {
     const parsed = parseRuntimeEnvironment({}, "/isolated/work");
+    expect(RUNTIME_DEFAULTS.semanticEnabled).toBe(true);
     expect(parsed).toEqual({
       dataDir: undefined,
       transcriptsDir: undefined,

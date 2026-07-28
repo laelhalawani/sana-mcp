@@ -257,6 +257,14 @@ function latestFrame(output: TestOutput, marker: string): string {
   return chunk;
 }
 
+function latestRawFrame(output: TestOutput, marker: string): string {
+  const chunk = [...output.chunks]
+    .reverse()
+    .find((value) => stripAnsi(value).includes(marker));
+  if (chunk === undefined) throw new Error(`no rendered frame containing ${marker}`);
+  return chunk;
+}
+
 test("cache-blocked browser performs no meeting query and refreshes into the list", async () => {
   const runtime = new FakeRuntime();
   runtime.currentStatus = status(true);
@@ -274,7 +282,7 @@ test("cache-blocked browser performs no meeting query and refreshes into the lis
   expect(await app.result).toEqual({ action: "quit" });
 });
 
-test("Enter opens meeting actions while t, s, and p remain direct shortcuts", async () => {
+test("meeting actions and direct shortcuts have distinct Escape targets", async () => {
   const app = await harness();
   await app.key("\x1b[B");
   await app.key("\r");
@@ -285,9 +293,13 @@ test("Enter opens meeting actions while t, s, and p remain direct shortcuts", as
   await app.key("\r");
   expect(app.runtime.transcriptIds).toEqual(["2"]);
   await app.key("\x1b");
+  expect(latestFrame(app.output, "Meeting 2")).toContain("Transcript");
+  await app.key("\x1b");
+  expect(latestFrame(app.output, "Meetings | 2 ready")).toContain("> Meeting 2");
   await app.key("t");
   expect(app.runtime.transcriptIds).toEqual(["2", "2"]);
   await app.key("\x1b");
+  expect(latestFrame(app.output, "Meetings | 2 ready")).not.toContain("Summary 2");
   await app.key("s");
   expect(app.runtime.summaryIds).toEqual(["2"]);
   await app.key("\x1b");
@@ -317,6 +329,144 @@ test("meeting actions retain their original meeting across list refresh", async 
   await app.result;
 });
 
+test("details opened from actions return to the same action selection before the list", async () => {
+  const app = await harness(new FakeRuntime(), { rows: 10, columns: 72 });
+  await app.key("\x1b[B");
+  await app.key("\r");
+  await app.key("\x1b[B");
+  await app.key("\r");
+  expect(app.runtime.summaryIds).toEqual(["2"]);
+  expect(latestFrame(app.output, "Summary 2")).toContain("Short summary");
+
+  await app.key("\x1b");
+  const actions = latestFrame(app.output, "Meeting 2");
+  expect(actions).toContain("> Summary");
+  app.runtime.onRefresh = () => {
+    throw new Error("refresh exploded");
+  };
+  await app.key("r");
+  expect(latestFrame(app.output, "Refresh failed")).toContain("refresh exploded");
+  await app.key("\x1b");
+  expect(latestFrame(app.output, "Meeting 2")).toContain("> Summary");
+  for (let index = 0; index < 3; index++) await app.key("\x1b[B");
+  await app.key("\r");
+  expect(latestFrame(app.output, "Sync details | Meeting 2")).toContain(
+    "Status: ready",
+  );
+  await app.key("\x1b");
+  expect(latestFrame(app.output, "Meeting 2")).toContain("> Sync details");
+  await app.key("\x1b");
+  expect(latestFrame(app.output, "Meetings |")).toContain("> Meeting 2");
+  await app.key("q");
+  await app.result;
+});
+
+test("detail shortcuts switch siblings for the captured meeting and retain their origin", async () => {
+  const app = await harness(new FakeRuntime(), { rows: 10, columns: 72 });
+  await app.key("\x1b[B");
+  await app.key("\r");
+  await app.key("\r");
+  expect(app.runtime.transcriptIds).toEqual(["2"]);
+  await app.key("s");
+  expect(app.runtime.summaryIds).toEqual(["2"]);
+  await app.key("p");
+  expect(app.runtime.participantIds).toEqual(["2"]);
+  await app.key("o");
+  expect(app.runtime.recordingIds).toEqual(["2"]);
+  expect(latestFrame(app.output, "Recording 2")).toContain("https://example.test/r");
+  await app.key("\x1b");
+  expect(latestFrame(app.output, "Meeting 2")).toContain("> Recording");
+  await app.key("\x1b");
+  await app.key("q");
+  await app.result;
+
+  const direct = await harness(new FakeRuntime(), { rows: 10, columns: 72 });
+  await direct.key("\x1b[B");
+  await direct.key("t");
+  await direct.key("s");
+  expect(direct.runtime.transcriptIds).toEqual(["2"]);
+  expect(direct.runtime.summaryIds).toEqual(["2"]);
+  await direct.key("\x1b");
+  expect(latestFrame(direct.output, "Meetings |")).toContain("> Meeting 2");
+  await direct.key("q");
+  await direct.result;
+});
+
+test("refresh and stale recording completion cannot retarget or replace a captured detail", async () => {
+  const runtime = new FakeRuntime();
+  let resolveRecording!: (result: RecordingResult) => void;
+  runtime.recording = (id: string) => {
+    runtime.recordingIds.push(id);
+    return new Promise((resolve) => {
+      resolveRecording = resolve;
+    });
+  };
+  const app = await harness(runtime, { rows: 10, columns: 72 });
+  await app.key("\x1b[B");
+  runtime.onRefresh = () => {
+    runtime.rows = [row("1")];
+  };
+  await app.key("o");
+  expect(latestFrame(app.output, "Loading: Recording")).toContain(
+    "Loading recording...",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  expect(latestFrame(app.output, "Loading: Recording")).toContain(
+    "Loading recording...",
+  );
+
+  await app.key("s");
+  expect(runtime.summaryIds).toEqual(["2"]);
+  expect(latestFrame(app.output, "Summary 2")).toContain("Short summary");
+  resolveRecording({
+    kind: "ok",
+    name: "Stale recording",
+    url: "https://example.test/stale",
+  });
+  await wait();
+  const frame = latestFrame(app.output, "Summary 2");
+  expect(frame).not.toContain("Stale recording");
+  expect(frame).not.toContain("example.test/stale");
+  await app.key("\x1b");
+  expect(latestFrame(app.output, "Meetings |")).toContain("Meeting 1");
+
+  runtime.onRefresh = () => {
+    throw new Error("refresh exploded");
+  };
+  await app.key("o");
+  await app.key("r");
+  expect(latestFrame(app.output, "Refresh failed")).toContain("refresh exploded");
+  resolveRecording({
+    kind: "ok",
+    name: "Late recording",
+    url: "https://example.test/late",
+  });
+  await wait();
+  expect(latestFrame(app.output, "Refresh failed")).not.toContain("Late recording");
+  await app.key("\x1b");
+  await app.key("q");
+  await app.result;
+});
+
+test("selection survives filters and refreshes while its meeting remains present", async () => {
+  const runtime = new FakeRuntime();
+  runtime.rows = [row("1", "Weekly first"), row("2", "Weekly second")];
+  const app = await harness(runtime, { rows: 8, columns: 72 });
+  await app.key("\x1b[B");
+  await app.key("/");
+  await app.key("weekly");
+  await app.key("\r");
+  runtime.onRefresh = () => {
+    runtime.rows = [row("2", "Weekly second"), row("1", "Weekly first")];
+  };
+  await app.key("r");
+  await app.key("t");
+  expect(runtime.transcriptIds).toEqual(["2"]);
+  await app.key("\x1b");
+  await app.key("q");
+  await app.result;
+});
+
 test("list and transcript viewports page and clamp within the current rows", async () => {
   const runtime = new FakeRuntime();
   runtime.rows = Array.from({ length: 10 }, (_, index) =>
@@ -330,16 +480,135 @@ test("list and transcript viewports page and clamp within the current rows", asy
   await app.key("\x1b[F");
   await app.key("\x1b[5~");
   await app.key("\r");
-  expect(latestFrame(app.output, "Meeting 7")).toContain("Transcript");
+  expect(latestFrame(app.output, "Meeting 9")).toContain("Transcript");
   await app.key("\r");
-  expect(runtime.transcriptIds).toEqual(["7"]);
-  expect(latestFrame(app.output, "Transcript 7")).toContain("transcript line 1");
+  expect(runtime.transcriptIds).toEqual(["9"]);
+  expect(latestFrame(app.output, "Transcript 9")).toContain("transcript line 1");
   await app.key("\x1b[6~");
-  const paged = latestFrame(app.output, "Transcript 7");
+  const paged = latestFrame(app.output, "Transcript 9");
   expect(paged).toContain("transcript line 4");
   expect(paged).not.toContain("transcript line 1");
   await app.key("\x1b[F");
-  expect(latestFrame(app.output, "Transcript 7")).toContain("transcript line 8");
+  expect(latestFrame(app.output, "Transcript 9")).toContain("transcript line 8");
+  await app.key("q");
+  await app.result;
+});
+
+test("meeting list renders two-line cards with local metadata and blank separators", async () => {
+  const runtime = new FakeRuntime();
+  runtime.rows = [
+    { ...row("1", "Ready meeting"), word_count: 1 },
+    {
+      ...row("2", "Downloading meeting"),
+      has_transcript: 0,
+      has_metadata: 0,
+      word_count: null,
+    },
+    {
+      ...row("3", "Processing meeting"),
+      has_transcript: 0,
+      has_metadata: 0,
+      processing_phase: "processing",
+      word_count: 1234,
+    },
+    {
+      ...row("4", "Retrying meeting"),
+      has_transcript: 0,
+      has_metadata: 0,
+      attempts: 1,
+      word_count: 0,
+    },
+  ];
+  const app = await harness(runtime, { rows: 14, columns: 120 });
+  const frame = latestFrame(app.output, "Meetings | 2 ready").replaceAll("\r", "");
+  const lines = frame.split("\n");
+  expect(lines).toHaveLength(14);
+  expect(lines[1]).toBe("> Ready meeting");
+  expect(lines[2]).toContain(
+    `| ${new Date(runtime.rows[0]!.created_at_ms).toLocaleString()}  1 word  Ready`,
+  );
+  expect(lines[3]).toBe("");
+  expect(lines[4]).toBe("  Downloading meeting");
+  expect(lines[5]).toContain("Downloading");
+  expect(lines[6]).toBe("");
+  expect(lines[8]).toContain("1,234 words  Processing");
+  expect(lines[9]).toBe("");
+  expect(lines[11]).toContain("0 words  Retrying");
+  expect(frame).not.toMatch(/\[(Ready|Downloading|Processing|Retrying)/);
+  await app.key("q");
+  await app.result;
+});
+
+test("meeting cards adapt metadata and footer labels without exceeding narrow widths", async () => {
+  const runtime = new FakeRuntime();
+  runtime.rows = [{ ...row("1", "A long meeting title"), word_count: 1234 }];
+  const date = new Date(runtime.rows[0]!.created_at_ms).toLocaleString();
+
+  const medium = await harness(runtime, { rows: 5, columns: 35 });
+  const mediumFrame = latestFrame(medium.output, "Meetings |");
+  expect(mediumFrame).toContain(date);
+  expect(mediumFrame).not.toContain("1,234 words");
+  expect(mediumFrame).toContain("Ready");
+  for (const line of mediumFrame.split("\n")) {
+    expect(displayWidth(line)).toBeLessThanOrEqual(34);
+  }
+  await medium.key("q");
+  await medium.result;
+
+  const narrow = await harness(runtime, { rows: 5, columns: 14 });
+  const narrowFrame = latestFrame(narrow.output, "Meetings |").replaceAll("\r", "");
+  expect(narrowFrame).toContain("| Ready");
+  expect(narrowFrame).not.toContain(date);
+  expect(narrowFrame).not.toContain("words");
+  expect(narrowFrame.split("\n").at(-1)).toBe("Enter open");
+  for (const line of narrowFrame.split("\n")) {
+    expect(displayWidth(line)).toBeLessThanOrEqual(13);
+  }
+  await narrow.key("q");
+  await narrow.result;
+});
+
+test("card paging moves exactly one full-card viewport and never renders a partial card", async () => {
+  const runtime = new FakeRuntime();
+  runtime.rows = Array.from({ length: 8 }, (_, index) => row(String(index + 1)));
+  const app = await harness(runtime, { rows: 11, columns: 60 });
+  const first = latestFrame(app.output, "Meetings |");
+  expect(first).toContain("Meeting 1");
+  expect(first).toContain("Meeting 3");
+  expect(first).not.toContain("Meeting 4");
+
+  await app.key("\x1b[6~");
+  const second = latestFrame(app.output, "Meetings |");
+  expect(second).not.toContain("Meeting 3");
+  expect(second).toContain("> Meeting 4");
+  expect(second).toContain("Meeting 6");
+  expect(second).not.toContain("Meeting 7");
+  await app.key("\x1b[5~");
+  expect(latestFrame(app.output, "Meetings |")).toContain("> Meeting 1");
+  await app.key("q");
+  await app.result;
+
+  const short = await harness(runtime, { rows: 7, columns: 60 });
+  const shortFrame = latestFrame(short.output, "Meetings |");
+  expect(shortFrame).toContain("Meeting 1");
+  expect(shortFrame).not.toContain("Meeting 2");
+  await short.key("q");
+  await short.result;
+});
+
+test("ASCII cards use a pointer and rail while preserving status text", async () => {
+  const runtime = new FakeRuntime();
+  runtime.rows = [{ ...row("1", "ASCII title"), has_metadata: 0, attempts: 1 }];
+  const app = await harness(
+    runtime,
+    { rows: 5, columns: 40 },
+    { NO_COLOR: "", LANG: "C" },
+  );
+  const frame = latestFrame(app.output, "Meetings |");
+  expect(frame).toContain("> ASCII title\n| ");
+  expect(frame).toContain("Retrying");
+  expect(frame).not.toContain("❯");
+  expect(frame).not.toContain("│");
   await app.key("q");
   await app.result;
 });
@@ -444,6 +713,37 @@ test("frames fit terminal rows, sanitize hostile titles, redraw, and clear on ty
     expect(await next.result).toEqual({ action } satisfies MeetingBrowserResult);
     expect(next.input.isRaw).toBe(false);
   }
+});
+
+test("detail content is sanitized and truncated even when it contains terminal escapes", async () => {
+  const runtime = new FakeRuntime();
+  runtime.transcript = (id: string) => ({
+    kind: "ok",
+    meeting: null,
+    id,
+    name: "Hostile transcript",
+    dateMs: null,
+    lineCount: 1,
+    wordCount: 1,
+    lines: [
+      {
+        n: 1,
+        timeSec: 0,
+        time: "00:00",
+        speaker: "speaker\x1b[2J",
+        text: "long hostile detail ".repeat(10),
+      },
+    ],
+  });
+  const app = await harness(runtime, { rows: 5, columns: 32 });
+  await app.key("t");
+  const raw = latestRawFrame(app.output, "Hostile transcript");
+  expect(raw).not.toContain("speaker\x1b[2J");
+  for (const line of stripAnsi(raw).split("\n")) {
+    expect(displayWidth(line)).toBeLessThanOrEqual(31);
+  }
+  await app.key("q");
+  await app.result;
 });
 
 test("name and status filters combine and clear together", async () => {
@@ -566,9 +866,9 @@ test("meeting browser polls and redraws changing sync status", async () => {
     };
   };
   const app = await harness(runtime);
-  expect(latestFrame(app.output, "0 ready")).toContain("retrying");
+  expect(latestFrame(app.output, "0 ready")).toContain("Retrying");
   await new Promise((resolve) => setTimeout(resolve, 1_050));
-  expect(latestFrame(app.output, "1 ready")).toContain("ready");
+  expect(latestFrame(app.output, "1 ready")).toContain("Ready");
   await app.key("q");
   await app.result;
 });
@@ -577,15 +877,28 @@ test("meeting browser colors selection and artifact statuses in color terminals"
   const runtime = new FakeRuntime();
   runtime.rows = [
     row("1", "Ready"),
-    { ...row("2", "Retrying"), has_metadata: 0, attempts: 1 },
+    { ...row("2", "Downloading"), has_metadata: 0, has_transcript: 0 },
+    {
+      ...row("3", "Processing"),
+      has_metadata: 0,
+      has_transcript: 0,
+      processing_phase: "processing",
+    },
+    { ...row("4", "Retrying"), has_metadata: 0, attempts: 1 },
   ];
-  const app = await harness(runtime, {}, { LANG: "en_US.UTF-8" });
-  const frame = [...app.output.chunks]
-    .reverse()
-    .find((chunk) => chunk.includes("Meetings |"));
-  expect(frame).toContain("\x1b[36m");
-  expect(frame).toContain("\x1b[32m");
-  expect(frame).toContain("\x1b[33m");
+  const app = await harness(
+    runtime,
+    { rows: 14, columns: 72 },
+    { LANG: "en_US.UTF-8" },
+  );
+  const frame = latestRawFrame(app.output, "Meetings |");
+  expect(frame).toContain("\x1b[36m❯\x1b[0m");
+  expect(frame).toContain("\x1b[36m│\x1b[0m");
+  expect(frame).toContain("\x1b[1mReady\x1b[0m");
+  expect(frame).toMatch(/\x1b\[32mReady\x1b\[0m/);
+  expect(frame).toMatch(/\x1b\[36mDownloading\x1b\[0m/);
+  expect(frame).toMatch(/\x1b\[33mProcessing\x1b\[0m/);
+  expect(frame).toMatch(/\x1b\[33mRetrying\x1b\[0m/);
   await app.key("q");
   await app.result;
 });
@@ -622,6 +935,7 @@ test("signed-in app starts at the menu and returns there from meetings", async (
     },
     input: async () => "",
     meetingBrowser: async () => ({ action: "back" }),
+    search: async () => ({ action: "back" }),
     syncStatus: async () => ({ action: "back" }),
   };
 
@@ -637,6 +951,30 @@ test("signed-in app starts at the menu and returns there from meetings", async (
   expect(selected).toHaveLength(2);
 });
 
+test("signed-in app opens the full-screen search prompt and honors quit", async () => {
+  const runtime = new FakeRuntime();
+  let selectedRuntime: AppRuntime | null = null;
+  let selectCalls = 0;
+  const prompts: AppPrompts = {
+    interactive: true,
+    select: async () => {
+      selectCalls++;
+      return "search" as never;
+    },
+    input: async () => "",
+    meetingBrowser: async () => ({ action: "back" }),
+    search: async (activeRuntime) => {
+      selectedRuntime = activeRuntime;
+      return { action: "quit" };
+    },
+    syncStatus: async () => ({ action: "back" }),
+  };
+
+  await runApp(runtime, prompts);
+  expect(selectedRuntime).toBe(runtime);
+  expect(selectCalls).toBe(1);
+});
+
 test("signed-in menu does not offer transcript search while cache access is blocked", async () => {
   const runtime = new FakeRuntime();
   runtime.currentStatus = status(true);
@@ -649,6 +987,7 @@ test("signed-in menu does not offer transcript search while cache access is bloc
     },
     input: async () => "",
     meetingBrowser: async () => ({ action: "back" }),
+    search: async () => ({ action: "back" }),
     syncStatus: async () => ({ action: "back" }),
   };
   await runApp(runtime, prompts);
@@ -675,6 +1014,7 @@ test("signed-in account screen is inspectable and Back never starts login", asyn
       return null;
     },
     meetingBrowser: async () => ({ action: "back" }),
+    search: async () => ({ action: "back" }),
     syncStatus: async () => ({ action: "back" }),
   };
   await runApp(runtime, prompts);

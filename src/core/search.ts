@@ -72,6 +72,7 @@ export interface SearchRuntimeOverrides {
   readonly embedQuery?: typeof embedQuery;
   readonly searchKnn?: typeof searchKnn;
   readonly guard?: CacheOperationGuard;
+  readonly signal?: AbortSignal;
 }
 
 export async function runSearch(
@@ -100,6 +101,7 @@ export async function runSearch(
   const semanticState = runtime.semanticState ?? semanticCapabilityState();
   const useSemantic = semanticState.kind === "available";
   const checkpoint = (): void => {
+    runtime.signal?.throwIfAborted();
     if (runtime.guard) store.assertCacheOperation(runtime.guard);
   };
   const fence = <Value>(operation: () => Value): Value =>
@@ -158,6 +160,7 @@ export async function runSearch(
   const RRF_K = 60;
   let kw: SearchRow[];
   try {
+    checkpoint();
     const read = () =>
       store.searchLines(match, {
         limit: POOL,
@@ -171,6 +174,7 @@ export async function runSearch(
       : read();
   } catch (e) {
     if (e instanceof CacheOperationChangedError) throw e;
+    if (runtime.signal?.aborted) throw runtime.signal.reason;
     return { kind: "error", query, message: (e as Error).message };
   }
 
@@ -209,7 +213,7 @@ export async function runSearch(
 
   try {
     checkpoint();
-    const qv = await (runtime.embedQuery ?? embedQuery)(query);
+    const qv = await (runtime.embedQuery ?? embedQuery)(query, runtime.signal);
     checkpoint();
     const knn = await (runtime.searchKnn ?? searchKnn)(
       store.db,
@@ -226,6 +230,7 @@ export async function runSearch(
     else resolveRows();
   } catch (e) {
     if (e instanceof CacheOperationChangedError) throw e;
+    if (runtime.signal?.aborted) throw runtime.signal.reason;
     const cause =
       e instanceof Error
         ? { kind: "ERROR" as const, name: e.name, message: e.message }

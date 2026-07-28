@@ -380,6 +380,11 @@ export class SanaStore {
         tokenize = 'unicode61 remove_diacritics 2'
       );
 
+      CREATE TABLE IF NOT EXISTS line_fts_state (
+        meeting_id TEXT PRIMARY KEY REFERENCES transcripts(meeting_id) ON DELETE CASCADE,
+        transcript_fetched_ms INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS sync_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         phase TEXT NOT NULL,
@@ -697,6 +702,7 @@ export class SanaStore {
   // ---- transcripts -------------------------------------------------------
 
   saveTranscript(row: Omit<TranscriptRow, "fetched_ms">): void {
+    const fetchedMs = Date.now();
     const tx = this.db.transaction(() => {
       this.db
         .prepare(
@@ -707,8 +713,9 @@ export class SanaStore {
              word_count = excluded.word_count, segment_count = excluded.segment_count,
              fetched_ms = excluded.fetched_ms`
         )
-        .run({ ...row, fetched_ms: Date.now() });
+        .run({ ...row, fetched_ms: fetchedMs });
       this.indexLines(row.meeting_id, row.json);
+      this.markSearchIndexed(row.meeting_id, fetchedMs);
       // Transcript changed -> its embeddings are stale; force a re-embed.
       this.db.prepare(`DELETE FROM line_embeddings WHERE meeting_id = ?`).run(row.meeting_id);
     });
@@ -755,6 +762,17 @@ export class SanaStore {
     }
     const ins = this.db.prepare(`INSERT INTO line_fts (text, meeting_id, line_no) VALUES (?, ?, ?)`);
     for (const l of lines) ins.run(l.text, meetingId, l.n);
+  }
+
+  private markSearchIndexed(meetingId: string, fetchedMs: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO line_fts_state (meeting_id, transcript_fetched_ms)
+         VALUES (?, ?)
+         ON CONFLICT(meeting_id) DO UPDATE SET
+           transcript_fetched_ms = excluded.transcript_fetched_ms`,
+      )
+      .run(meetingId, fetchedMs);
   }
 
   getTranscript(meetingId: string): TranscriptRow | null {
@@ -837,17 +855,28 @@ export class SanaStore {
 
   private searchIndexReady = false;
 
-  /** Backfill the FTS index from existing transcripts if it is empty. */
+  /** Backfill transcripts that predate or are missing from the FTS index. */
   private ensureSearchIndex(): void {
     if (this.searchIndexReady) return;
-    const n = (this.db.prepare(`SELECT COUNT(*) c FROM line_fts`).get() as { c: number }).c;
-    if (n === 0) {
-      const rows = this.db.prepare(`SELECT meeting_id, json FROM transcripts`).all() as {
+    const repairs = this.db
+      .prepare(
+        `SELECT t.meeting_id, t.json, t.fetched_ms
+         FROM transcripts t
+         LEFT JOIN line_fts_state s ON s.meeting_id = t.meeting_id
+         WHERE s.meeting_id IS NULL
+            OR s.transcript_fetched_ms <> t.fetched_ms`,
+      )
+      .all() as Array<{
         meeting_id: string;
         json: string;
-      }[];
+        fetched_ms: number;
+      }>;
+    if (repairs.length > 0) {
       const tx = this.db.transaction(() => {
-        for (const r of rows) this.indexLines(r.meeting_id, r.json);
+        for (const repair of repairs) {
+          this.indexLines(repair.meeting_id, repair.json);
+          this.markSearchIndexed(repair.meeting_id, repair.fetched_ms);
+        }
       });
       tx();
     }
@@ -1741,6 +1770,7 @@ export class SanaStore {
       // an authoritative identity and a successful complete list response.
       this.db.exec(`
         DELETE FROM line_fts;
+        DELETE FROM line_fts_state;
         DELETE FROM line_embeddings;
         DELETE FROM meeting_metadata;
         DELETE FROM transcripts;

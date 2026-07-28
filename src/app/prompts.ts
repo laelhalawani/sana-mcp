@@ -15,6 +15,10 @@ import {
   syncStatusPrompt,
   type SyncStatusPromptResult,
 } from "./status-prompt.js";
+import {
+  searchPrompt,
+  type SearchPromptResult,
+} from "./search-prompt.js";
 import { textInputPrompt } from "./text-prompt.js";
 
 export interface AppPromptChoice<Value extends string> {
@@ -31,6 +35,7 @@ export interface AppPrompts {
   }): Promise<Value>;
   input(message: string): Promise<string | null>;
   meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult>;
+  search(runtime: AppRuntime): Promise<SearchPromptResult>;
   syncStatus(runtime: AppRuntime): Promise<SyncStatusPromptResult>;
 }
 
@@ -127,6 +132,16 @@ export class TerminalAppPrompts implements AppPrompts {
 
   meetingBrowser(runtime: AppRuntime): Promise<MeetingBrowserResult> {
     return meetingBrowserPrompt(
+      { runtime, output: this.outputStream, ui: this.ui },
+      {
+        input: this.inputStream as NodeJS.ReadableStream,
+        output: this.outputStream as NodeJS.WritableStream,
+      },
+    );
+  }
+
+  search(runtime: AppRuntime): Promise<SearchPromptResult> {
+    return searchPrompt(
       { runtime, output: this.outputStream, ui: this.ui },
       {
         input: this.inputStream as NodeJS.ReadableStream,

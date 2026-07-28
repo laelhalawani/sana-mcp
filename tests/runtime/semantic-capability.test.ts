@@ -23,28 +23,18 @@ import {
 
 describe("semantic build capability", () => {
   test("keeps an absent request disabled for every build capability", () => {
-    expect(resolveSemanticCapability(false, "keyword")).toEqual({ kind: "disabled" });
+    expect(resolveSemanticCapability(false, "bundled")).toEqual({ kind: "disabled" });
     expect(resolveSemanticCapability(false, "source-semantic")).toEqual({
       kind: "disabled",
     });
   });
 
-  test("allows explicit semantic mode only in source-semantic builds", () => {
+  test("allows explicit semantic mode in source and bundled builds", () => {
     expect(resolveSemanticCapability(true, "source-semantic")).toEqual({
       kind: "available",
     });
-    const unsupported = resolveSemanticCapability(true, "keyword");
-    expect(unsupported.kind).toBe("unsupported");
-    if (unsupported.kind === "unsupported") {
-      expect(unsupported.message).toContain("keyword search only");
-    }
-  });
-
-  test("represents unsupported explicit requests as a typed degradation", () => {
-    expect(resolveSemanticCapability(true, "keyword")).toEqual({
-      kind: "unsupported",
-      message:
-        "This standalone build supports keyword search only; semantic search is available from source builds.",
+    expect(resolveSemanticCapability(true, "bundled")).toEqual({
+      kind: "available",
     });
   });
 
@@ -370,6 +360,94 @@ describe("semantic embedding lifecycle", () => {
     await Promise.all([first, second]);
     await Promise.resolve();
     expect(disposals).toBe(1);
+  });
+
+  test("does not cancel a shared load while another caller still awaits it", async () => {
+    const load = deferred<EmbeddingPipe>();
+    const controller = new AbortController();
+    let loadSignal: AbortSignal | undefined;
+    const pipe: EmbeddingPipe = async (texts) => output(texts.length);
+    const runtime = createEmbeddingRuntime({
+      load: (signal) => {
+        loadSignal = signal;
+        return load.promise;
+      },
+      idleMs: 60_000,
+      cancelLoadWhenUnused: true,
+    });
+
+    const cancelled = runtime.embed(["cancelled"], controller.signal);
+    const continuing = runtime.embed(["continuing"]);
+    controller.abort(new Error("search cancelled"));
+    await expect(cancelled).rejects.toThrow("search cancelled");
+    expect(loadSignal?.aborted).toBe(false);
+    load.resolve(pipe);
+    await expect(continuing).resolves.toHaveLength(1);
+    await runtime.unload();
+  });
+
+  test("restarts an abandoned cancelable load for a replacement caller", async () => {
+    const loads = [deferred<EmbeddingPipe>(), deferred<EmbeddingPipe>()];
+    const signals: AbortSignal[] = [];
+    let loadIndex = 0;
+    const pipe: EmbeddingPipe = async (texts) => output(texts.length);
+    const runtime = createEmbeddingRuntime({
+      load: (signal) => {
+        if (signal) signals.push(signal);
+        return loads[loadIndex++]!.promise;
+      },
+      idleMs: 60_000,
+      cancelLoadWhenUnused: true,
+    });
+    const controller = new AbortController();
+
+    const cancelled = runtime.embed(["cancelled"], controller.signal);
+    controller.abort(new Error("search cancelled"));
+    await expect(cancelled).rejects.toThrow("search cancelled");
+    expect(signals[0]!.aborted).toBe(true);
+
+    const replacement = runtime.embed(["replacement"]);
+    expect(loadIndex).toBe(2);
+    loads[1]!.resolve(pipe);
+    await expect(replacement).resolves.toHaveLength(1);
+    loads[0]!.reject(new Error("abandoned load"));
+    await runtime.unload();
+  });
+
+  test("serializes inference against the shared WASM pipeline", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const releases = [deferred<EmbeddingOutput>(), deferred<EmbeddingOutput>()];
+    let call = 0;
+    const pipe: EmbeddingPipe = async () => {
+      const index = call++;
+      active++;
+      maximumActive = Math.max(maximumActive, active);
+      try {
+        return await releases[index].promise;
+      } finally {
+        active--;
+      }
+    };
+    const runtime = createEmbeddingRuntime({
+      load: async () => pipe,
+      idleMs: 60_000,
+    });
+    const first = runtime.embed(["first"]);
+    const second = runtime.embed(["second"]);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(call).toBe(1);
+    releases[0].resolve(output(1));
+    await first;
+    await Promise.resolve();
+    expect(call).toBe(2);
+    releases[1].resolve(output(1));
+    await second;
+    expect(maximumActive).toBe(1);
+    await runtime.unload();
   });
 });
 
