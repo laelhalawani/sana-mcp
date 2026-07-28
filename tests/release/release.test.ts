@@ -40,6 +40,7 @@ import { standaloneSemanticSmokeEvidence } from "../../src/semantic/smoke-contra
 
 const sourceCommit = "0123456789abcdef0123456789abcdef01234567";
 const linuxOnlyTest = process.platform === "linux" ? test : test.skip;
+const RESOLVER_PROCESS_TIMEOUT_MS = 5_000;
 
 async function makeArtifacts(directory: string): Promise<void> {
   for (const target of RELEASE_TARGETS) {
@@ -847,6 +848,7 @@ linuxOnlyTest("release resolver distinguishes version reuse, new versions, and l
       const result = spawnSync("/bin/bash", ["-c", resolver], {
         cwd: temporary,
         encoding: "utf8",
+        timeout: RESOLVER_PROCESS_TIMEOUT_MS,
         env: {
           ...process.env,
           PATH: `${commands}:${process.env.PATH ?? ""}`,
@@ -871,6 +873,8 @@ linuxOnlyTest("release resolver distinguishes version reuse, new versions, and l
           GITHUB_OUTPUT: output,
         },
       });
+      if (result.error !== undefined) throw result.error;
+      assert.equal(result.signal, null, "release resolver subprocess was terminated");
       const outputs =
         result.status === 0
           ? Object.fromEntries(
