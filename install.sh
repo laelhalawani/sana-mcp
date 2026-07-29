@@ -2,8 +2,8 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.16 sh
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.16/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.17 sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.17/install.sh | sh
 set -eu
 set -f
 umask 077
@@ -38,14 +38,16 @@ path_preimage_sha256=""
 dest=""
 receipt=""
 preserve_tmp=0
+retain_new_runtime=0
+live_state_touched=0
+download_pid=""
+download_progress_pid=""
+download_progress_active=0
+setup_pid=""
+setup_result_file=""
+setup_transaction_active=0
 config_journal_dir=""
 config_journal_file=""
-config_transaction_state=none
-config_outcome=""
-config_authentication=""
-retain_new_runtime=0
-config_journal_preexisting=0
-live_state_touched=0
 
 fail() {
   printf 'sana-mcp: %s\n' "$*" >&2
@@ -161,237 +163,6 @@ cleanup_unowned_path_lock_artifacts() {
   [ "$unowned_path_cleanup_failed" = "0" ]
 }
 
-read_config_transaction_result() {
-  result_file=$1
-  expected_operation=$2
-  result_status=$3
-  [ -f "$result_file" ] && [ ! -L "$result_file" ] || return 1
-  [ "$(wc -l < "$result_file" | tr -d '[:space:]')" = "1" ] || return 1
-  parsed_file="$tmp_dir/config-result.parsed"
-  SANA_MCP_EXPECTED_JOURNAL=$config_journal_file awk '
-    function bad() { exit 2 }
-    function string_value(    c, esc, hex) {
-      if (substr(line, position, 1) != "\"") bad()
-      position++
-      parsed = ""
-      escaped = 0
-      while (position <= length(line)) {
-        c = substr(line, position, 1)
-        position++
-        if (c == "\"") return
-        if (c == "\\") {
-          escaped = 1
-          if (position > length(line)) bad()
-          esc = substr(line, position, 1)
-          position++
-          if (esc == "u") {
-            hex = substr(line, position, 4)
-            if (length(hex) != 4 ||
-                hex !~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/) bad()
-            position += 4
-          } else if (esc !~ /^["\\\/bfnrt]$/) bad()
-          if (esc == "\"") parsed = parsed "\""
-          else if (esc == "\\") parsed = parsed "\\"
-          else if (esc == "/") parsed = parsed "/"
-          else parsed = parsed "?"
-        } else {
-          if (c ~ /[[:cntrl:]]/) bad()
-          parsed = parsed c
-        }
-      }
-      bad()
-    }
-    function number_value(    c) {
-      parsed = ""
-      c = substr(line, position, 1)
-      if (c == "0") {
-        parsed = c
-        position++
-        if (substr(line, position, 1) ~ /[0-9]/) bad()
-        return
-      }
-      if (c !~ /[1-9]/) bad()
-      while (substr(line, position, 1) ~ /[0-9]/) {
-        parsed = parsed substr(line, position, 1)
-        position++
-      }
-    }
-    NR != 1 { bad() }
-    {
-      line = $0
-      position = 1
-      if (substr(line, position, 1) != "{") bad()
-      position++
-      optional = ""
-      count = 0
-      while (1) {
-        string_value()
-        if (escaped) bad()
-        key = parsed
-        if (seen[key]++) bad()
-        if (substr(line, position, 1) != ":") bad()
-        position++
-        count++
-        if (count <= 5) {
-          split("transactionProtocol operation outcome appliedCount noopCount", required, " ")
-          if (key != required[count]) bad()
-        } else {
-          if (key !~ /^(journal|errorCode|message|disposition|authentication)$/) bad()
-          optional = optional (optional == "" ? "" : ",") key
-        }
-        if (key == "transactionProtocol" || key == "appliedCount" || key == "noopCount") {
-          number_value()
-        } else {
-          string_value()
-        }
-        value = parsed
-        if (key == "transactionProtocol" && value != "1") bad()
-        if (key == "operation") operation = value
-        if (key == "outcome") outcome = value
-        if (key == "appliedCount") applied = value
-        if (key == "noopCount") noop = value
-        if (key == "journal") {
-          if (value == "" || value != ENVIRON["SANA_MCP_EXPECTED_JOURNAL"]) bad()
-          journal = "present"
-        }
-        if (key == "errorCode") { if (value == "") bad(); error = "present" }
-        if (key == "message") { if (value == "") bad(); message = "present" }
-        if (key == "errorCode" &&
-            value == "CONFIG_TRANSACTION_INTERACTION_UNAVAILABLE")
-          interaction_code = "canonical"
-        if (key == "message" &&
-            value == "an interactive terminal is required for client selection")
-          interaction_message = "canonical"
-        if (key == "disposition") disposition = value
-        if (key == "authentication") authentication = value
-        c = substr(line, position, 1)
-        if (c == "}") { position++; break }
-        if (c != ",") bad()
-        position++
-      }
-      if (position != length(line) + 1 || count < 5) bad()
-      if (optional != "" &&
-          optional != "disposition,authentication" &&
-          optional != "disposition,authentication,errorCode,message" &&
-          optional != "errorCode,message" &&
-          optional != "journal" &&
-          optional != "journal,errorCode,message" &&
-          optional != "journal,disposition,authentication" &&
-          optional != "journal,errorCode,message,disposition,authentication" &&
-          optional != "journal,disposition,authentication,errorCode,message") bad()
-      printf "%s %s %s %s %s %s %s %s %s\n",
-        operation, outcome, applied, noop,
-        disposition == "" ? "-" : disposition,
-        authentication == "" ? "-" : authentication,
-        journal == "" ? "absent" : journal,
-        error == "present" && message == "present" ? "error" :
-          error == "" && message == "" ? "none" : "partial",
-        interaction_code == "canonical" &&
-          interaction_message == "canonical" ? "canonical" : "other"
-    }
-  ' "$result_file" > "$parsed_file" || return 1
-  IFS=' ' read -r config_operation config_outcome applied_count noop_count \
-    config_disposition config_authentication config_journal_field config_error_fields \
-    config_interaction_details \
-    < "$parsed_file" || return 1
-  [ "$config_operation" = "$expected_operation" ] || return 1
-  [ "$config_error_fields" != "partial" ] || return 1
-  case "$config_outcome" in
-    applied|no-mutation|interaction-unavailable|configuration-unavailable|authentication-incomplete|failed-rolled-back|rollback-incomplete|conflict|journal-ambiguous|journal-persistence-unknown|journal-unavailable) ;;
-    *) return 1 ;;
-  esac
-  case "$config_disposition" in
-    -|configured|no-clients|no-changes|cancelled|interaction-unavailable|configuration-unavailable|authentication-incomplete) ;;
-    *) return 1 ;;
-  esac
-  case "$config_authentication" in
-    -|not-attempted|ready|skipped|retained|unconfirmed) ;;
-    *) return 1 ;;
-  esac
-  if [ "$config_outcome" = "applied" ]; then
-    case "$applied_count" in 0) return 1 ;; esac
-    [ "$config_journal_field" = "present" ] || return 1
-  else
-    [ "$applied_count" = "0" ] || return 1
-  fi
-  if [ "$expected_operation" = "apply" ]; then
-    [ "$config_disposition" != "-" ] && [ "$config_authentication" != "-" ] || return 1
-    case "$result_status:$config_outcome" in
-      0:applied)
-        [ "$config_disposition" = "configured" ] &&
-          [ "$config_journal_preexisting" = "0" ] &&
-          [ "$config_authentication" != "unconfirmed" ] &&
-          [ "$config_authentication" != "retained" ] &&
-          [ "$config_error_fields" = "none" ] || return 1
-        ;;
-      0:no-mutation)
-        [ "$config_journal_field" = "absent" ] &&
-          { [ "$config_disposition" = "no-clients" ] ||
-            [ "$config_disposition" = "no-changes" ] ||
-            [ "$config_disposition" = "cancelled" ]; } &&
-          [ "$config_authentication" != "unconfirmed" ] &&
-          [ "$config_authentication" != "retained" ] &&
-          [ "$config_error_fields" = "none" ] || return 1
-        ;;
-      1:interaction-unavailable|1:configuration-unavailable|1:authentication-incomplete|1:failed-rolled-back|1:journal-unavailable)
-        [ "$config_error_fields" = "error" ] || return 1
-        [ "$config_authentication" != "ready" ] || return 1
-        case "$config_outcome:$config_disposition" in
-          interaction-unavailable:interaction-unavailable|configuration-unavailable:configuration-unavailable|authentication-incomplete:authentication-incomplete|journal-unavailable:configuration-unavailable|failed-rolled-back:interaction-unavailable|failed-rolled-back:configuration-unavailable|failed-rolled-back:authentication-incomplete) ;;
-          *) return 1 ;;
-        esac
-        ;;
-      2:rollback-incomplete|2:conflict|2:journal-ambiguous|2:journal-persistence-unknown)
-        [ "$config_error_fields" = "error" ] || return 1
-        [ "$config_authentication" != "ready" ] || return 1
-        case "$config_outcome:$config_disposition" in
-          conflict:configuration-unavailable|journal-ambiguous:configuration-unavailable|rollback-incomplete:interaction-unavailable|rollback-incomplete:configuration-unavailable|rollback-incomplete:authentication-incomplete|journal-persistence-unknown:interaction-unavailable|journal-persistence-unknown:configuration-unavailable|journal-persistence-unknown:authentication-incomplete) ;;
-          *) return 1 ;;
-        esac
-        ;;
-      *) return 1 ;;
-    esac
-  else
-    [ "$config_disposition" = "-" ] && [ "$config_authentication" = "-" ] || return 1
-    case "$result_status:$config_outcome" in
-      0:failed-rolled-back)
-        [ "$config_journal_field" = "present" ] &&
-          [ "$config_error_fields" = "none" ] || return 1
-        ;;
-      1:journal-unavailable|2:rollback-incomplete|2:conflict|2:journal-persistence-unknown)
-        [ "$config_error_fields" = "error" ] || return 1
-        ;;
-      *) return 1 ;;
-    esac
-  fi
-  return 0
-}
-
-config_journal_is_regular() {
-  [ -n "$config_journal_file" ] &&
-    [ -f "$config_journal_file" ] &&
-    [ ! -L "$config_journal_file" ]
-}
-
-remove_completed_config_journal() {
-  if config_journal_is_regular; then
-    rm -f "$config_journal_file" || return 1
-  elif [ -e "$config_journal_file" ] || [ -L "$config_journal_file" ]; then
-    return 1
-  fi
-  [ ! -d "$config_journal_dir" ] || rmdir "$config_journal_dir"
-}
-
-report_authentication_state() {
-  case "$config_authentication" in
-    ready) printf '%s\n' "Sana authentication was confirmed ready." ;;
-    retained) printf '%s\n' "Existing Sana authentication was retained." ;;
-    unconfirmed) printf '%s\n' "Sana authentication may have been retained but could not be confirmed." ;;
-    skipped) printf '%s\n' "Sana authentication was not changed." ;;
-    not-attempted|"") ;;
-  esac
-}
-
 reconcile_retained_runtime() {
   [ -n "$dest" ] && [ -x "$dest" ] || return 0
   if [ "$old_present" = "1" ]; then
@@ -437,11 +208,270 @@ record_cleanup_failure() {
   fi
 }
 
+read_config_transaction_properties() {
+  config_result_file=$1
+  config_expected_operation=$2
+  config_result_status=$3
+  CT_format=""; CT_protocol=""; CT_operation=""; CT_outcome=""
+  CT_applied=""; CT_noop=""; CT_journal=""; CT_disposition=""
+  CT_authentication=""; CT_error=""; CT_seen=" "
+  while IFS= read -r config_line || [ -n "$config_line" ]; do
+    case "$config_line" in
+      *=*) config_key=${config_line%%=*}; config_value=${config_line#*=} ;;
+      *) return 1 ;;
+    esac
+    case "$CT_seen" in *" $config_key "*) return 1 ;; esac
+    CT_seen="$CT_seen$config_key "
+    case "$config_key" in
+      format) CT_format=$config_value ;;
+      transactionProtocol) CT_protocol=$config_value ;;
+      operation) CT_operation=$config_value ;;
+      outcome) CT_outcome=$config_value ;;
+      appliedCount) CT_applied=$config_value ;;
+      noopCount) CT_noop=$config_value ;;
+      journal) CT_journal=$config_value ;;
+      disposition) CT_disposition=$config_value ;;
+      authentication) CT_authentication=$config_value ;;
+      error) CT_error=$config_value ;;
+      *) return 1 ;;
+    esac
+  done < "$config_result_file"
+  [ "$CT_format" = "sana-mcp-config-transaction-v1" ] &&
+    [ "$CT_protocol" = "1" ] &&
+    [ "$CT_operation" = "$config_expected_operation" ] || return 1
+  case "$CT_applied" in ''|*[!0-9]*) return 1 ;; esac
+  case "$CT_noop" in ''|*[!0-9]*) return 1 ;; esac
+  case "$CT_outcome" in
+    applied|no-mutation|interaction-unavailable|configuration-unavailable|authentication-incomplete|failed-rolled-back|rollback-incomplete|conflict|journal-ambiguous|journal-persistence-unknown|journal-unavailable) ;;
+    *) return 1 ;;
+  esac
+  case "$CT_journal" in present|absent) ;; *) return 1 ;; esac
+  case "$CT_disposition" in
+    absent|configured|no-clients|no-changes|cancelled|interaction-unavailable|configuration-unavailable|authentication-incomplete) ;;
+    *) return 1 ;;
+  esac
+  case "$CT_authentication" in
+    absent|not-attempted|ready|skipped|retained|unconfirmed) ;;
+    *) return 1 ;;
+  esac
+  case "$CT_error" in present|absent) ;; *) return 1 ;; esac
+  if [ "$config_expected_operation" = "apply" ]; then
+    case "$config_result_status:$CT_outcome" in
+      0:applied|0:no-mutation|1:interaction-unavailable|1:configuration-unavailable|1:authentication-incomplete|1:failed-rolled-back|1:journal-unavailable|2:rollback-incomplete|2:conflict|2:journal-ambiguous|2:journal-persistence-unknown) ;;
+      *) return 1 ;;
+    esac
+    case "$config_result_status:$CT_outcome" in
+      0:applied)
+        [ "$CT_disposition" = "configured" ] &&
+          { [ "$CT_authentication" = "ready" ] ||
+            [ "$CT_authentication" = "skipped" ]; } || return 1
+        ;;
+      0:no-mutation)
+        case "$CT_disposition" in no-clients|no-changes|cancelled) ;; *) return 1 ;; esac
+        ;;
+      1:failed-rolled-back)
+        [ "$CT_applied" = "0" ] && [ "$CT_journal" = "present" ] &&
+          [ "$CT_disposition" != "absent" ] &&
+          [ "$CT_disposition" != "configured" ] &&
+          [ "$CT_authentication" != "ready" ] || return 1
+        ;;
+    esac
+  else
+    case "$config_result_status:$CT_outcome" in
+      0:failed-rolled-back|1:journal-unavailable|2:rollback-incomplete|2:conflict|2:journal-persistence-unknown) ;;
+      *) return 1 ;;
+    esac
+  fi
+  case "$config_result_status" in
+    0) [ "$CT_error" = "absent" ] || return 1 ;;
+    *) [ "$CT_error" = "present" ] || return 1 ;;
+  esac
+  if [ "$CT_outcome" = "applied" ]; then
+    [ "$CT_applied" != "0" ] && [ "$CT_journal" = "present" ] || return 1
+  elif [ "$CT_outcome" = "no-mutation" ]; then
+    [ "$CT_applied" = "0" ] && [ "$CT_journal" = "absent" ] || return 1
+  fi
+}
+
+remove_completed_config_journal() {
+  if [ "$CT_journal" = "present" ]; then
+    [ -f "$config_journal_file" ] && [ ! -L "$config_journal_file" ] || return 1
+    [ -d "$config_journal_dir" ] && [ ! -L "$config_journal_dir" ] || return 1
+    completed_config_sha256=$(hash_file "$config_journal_file") || return 1
+    [ "${#completed_config_sha256}" -eq 64 ] || return 1
+    case "$completed_config_sha256" in *[!a-f0-9]*) return 1 ;; esac
+    completed_config_marker="$config_journal_dir/installer-completed.properties"
+    [ ! -e "$completed_config_marker" ] && [ ! -L "$completed_config_marker" ] || return 1
+    {
+      printf '%s\n' 'format=sana-mcp-completed-config-v1'
+      printf 'journalSha256=%s\n' "$completed_config_sha256"
+    } > "$completed_config_marker" || {
+      rm -f "$completed_config_marker" || :
+      return 1
+    }
+    chmod 600 "$completed_config_marker" || return 1
+    completed_config_dir=$(mktemp -d "$install_dir/.sana-mcp-config-completed.XXXXXX") || return 1
+    rmdir "$completed_config_dir" || return 1
+    mv "$config_journal_dir" "$completed_config_dir" || return 1
+    remove_retired_config_directory "$completed_config_dir" || return 1
+  else
+    [ ! -e "$config_journal_dir" ] && [ ! -L "$config_journal_dir" ] || return 1
+  fi
+}
+
+remove_retired_config_directory() {
+  retired_config_dir=$1
+  [ -d "$retired_config_dir" ] && [ ! -L "$retired_config_dir" ] || return 1
+  retired_config_marker="$retired_config_dir/installer-completed.properties"
+  retired_config_file="$retired_config_dir/client-config-transaction.json"
+  [ -f "$retired_config_marker" ] && [ ! -L "$retired_config_marker" ] || return 1
+  [ "$(wc -l < "$retired_config_marker" | tr -d '[:space:]')" = "2" ] || return 1
+  IFS= read -r retired_format < "$retired_config_marker" || return 1
+  retired_sha256=$(awk '
+    NR == 2 && /^journalSha256=[a-f0-9][a-f0-9]*$/ {
+      sub(/^journalSha256=/, "")
+      print
+    }
+  ' "$retired_config_marker")
+  [ "$retired_format" = "format=sana-mcp-completed-config-v1" ] &&
+    [ "${#retired_sha256}" -eq 64 ] || return 1
+  if [ -e "$retired_config_file" ] || [ -L "$retired_config_file" ]; then
+    [ -f "$retired_config_file" ] && [ ! -L "$retired_config_file" ] &&
+      [ "$(hash_file "$retired_config_file")" = "$retired_sha256" ] || return 1
+    rm -f "$retired_config_file" || return 1
+  fi
+  rm -f "$retired_config_marker" || return 1
+  rmdir "$retired_config_dir" || return 1
+}
+
+cleanup_completed_config_directories() {
+  canonical_completed_marker="$config_journal_dir/installer-completed.properties"
+  if [ -e "$canonical_completed_marker" ] || [ -L "$canonical_completed_marker" ]; then
+    if ! remove_retired_config_directory "$config_journal_dir"; then
+      rm -f "$canonical_completed_marker" || return 1
+      if [ ! -e "$config_journal_file" ] && [ ! -L "$config_journal_file" ]; then
+        rmdir "$config_journal_dir" || return 1
+      fi
+    fi
+  fi
+  completed_config_count=0
+  for retained_config_dir in "$install_dir"/.sana-mcp-config-completed.*; do
+    [ -e "$retained_config_dir" ] || [ -L "$retained_config_dir" ] || continue
+    completed_config_count=$((completed_config_count + 1))
+    [ "$completed_config_count" -le 32 ] || return 1
+    if [ -d "$retained_config_dir" ] && [ ! -L "$retained_config_dir" ] &&
+      [ ! -e "$retained_config_dir/installer-completed.properties" ] &&
+      [ ! -L "$retained_config_dir/installer-completed.properties" ]; then
+      rmdir "$retained_config_dir" || return 1
+      continue
+    fi
+    remove_retired_config_directory "$retained_config_dir" || return 1
+  done
+}
+
+resolve_interrupted_setup() {
+  if [ -f "$config_journal_file" ] && [ ! -L "$config_journal_file" ]; then
+    rollback_setup_transaction
+  elif [ ! -e "$config_journal_dir" ] && [ ! -L "$config_journal_dir" ]; then
+    return 0
+  elif [ -d "$config_journal_dir" ] && [ ! -L "$config_journal_dir" ]; then
+    rmdir "$config_journal_dir"
+  else
+    return 1
+  fi
+}
+
+rollback_setup_transaction() {
+  [ -n "$config_journal_dir" ] && [ -n "$config_journal_file" ] || return 1
+  [ -f "$config_journal_file" ] && [ ! -L "$config_journal_file" ] || return 1
+  rollback_result=$(mktemp "$install_dir/.sana-mcp-config-rollback.XXXXXX") || return 1
+  setup_pid=""
+  "$dest" __configure-transaction rollback \
+    --journal "$config_journal_dir" \
+    --format properties > "$rollback_result" 2>/dev/null &
+  setup_pid=$!
+  if wait "$setup_pid"; then
+    rollback_status=0
+  else
+    rollback_status=$?
+  fi
+  setup_pid=""
+  if read_config_transaction_properties "$rollback_result" rollback "$rollback_status" &&
+    [ "$CT_outcome" = "failed-rolled-back" ] &&
+    remove_completed_config_journal; then
+    rollback_resolved=0
+  else
+    rollback_resolved=1
+  fi
+  rm -f "$rollback_result" || rollback_resolved=1
+  return "$rollback_resolved"
+}
+
+finalize_committed_cleanup() {
+  [ -n "$tmp_dir" ] || return 0
+  rm -f \
+    "$tmp_dir/bootstrap.properties" \
+    "$tmp_dir/bootstrap.properties.sha256" \
+    "$tmp_dir/release.properties" \
+    "$tmp_dir/release.properties.sha256" \
+    "$tmp_dir/manifest.json" \
+    "$tmp_dir/manifest.json.sha256" \
+    "$tmp_dir/binary" \
+    "$tmp_dir/binary.sha256" \
+    "$tmp_dir/binary-download.error" \
+    "$tmp_dir/binary-download.done" \
+    "$tmp_dir/inspect.properties" \
+    "$tmp_dir/old-binary" \
+    "$tmp_dir/old-receipt" \
+    "$tmp_dir/old-inspect.properties" \
+    "$tmp_dir/lifecycle.properties" \
+    "$tmp_dir/old-path-file" \
+    "$tmp_dir/path-block" \
+    "$tmp_dir/existing-path-block" \
+    "$tmp_dir/path-without-block" \
+    "$tmp_dir/new-receipt" || return 1
+  rmdir "$tmp_dir" || return 1
+  tmp_dir=""
+}
+
 cleanup() {
   cleanup_status=$?
   cleanup_failed=0
   cleanup_error_summary=""
   set +e
+  if [ -n "$download_pid" ]; then
+    kill "$download_pid" 2>/dev/null || :
+    wait "$download_pid" 2>/dev/null || :
+    download_pid=""
+  fi
+  if [ -n "$download_progress_pid" ]; then
+    kill "$download_progress_pid" 2>/dev/null || :
+    wait "$download_progress_pid" 2>/dev/null || :
+    download_progress_pid=""
+  fi
+  if [ -n "$setup_pid" ]; then
+    kill "$setup_pid" 2>/dev/null || :
+    wait "$setup_pid" 2>/dev/null || :
+    setup_pid=""
+  fi
+  if [ "$setup_transaction_active" = "1" ]; then
+    if ! resolve_interrupted_setup; then
+      printf 'sana-mcp: setup recovery is incomplete; rerun the installer.\n' >&2
+    fi
+    setup_transaction_active=0
+  fi
+  if [ -n "$setup_result_file" ]; then
+    rm -f "$setup_result_file" || :
+    setup_result_file=""
+  fi
+  if [ "$download_progress_active" = "1" ]; then
+    if [ "$host_color" = "1" ]; then
+      printf '%s\n' "$color_reset"
+    else
+      printf '\n'
+    fi
+    download_progress_active=0
+  fi
   if [ "$transaction_active" = "1" ] && [ "$committed" = "0" ]; then
     rollback_errors=0
     can_restore=1
@@ -452,30 +482,6 @@ cleanup() {
       can_restore=0
       retain_new_runtime=1
       preserve_tmp=1
-      if refresh_cleanup_lock_ownership &&
-        [ "$config_transaction_state" = "applied" ]; then
-        set +e
-        "$dest" __configure-transaction rollback --journal "$config_journal_dir" \
-          > "$tmp_dir/config-rollback.json"
-        config_rollback_status=$?
-        set +e
-        refresh_cleanup_lock_ownership || :
-        if [ "$cleanup_lock_ownership_lost" = "0" ] &&
-          [ "$config_rollback_status" -eq 0 ] &&
-          read_config_transaction_result "$tmp_dir/config-rollback.json" rollback "$config_rollback_status" &&
-          [ "$config_outcome" = "failed-rolled-back" ]; then
-          config_transaction_state=safe-rolled-back
-          if refresh_cleanup_lock_ownership; then
-            remove_completed_config_journal ||
-              printf 'sana-mcp: client configuration was rolled back, but its completed journal could not be removed: %s\n' "$config_journal_dir" >&2
-          fi
-        else
-          rollback_errors=1
-          if [ "$cleanup_lock_ownership_lost" = "0" ]; then
-            printf 'sana-mcp: client configuration rollback was incomplete; the replacement runtime and recovery journal were retained\n' >&2
-          fi
-        fi
-      fi
       if refresh_cleanup_lock_ownership; then
         reconcile_retained_runtime || rollback_errors=1
         refresh_cleanup_lock_ownership || :
@@ -591,10 +597,6 @@ cleanup() {
     if [ "$retain_new_runtime" = "1" ]; then
       preserve_tmp=1
       printf 'sana-mcp: retained the replacement runtime at %s\n' "$dest" >&2
-      if [ -n "$config_journal_dir" ] &&
-        { [ -e "$config_journal_file" ] || [ -L "$config_journal_file" ]; }; then
-        printf 'sana-mcp: client configuration recovery journal: %s\n' "$config_journal_dir" >&2
-      fi
       printf 'sana-mcp: previous runtime backup and recovery inventory: %s\n' "$tmp_dir" >&2
     fi
     if [ "$rollback_errors" != "0" ]; then
@@ -639,10 +641,12 @@ cleanup() {
         "$tmp_dir/release.properties" \
         "$tmp_dir/release.properties.sha256" \
         "$tmp_dir/manifest.json" \
-        "$tmp_dir/manifest.json.sha256" \
-        "$tmp_dir/binary" \
-        "$tmp_dir/binary.sha256" \
-        "$tmp_dir/inspect.properties"; then
+         "$tmp_dir/manifest.json.sha256" \
+         "$tmp_dir/binary" \
+         "$tmp_dir/binary.sha256" \
+         "$tmp_dir/binary-download.error" \
+         "$tmp_dir/binary-download.done" \
+         "$tmp_dir/inspect.properties"; then
         record_cleanup_failure "the downloaded temporary files could not be removed"
       fi
       if ! rm -f \
@@ -654,10 +658,7 @@ cleanup() {
         "$tmp_dir/path-block" \
         "$tmp_dir/existing-path-block" \
         "$tmp_dir/path-without-block" \
-        "$tmp_dir/new-receipt" \
-        "$tmp_dir/config-apply.json" \
-        "$tmp_dir/config-result.parsed" \
-        "$tmp_dir/config-rollback.json"; then
+        "$tmp_dir/new-receipt"; then
         record_cleanup_failure "the rollback temporary files could not be removed"
       fi
       if ! rmdir "$tmp_dir"; then
@@ -689,6 +690,27 @@ else
   fail "SHA-256 verification requires sha256sum or shasum"
 fi
 
+host_color=0
+if [ -t 1 ] && [ "${TERM:-}" != "dumb" ] && [ -z "${CI:-}" ] &&
+  [ -z "${NO_COLOR+x}" ]; then
+  host_color=1
+fi
+color_cyan=$(printf '\033[36m')
+color_gray=$(printf '\033[90m')
+color_white=$(printf '\033[37m')
+color_green=$(printf '\033[32m')
+color_reset=$(printf '\033[0m')
+
+host_line() {
+  host_line_color=$1
+  host_line_text=$2
+  if [ "$host_color" = "1" ]; then
+    printf '%s%s%s\n' "$host_line_color" "$host_line_text" "$color_reset"
+  else
+    printf '%s\n' "$host_line_text"
+  fi
+}
+
 download() {
   curl -fL \
     --proto '=https' \
@@ -705,6 +727,36 @@ download() {
 }
 
 download_binary() {
+  download_url=$1
+  download_destination=$2
+  download_total=$(
+    curl -fIL \
+      --proto '=https' \
+      --proto-redir '=https' \
+      --max-redirs 5 \
+      --connect-timeout 3 \
+      --max-time 5 \
+      --silent \
+      --show-error \
+      "$download_url" 2>/dev/null |
+      awk '
+        BEGIN { size = 0 }
+        toupper($1) ~ /^HTTP\// { size = 0 }
+        tolower($1) == "content-length:" {
+          value = $2
+          sub(/\r$/, "", value)
+          if (value ~ /^[0-9]+$/) size = value
+        }
+        END { print size }
+      '
+  ) || download_total=0
+  case "$download_total" in
+    ''|*[!0-9]*) download_total=0 ;;
+  esac
+
+  : > "$download_destination"
+  rm -f "$tmp_dir/binary-download.done"
+  download_started=$(date +%s)
   curl -fL \
     --proto '=https' \
     --proto-redir '=https' \
@@ -713,9 +765,114 @@ download_binary() {
     --max-time 600 \
     --retry 2 \
     --retry-delay 1 \
-    --progress-bar \
-    "$1" \
-    -o "$2"
+    --silent \
+    --show-error \
+    "$download_url" \
+    -o "$download_destination" \
+    2> "$tmp_dir/binary-download.error" &
+  download_pid=$!
+
+  if [ -t 1 ]; then
+    (
+      while [ ! -f "$tmp_dir/binary-download.done" ]; do
+        download_now=$(date +%s)
+        download_read=$(wc -c < "$download_destination" | tr -d '[:space:]')
+        format_download_progress "$download_read" "$download_total" "$((download_now - download_started))" "$color_cyan" || exit 1
+        sleep 0.1
+      done
+    ) &
+    download_progress_pid=$!
+    download_progress_active=1
+  fi
+
+  if wait "$download_pid"; then
+    download_status=0
+  else
+    download_status=$?
+  fi
+  download_pid=""
+  : > "$tmp_dir/binary-download.done"
+  if [ -n "$download_progress_pid" ]; then
+    wait "$download_progress_pid" 2>/dev/null || :
+    download_progress_pid=""
+  fi
+  download_read=$(wc -c < "$download_destination" | tr -d '[:space:]')
+  download_now=$(date +%s)
+  if [ "$download_status" -eq 0 ]; then
+    format_download_progress "$download_read" "$download_total" "$((download_now - download_started))" "$color_green" || return 1
+    printf '\n'
+    download_progress_active=0
+    return 0
+  fi
+  if [ "$download_progress_active" = "1" ]; then
+    if [ "$host_color" = "1" ]; then
+      printf '%s\n' "$color_reset"
+    else
+      printf '\n'
+    fi
+    download_progress_active=0
+  fi
+  if [ -s "$tmp_dir/binary-download.error" ]; then
+    while IFS= read -r download_error_line || [ -n "$download_error_line" ]; do
+      printf '%s\n' "$download_error_line" >&2
+    done < "$tmp_dir/binary-download.error"
+  fi
+  return "$download_status"
+}
+
+format_download_progress() {
+  progress_read=$1
+  progress_total=$2
+  progress_elapsed=$3
+  progress_color=$4
+  if ! progress_text=$(LC_ALL=C awk \
+    -v bytes="$progress_read" \
+    -v total="$progress_total" \
+    -v elapsed="$progress_elapsed" '
+    function decimal(value, text) {
+      text = sprintf("%.1f", value)
+      sub(/\.0$/, "", text)
+      return text
+    }
+    BEGIN {
+      if (elapsed < 0.001) elapsed = 0.001
+      speed = bytes / elapsed
+      read_mb = decimal(bytes / 1048576)
+      speed_mb = decimal(speed / 1048576)
+      if (total <= 0) {
+        printf "  %s MB  %s MB/s", read_mb, speed_mb
+        exit
+      }
+      ratio = bytes / total
+      if (ratio < 0) ratio = 0
+      if (ratio > 1) ratio = 1
+      percent = int(ratio * 100)
+      total_mb = decimal(total / 1048576)
+      while (length(read_mb) < length(total_mb)) read_mb = " " read_mb
+      remaining = speed > 0 ? (total - bytes) / speed : 0
+      if (remaining < 0) remaining = 0
+      minutes = int(remaining / 60) % 60
+      seconds = int(remaining) % 60
+      fill = int(ratio * 24)
+      bar = ""
+      for (position = 0; position < 24; position++) {
+        bar = bar (position < fill ? "#" : "-")
+      }
+      printf "  [%s] %3d%%  %s/%s MB  %s MB/s  ETA %02d:%02d", \
+        bar, percent, read_mb, total_mb, speed_mb, minutes, seconds
+    }
+  '); then
+    return 1
+  fi
+  if [ -t 1 ]; then
+    if [ "$host_color" = "1" ]; then
+      printf '\r%s%s%s ' "$progress_color" "$progress_text" "$color_reset"
+    else
+      printf '\r%s ' "$progress_text"
+    fi
+  else
+    printf '%s' "$progress_text"
+  fi
 }
 
 validate_release_tag() {
@@ -1208,7 +1365,10 @@ else
 fi
 
 base_url="https://github.com/$repo/releases/download/$version"
-printf 'Installing sana-mcp %s (%s)\n' "$version" "$target"
+printf '\n'
+host_line "$color_cyan" "Installing sana-mcp $version"
+host_line "$color_gray" "  Platform: $target"
+host_line "$color_white" "  Downloading verified binary..."
 
 download "$base_url/$metadata_name" "$tmp_dir/release.properties" ||
   fail "could not download release metadata"
@@ -1324,11 +1484,6 @@ else
     path_profile=none
   fi
 fi
-if [ -n "${HOME:-}" ]; then
-  current_shell_path_profile=$(select_path_profile)
-else
-  current_shell_path_profile=none
-fi
 should_run_after_install=$old_was_running
 if [ "$old_present" = "1" ] && [ "${SANA_MCP_UPDATE:-0}" != "1" ]; then
   should_run_after_install=1
@@ -1382,13 +1537,6 @@ mv -f "$staged_binary" "$dest"
 staged_binary=""
 
 verify_or_apply_path_block "$path_profile"
-if [ "$current_shell_path_profile" = "none" ]; then
-  printf "PATH was not changed because no matching shell startup file exists.\n"
-  printf "Add %s to PATH manually, or run the binary by its absolute path.\n" "$install_dir"
-elif [ "$path_profile" != "$current_shell_path_profile" ]; then
-  printf "PATH was not changed for the current shell because the installer-owned PATH block belongs to a different shell startup file.\n"
-  printf "Add %s to PATH manually, or run the binary by its absolute path.\n" "$install_dir"
-fi
 PATH="$install_dir:${PATH:-}"; export PATH
 
 {
@@ -1412,123 +1560,6 @@ revalidate_path_block_for_commit "$path_profile"
 assert_installer_locks_owned
 mv -f "$staged_receipt" "$receipt"
 staged_receipt=""
-
-if [ "$old_present" = "0" ]; then
-  config_journal_dir="$install_dir/.sana-mcp-config-transaction"
-  config_journal_file="$config_journal_dir/client-config-transaction.json"
-  [ ! -L "$config_journal_dir" ] ||
-    fail "client configuration journal directory must not be a symbolic link"
-  if [ -e "$config_journal_file" ] || [ -L "$config_journal_file" ]; then
-    config_journal_preexisting=1
-  fi
-fi
-configure_status=0
-config_interactive_attempted=0
-if [ "$old_present" = "1" ]; then
-  config_transaction_state=no-mutation
-elif [ "${SANA_MCP_YES:-0}" = "1" ]; then
-  live_state_touched=1
-  assert_installer_locks_owned
-  set +e
-  "$dest" __configure-transaction apply \
-    --journal "$config_journal_dir" \
-    --server-command "$dest" \
-    --yes > "$tmp_dir/config-apply.json"
-  configure_status=$?
-  set -e
-elif { true >/dev/tty; } 2>/dev/null; then
-  config_interactive_attempted=1
-  live_state_touched=1
-  assert_installer_locks_owned
-  set +e
-  "$dest" __configure-transaction apply \
-    --journal "$config_journal_dir" \
-    --server-command "$dest" \
-    < /dev/tty > "$tmp_dir/config-apply.json"
-  configure_status=$?
-  set -e
-else
-  config_transaction_state=no-mutation
-  printf '%s\n' "Client configuration was skipped because no interactive terminal is available."
-  printf "Run this command: '%s' install\n" "$dest"
-fi
-if [ "$config_transaction_state" != "no-mutation" ]; then
-  if ! read_config_transaction_result "$tmp_dir/config-apply.json" apply "$configure_status"; then
-    retain_new_runtime=1
-    preserve_tmp=1
-    fail "client configuration returned an invalid transaction response (exit $configure_status); the replacement runtime and recovery files were retained"
-  fi
-  if [ "$configure_status" -eq 1 ] &&
-    [ "$config_interactive_attempted" = "1" ] &&
-    [ "$config_outcome" = "interaction-unavailable" ] &&
-    [ "$applied_count" = "0" ] &&
-    [ "$noop_count" = "0" ] &&
-    [ "$config_disposition" = "interaction-unavailable" ] &&
-    [ "$config_authentication" = "not-attempted" ] &&
-    [ "$config_interaction_details" = "canonical" ] &&
-    [ "$config_journal_field" = "absent" ] &&
-    [ "$config_journal_preexisting" = "0" ] &&
-    [ ! -e "$config_journal_file" ] &&
-    [ ! -L "$config_journal_file" ]; then
-    config_transaction_state=no-mutation
-    printf '%s\n' "Client configuration was deferred because interactive controls are unavailable."
-    printf "Run this command: '%s' install\n" "$dest"
-  else
-    report_authentication_state
-    case "$configure_status:$config_outcome" in
-    0:applied)
-      if ! config_journal_is_regular; then
-        retain_new_runtime=1
-        preserve_tmp=1
-        fail "client configuration reported applied changes without a usable recovery journal; the replacement runtime was retained"
-      fi
-      config_transaction_state=applied
-      ;;
-    0:no-mutation)
-      if [ -e "$config_journal_file" ] || [ -L "$config_journal_file" ]; then
-        retain_new_runtime=1
-        preserve_tmp=1
-        fail "client configuration reported no changes but left a recovery journal; the replacement runtime was retained"
-      fi
-      config_transaction_state=no-mutation
-      ;;
-    1:failed-rolled-back)
-      config_transaction_state=safe-rolled-back
-      assert_installer_locks_owned
-      remove_completed_config_journal ||
-        printf 'sana-mcp: client configuration was rolled back, but its completed journal could not be removed: %s\n' "$config_journal_dir" >&2
-      preserve_tmp=1
-      fail "client configuration did not complete, but its changes were rolled back; the replacement runtime remains installed because it has accessed live state"
-      ;;
-    1:interaction-unavailable|1:configuration-unavailable|1:authentication-incomplete|1:no-mutation)
-      if [ "$config_journal_preexisting" = "1" ] ||
-        { [ ! -e "$config_journal_file" ] && [ ! -L "$config_journal_file" ]; }; then
-        config_transaction_state=no-mutation
-        preserve_tmp=1
-        fail "client configuration did not complete before changing client files; the replacement runtime remains installed because it has accessed live state"
-      fi
-      retain_new_runtime=1
-      preserve_tmp=1
-      fail "client configuration did not complete and may have changed client files; the replacement runtime and recovery journal were retained"
-      ;;
-    1:*)
-      if [ "$config_journal_preexisting" = "1" ]; then
-        config_transaction_state=no-mutation
-        preserve_tmp=1
-        fail "client configuration could not start while an existing recovery journal is present; the replacement runtime and existing journal were preserved"
-      fi
-      retain_new_runtime=1
-      preserve_tmp=1
-      fail "client configuration did not complete and its mutation state is uncertain; the replacement runtime and recovery journal were retained"
-      ;;
-    *)
-      retain_new_runtime=1
-      preserve_tmp=1
-      fail "client configuration rollback status is uncertain (exit $configure_status, outcome $config_outcome); the replacement runtime and recovery journal were retained"
-      ;;
-    esac
-  fi
-fi
 
 live_state_touched=1
 assert_installer_locks_owned
@@ -1554,18 +1585,94 @@ revalidate_path_block_for_commit "$path_profile"
 assert_installer_locks_owned
 committed=1
 transaction_active=0
-if [ "$config_transaction_state" = "applied" ]; then
-  assert_installer_locks_owned
-  if remove_completed_config_journal; then
-    config_transaction_state=no-mutation
-  else
-    printf 'sana-mcp: install succeeded, but the completed configuration journal could not be removed: %s\n' "$config_journal_dir" >&2
-  fi
-fi
 refresh_cleanup_lock_ownership ||
   fail "installer lock ownership was lost before final lock release"
 release_path_lock ||
   fail "the owned per-user installer lock could not be released"
 release_install_lock ||
   fail "the owned sana-mcp install lock could not be released"
-printf '%s\n' 'sana-mcp installed.'
+finalize_committed_cleanup || fail "cleanup was incomplete"
+
+if [ "${SANA_MCP_UPDATE:-0}" != "1" ]; then
+  setup_status=0
+  setup_recovery_incomplete=0
+  config_journal_dir="$install_dir/.sana-mcp-config-transaction"
+  config_journal_file="$config_journal_dir/client-config-transaction.json"
+  if ! cleanup_completed_config_directories; then
+    setup_status=1
+    setup_recovery_incomplete=1
+  fi
+  if [ "$setup_recovery_incomplete" = "0" ] &&
+    { [ -e "$config_journal_dir" ] || [ -L "$config_journal_dir" ]; }; then
+    if ! rollback_setup_transaction; then
+      setup_status=1
+      setup_recovery_incomplete=1
+    fi
+  fi
+  if [ "$setup_recovery_incomplete" = "0" ]; then
+    setup_result_file=$(mktemp "$install_dir/.sana-mcp-config-result.XXXXXX") ||
+      setup_recovery_incomplete=1
+  fi
+  if [ "$setup_recovery_incomplete" = "0" ]; then
+    setup_transaction_active=1
+    if [ "${SANA_MCP_YES:-0}" = "1" ]; then
+      "$dest" __configure-transaction apply \
+        --journal "$config_journal_dir" \
+        --server-command "$dest" \
+        --format properties \
+        --yes > "$setup_result_file" &
+    elif { true </dev/tty >/dev/tty; } 2>/dev/null; then
+      "$dest" __configure-transaction apply \
+        --journal "$config_journal_dir" \
+        --server-command "$dest" \
+        --format properties \
+        < /dev/tty > "$setup_result_file" 2> /dev/tty &
+    else
+      "$dest" __configure-transaction apply \
+        --journal "$config_journal_dir" \
+        --server-command "$dest" \
+        --format properties \
+        < /dev/null > "$setup_result_file" &
+    fi
+    setup_pid=$!
+    if wait "$setup_pid"; then
+      setup_status=0
+    else
+      setup_status=$?
+    fi
+    setup_pid=""
+    setup_transaction_active=0
+    if read_config_transaction_properties "$setup_result_file" apply "$setup_status"; then
+      if [ "$CT_journal" = "present" ]; then
+        case "$CT_outcome" in
+          applied)
+            remove_completed_config_journal || setup_recovery_incomplete=1
+            ;;
+          *)
+            rollback_setup_transaction || setup_recovery_incomplete=1
+            ;;
+        esac
+      else
+        remove_completed_config_journal || setup_recovery_incomplete=1
+      fi
+    else
+      setup_status=1
+      if [ -e "$config_journal_dir" ] || [ -L "$config_journal_dir" ]; then
+        rollback_setup_transaction || setup_recovery_incomplete=1
+      fi
+    fi
+    rm -f "$setup_result_file" || setup_recovery_incomplete=1
+    setup_result_file=""
+  fi
+  if [ "$setup_recovery_incomplete" = "1" ]; then
+    printf 'sana-mcp: setup recovery is incomplete; rerun the installer.\n' >&2
+  elif [ "$setup_status" -ne 0 ]; then
+    if [ "${SANA_MCP_YES:-0}" = "1" ]; then
+      printf 'sana-mcp: installation succeeded, but client registration exited with code %s.\n' "$setup_status" >&2
+      printf "sana-mcp: retry with: '%s' install --yes\n" "$dest" >&2
+    else
+      printf 'sana-mcp: installation succeeded, but setup exited with code %s.\n' "$setup_status" >&2
+      printf "sana-mcp: retry with: '%s' install\n" "$dest" >&2
+    fi
+  fi
+fi

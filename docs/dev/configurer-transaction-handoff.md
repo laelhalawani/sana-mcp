@@ -7,10 +7,9 @@ authority: remediation-plan.md and AGENTS.md remain controlling
 
 # Configurer transaction handoff
 
-The release installers can journal and roll back their binary, receipt, PATH
-registration, and daemon transition. They must not claim a complete installation
-transaction until client configuration exposes the following structured,
-non-interactive boundary.
+The POSIX release installer uses this structured transaction API after runtime
+commit and cleanup. It presents the same configurer UI as Windows while retaining
+journaled all-or-rollback client registration.
 
 ## Smallest required API
 
@@ -137,6 +136,9 @@ then fails to close is reported separately as an authentication-session cleanup
 failure. It preserves the committed config and truthful retained/skipped auth
 state; it is not mislabeled as a presentation failure and does not trigger
 config rollback.
+The POSIX outer installer applies a stricter recovery rule: every journal-bearing
+nonzero handoff result is revalidated through rollback before retry guidance is
+shown, even when the configurer core would otherwise retain that batch.
 If a Sana sign-in prompt is cancelled and closing that same local auth session
 also fails, the direct prompt-cancellation and cleanup siblings remain
 authoritative: authentication is `skipped`, the exact applied/no-mutation batch
@@ -199,16 +201,10 @@ operations regardless of the host running a test.
 
 ## Installer sequencing
 
-The POSIX and Windows installers should replace their current `install` call with
-`__configure-transaction apply` after staging the verified binary at its final
-path. They must retain the journal until binary replacement, PATH registration,
-daemon health/restart, and installer-receipt publication all succeed.
-
-On any later failure, the installer calls `__configure-transaction rollback`
-before restoring the previous binary. If rollback reports a conflict or other
-failure, the installer retains both its release inventory and the configurer
-journal and reports the installation as incomplete.
-
-An upgrade whose registrations already point to the same final binary path
-returns `no-mutation` without creating a receipt or rewriting those files. This
-keeps pre-1.0 upgrades clean while preserving existing client registrations.
+Direct installers publish and validate the runtime, commit the installer
+transaction, release installer locks, and complete installer cleanup before
+opening setup exactly once. POSIX invokes `__configure-transaction apply` so a
+failed client batch is compensated; Windows invokes the public configurer. Both
+paths render the same setup UI. An updater handoff does not reopen setup, and a
+post-install setup failure does not invalidate an already successful runtime
+installation.

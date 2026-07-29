@@ -1423,3 +1423,21 @@ export function serializeConfigTransactionResult(
   const { exitCode: _exitCode, clientResults: _clientResults, ...wire } = value;
   return `${JSON.stringify(wire)}\n`;
 }
+
+export function serializeConfigTransactionProperties(
+  value: ConfigTransactionResult,
+): string {
+  return [
+    "format=sana-mcp-config-transaction-v1",
+    `transactionProtocol=${value.transactionProtocol}`,
+    `operation=${value.operation}`,
+    `outcome=${value.outcome}`,
+    `appliedCount=${value.appliedCount}`,
+    `noopCount=${value.noopCount}`,
+    `journal=${value.journal === undefined ? "absent" : "present"}`,
+    `disposition=${value.disposition ?? "absent"}`,
+    `authentication=${value.authentication ?? "absent"}`,
+    `error=${value.errorCode === undefined && value.message === undefined ? "absent" : "present"}`,
+    "",
+  ].join("\n");
+}

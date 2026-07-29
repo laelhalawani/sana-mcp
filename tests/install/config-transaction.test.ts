@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   applyConfigTransaction,
   rollbackConfigTransaction,
+  serializeConfigTransactionProperties,
   serializeConfigTransactionResult,
 } from "../../src/install/config-transaction.js";
 import type { ClientDef } from "../../src/install/clients.js";
@@ -845,6 +846,36 @@ test("wire result is one JSON line and excludes the local exit-code adapter", as
     assert.equal(parsed.operation, "apply");
     assert.equal(parsed.outcome, "failed-rolled-back");
     assert.equal("exitCode" in parsed, false);
+  } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("properties result exposes only bounded installer handoff fields", async () => {
+  const root = temporaryDirectory();
+  try {
+    const value = await applyConfigTransaction({
+      ...applyOptions(root, [
+        fixture("fixture", path.join(root, "client.json")),
+      ]),
+      yes: false,
+    });
+    assert.equal(
+      serializeConfigTransactionProperties(value),
+      [
+        "format=sana-mcp-config-transaction-v1",
+        "transactionProtocol=1",
+        "operation=apply",
+        "outcome=failed-rolled-back",
+        "appliedCount=0",
+        "noopCount=0",
+        "journal=absent",
+        "disposition=absent",
+        "authentication=absent",
+        "error=present",
+        "",
+      ].join("\n"),
+    );
   } finally {
     fs.rmSync(root, { recursive: true });
   }

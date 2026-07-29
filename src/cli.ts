@@ -213,14 +213,21 @@ configTransaction
     "final absolute standalone binary path",
   )
   .option("--yes", "confirm configuration of every detected client")
+  .option("--format <format>", "result format: json or properties", "json")
   .action(
     async (opts: {
       journal: string;
       serverCommand: string;
       yes?: boolean;
+      format: string;
     }) => {
       requireStandaloneInstallerCommand("__configure-transaction");
-      const { serializeConfigTransactionResult } = await import(
+      if (opts.format !== "json" && opts.format !== "properties")
+        throw new Error("config transaction format must be json or properties");
+      const {
+        serializeConfigTransactionProperties,
+        serializeConfigTransactionResult,
+      } = await import(
         "./install/config-transaction.js"
       );
       const { runInstallerConfigTransaction } = await import(
@@ -242,7 +249,10 @@ configTransaction
           writeLine: (line) => process.stderr.write(`${line}\n`),
         },
       );
-      process.stdout.write(serializeConfigTransactionResult(result));
+      if (opts.format === "properties")
+        process.stdout.write(serializeConfigTransactionProperties(result));
+      else if (opts.format === "json")
+        process.stdout.write(serializeConfigTransactionResult(result));
       process.exitCode = result.exitCode;
     },
   );
@@ -250,16 +260,23 @@ configTransaction
 configTransaction
   .command("rollback")
   .requiredOption("--journal <directory>", "private absolute journal directory")
-  .action(async (opts: { journal: string }) => {
+  .option("--format <format>", "result format: json or properties", "json")
+  .action(async (opts: { journal: string; format: string }) => {
     requireStandaloneInstallerCommand("__configure-transaction");
+    if (opts.format !== "json" && opts.format !== "properties")
+      throw new Error("config transaction format must be json or properties");
     const {
       rollbackConfigTransaction,
+      serializeConfigTransactionProperties,
       serializeConfigTransactionResult,
     } = await import("./install/config-transaction.js");
     const result = rollbackConfigTransaction({
       journalDirectory: opts.journal,
     });
-    process.stdout.write(serializeConfigTransactionResult(result));
+    if (opts.format === "properties")
+      process.stdout.write(serializeConfigTransactionProperties(result));
+    else if (opts.format === "json")
+      process.stdout.write(serializeConfigTransactionResult(result));
     process.exitCode = result.exitCode;
   });
 
