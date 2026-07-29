@@ -5035,10 +5035,6 @@ test("POSIX piped installer routes setup through the controlling terminal", { ti
     await mkdir(home);
     const installer = path.join(root, "install.sh");
     const command = `/bin/cat '${installer}' | /bin/sh`;
-    const args =
-      process.platform === "darwin"
-        ? ["-q", "/dev/null", "/bin/sh", "-c", command]
-        : ["-qec", command, "/dev/null"];
     const environment: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
@@ -5053,12 +5049,40 @@ test("POSIX piped installer routes setup through the controlling terminal", { ti
     };
     delete environment.CI;
     delete environment.NO_COLOR;
-    const result = spawnSync("/usr/bin/script", args, {
-      encoding: "utf8",
-      env: environment,
-      input: "cursor\n",
-      timeout: 30_000,
-    });
+    let result;
+    if (process.platform === "darwin") {
+      const expectScript = path.join(temporary, "installer.exp");
+      await writeFile(
+        expectScript,
+        [
+          "set timeout 30",
+          "set installer [lindex $argv 0]",
+          'spawn /bin/sh -c "/bin/cat \\"$installer\\" | /bin/sh"',
+          'expect "Select clients: "',
+          'send "cursor\\r"',
+          "expect eof",
+          "set outcome [wait]",
+          "exit [lindex $outcome 3]",
+          "",
+        ].join("\n"),
+      );
+      result = spawnSync("/usr/bin/expect", [expectScript, installer], {
+        encoding: "utf8",
+        env: environment,
+        timeout: 30_000,
+      });
+    } else {
+      result = spawnSync(
+        "/usr/bin/script",
+        ["-qec", command, "/dev/null"],
+        {
+          encoding: "utf8",
+          env: environment,
+          input: "cursor\n",
+          timeout: 30_000,
+        },
+      );
+    }
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /Select clients:/);
     assert.equal(await readFile(selectedInput, "utf8"), "cursor\n");
