@@ -186,17 +186,20 @@ async function runOwnedProcess(
 async function createOfflineRelease(
   directory: string,
   version = "0.3.2",
+  platform: "linux" | "darwin" = "linux",
+  architecture: "x64" | "arm64" = "x64",
 ): Promise<string> {
   const fixture = path.join(directory, `release-${version}`);
   const commands = path.join(directory, "commands");
   await mkdir(fixture);
   await mkdir(commands, { recursive: true });
 
-  const binaryName = "sana-mcp-linux-x64";
+  const target = `bun-${platform}-${architecture}`;
+  const binaryName = `sana-mcp-${platform}-${architecture}`;
   const binary = [
     "#!/bin/sh",
     'if [ "${1:-}" = "__inspect" ]; then',
-    `  printf '%s\\n' inspectProtocol=1 version=${version} target=bun-linux-x64 installerProtocol=1 lifecycleProtocol=1 stateCompatibility=1 semanticCapability=bundled`,
+    `  printf '%s\\n' inspectProtocol=1 version=${version} target=${target} installerProtocol=1 lifecycleProtocol=1 stateCompatibility=1 semanticCapability=bundled`,
     "  exit 0",
     "fi",
     'if [ "${1:-}" = "__lifecycle" ]; then',
@@ -206,7 +209,7 @@ async function createOfflineRelease(
     '    state=$(cat "$FAKE_LIFECYCLE_STATE_FILE")',
     "  fi",
     '  case "$operation" in',
-    '    health) if [ -n "${FAKE_CONFIGURED_FILE:-}" ] && [ -f "$FAKE_CONFIGURED_FILE" ]; then if [ -n "${FAKE_HEALTH_READY_FILE:-}" ]; then : > "$FAKE_HEALTH_READY_FILE"; fi; while [ -n "${FAKE_HEALTH_WAIT_FILE:-}" ] && [ ! -f "$FAKE_HEALTH_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_POST_CONFIG_HEALTH_EXIT:-}" ]; then exit "$FAKE_POST_CONFIG_HEALTH_EXIT"; fi; fi; changed=false ;;',
+    '    health) if [ -n "${FAKE_HEALTH_READY_FILE:-}" ]; then : > "$FAKE_HEALTH_READY_FILE"; fi; while [ -n "${FAKE_HEALTH_WAIT_FILE:-}" ] && [ ! -f "$FAKE_HEALTH_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_POST_CONFIG_HEALTH_EXIT:-}" ]; then exit "$FAKE_POST_CONFIG_HEALTH_EXIT"; fi; changed=false ;;',
     '    stop) changed=$([ "$state" = running ] && printf true || printf false); state=stopped ;;',
     '    start) if [ -n "${FAKE_CONFIGURED_FILE:-}" ] && [ -f "$FAKE_CONFIGURED_FILE" ] && [ -n "${FAKE_POST_CONFIG_START_EXIT:-}" ]; then if [ -n "${FAKE_START_READY_FILE:-}" ]; then : > "$FAKE_START_READY_FILE"; fi; while [ -n "${FAKE_START_WAIT_FILE:-}" ] && [ ! -f "$FAKE_START_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_LIFECYCLE_LOG_FILE:-}" ]; then printf "%s:%s\\n" start-attempt "$state" >> "$FAKE_LIFECYCLE_LOG_FILE"; fi; exit "$FAKE_POST_CONFIG_START_EXIT"; fi; changed=$([ "$state" = stopped ] && printf true || printf false); state=running ;;',
     "    *) exit 64 ;;",
@@ -220,10 +223,12 @@ async function createOfflineRelease(
     '  operation=${2:-}',
     '  shift 2',
     '  journal=""',
+    '  format=json',
     '  while [ "$#" -gt 0 ]; do',
     '    case "$1" in',
     '      --journal) shift; journal=${1:-} ;;',
     '      --server-command) shift; server_command=${1:-} ;;',
+    '      --format) shift; format=${1:-} ;;',
     '      --yes) ;;',
     '      *) exit 64 ;;',
     '    esac',
@@ -236,7 +241,10 @@ async function createOfflineRelease(
     '    if [ -n "${FAKE_ROLLBACK_READY_FILE:-}" ]; then : > "$FAKE_ROLLBACK_READY_FILE"; fi',
     '    while [ -n "${FAKE_ROLLBACK_WAIT_FILE:-}" ] && [ ! -f "$FAKE_ROLLBACK_WAIT_FILE" ]; do sleep 0.02; done',
     '    if [ -n "${FAKE_TRANSACTION_LOG_FILE:-}" ]; then printf "%s\\n" rollback >> "$FAKE_TRANSACTION_LOG_FILE"; fi',
-    '    if [ "$exit_code" -eq 0 ] && [ "$outcome" = failed-rolled-back ]; then',
+    '    if [ "$format" = properties ]; then',
+    '      error=$([ "$exit_code" -eq 0 ] && printf absent || printf present)',
+    '      printf "%s\\n" format=sana-mcp-config-transaction-v1 transactionProtocol=1 operation=rollback "outcome=$outcome" appliedCount=0 noopCount=0 journal=present disposition=absent authentication=absent "error=$error"',
+    '    elif [ "$exit_code" -eq 0 ] && [ "$outcome" = failed-rolled-back ]; then',
     '      printf "%s\\n" "{\\"transactionProtocol\\":1,\\"operation\\":\\"rollback\\",\\"outcome\\":\\"$outcome\\",\\"appliedCount\\":0,\\"noopCount\\":0,\\"journal\\":\\"$journal/client-config-transaction.json\\"}"',
     "    else",
     '      printf "%s\\n" "{\\"transactionProtocol\\":1,\\"operation\\":\\"rollback\\",\\"outcome\\":\\"$outcome\\",\\"appliedCount\\":0,\\"noopCount\\":0,\\"journal\\":\\"$journal/client-config-transaction.json\\",\\"errorCode\\":\\"FAKE_ROLLBACK_FAILED\\",\\"message\\":\\"fake rollback failed\\"}"',
@@ -244,6 +252,12 @@ async function createOfflineRelease(
     '    exit "$exit_code"',
     '  fi',
     '  [ "$operation" = "apply" ] || exit 64',
+    '  if [ "${FAKE_CONFIG_REQUIRE_TTY:-0}" = "1" ]; then',
+    '    [ -t 0 ] && [ -t 2 ] || exit 65',
+    '    printf "%s" "Select clients: " >&2',
+    '    IFS= read -r selected || exit 66',
+    '    if [ -n "${FAKE_CONFIG_INPUT_FILE:-}" ]; then printf "%s\\n" "$selected" > "$FAKE_CONFIG_INPUT_FILE"; fi',
+    "  fi",
     '  if [ -n "${FAKE_CONFIG_READY_FILE:-}" ]; then : > "$FAKE_CONFIG_READY_FILE"; fi',
     '  while [ -n "${FAKE_CONFIG_WAIT_FILE:-}" ] && [ ! -f "$FAKE_CONFIG_WAIT_FILE" ]; do sleep 0.02; done',
     '  if [ "${FAKE_CONFIG_START_DAEMON:-0}" = "1" ] && [ -n "${FAKE_LIFECYCLE_STATE_FILE:-}" ]; then',
@@ -270,7 +284,14 @@ async function createOfflineRelease(
     "  fi",
     '  if [ "${FAKE_CONFIG_MALFORMED:-0}" = "1" ]; then printf "%s\\n" malformed; exit "$exit_code"; fi',
     '  if [ -n "${FAKE_TRANSACTION_LOG_FILE:-}" ]; then printf "%s\\n" apply >> "$FAKE_TRANSACTION_LOG_FILE"; fi',
-    '  if [ "$exit_code" -eq 0 ]; then',
+    '  if [ -n "${FAKE_CONFIG_APPLIED_READY_FILE:-}" ]; then : > "$FAKE_CONFIG_APPLIED_READY_FILE"; fi',
+    '  while [ -n "${FAKE_CONFIG_APPLIED_WAIT_FILE:-}" ] && [ ! -f "$FAKE_CONFIG_APPLIED_WAIT_FILE" ]; do sleep 0.02; done',
+    '  if [ "$format" = properties ]; then',
+    '    journal_state=absent',
+    '    if [ -f "$journal/client-config-transaction.json" ]; then journal_state=present; fi',
+    '    error=$([ "$exit_code" -eq 0 ] && printf absent || printf present)',
+    '    printf "%s\\n" format=sana-mcp-config-transaction-v1 transactionProtocol=1 operation=apply "outcome=$outcome" "appliedCount=$applied_count" noopCount=0 "journal=$journal_state" "disposition=$disposition" "authentication=$authentication" "error=$error"',
+    '  elif [ "$exit_code" -eq 0 ]; then',
     '    if [ "$outcome" = applied ]; then',
     '      printf "%s\\n" "{\\"transactionProtocol\\":1,\\"operation\\":\\"apply\\",\\"outcome\\":\\"$outcome\\",\\"appliedCount\\":$applied_count,\\"noopCount\\":0,\\"journal\\":\\"$journal/client-config-transaction.json\\",\\"disposition\\":\\"$disposition\\",\\"authentication\\":\\"$authentication\\"}"',
     "    else",
@@ -282,8 +303,18 @@ async function createOfflineRelease(
     '  exit "$exit_code"',
     "fi",
     'if [ "${1:-}" = "install" ]; then',
-    '  if [ -n "${FAKE_INSTALL_ARGS_FILE:-}" ]; then printf "%s\\n" "$@" > "$FAKE_INSTALL_ARGS_FILE"; fi',
-    "  exit 23",
+    '  if [ -n "${FAKE_INSTALL_ARGS_FILE:-}" ]; then printf "%s\\n" "$@" >> "$FAKE_INSTALL_ARGS_FILE"; fi',
+    '  if [ "${FAKE_CONFIG_REQUIRE_TTY:-0}" = "1" ]; then',
+    '    [ -t 0 ] && [ -t 1 ] && [ -t 2 ] || exit 65',
+    '    printf "%s" "Select clients: "',
+    '    IFS= read -r selected || exit 66',
+    '    if [ -n "${FAKE_CONFIG_INPUT_FILE:-}" ]; then printf "%s\\n" "$selected" > "$FAKE_CONFIG_INPUT_FILE"; fi',
+    "  fi",
+    '  if [ -n "${FAKE_CONFIG_READY_FILE:-}" ]; then : > "$FAKE_CONFIG_READY_FILE"; fi',
+    '  while [ -n "${FAKE_CONFIG_WAIT_FILE:-}" ] && [ ! -f "$FAKE_CONFIG_WAIT_FILE" ]; do sleep 0.02; done',
+    '  if [ "${FAKE_CONFIG_START_DAEMON:-0}" = "1" ] && [ -n "${FAKE_LIFECYCLE_STATE_FILE:-}" ]; then printf "%s\\n" running > "$FAKE_LIFECYCLE_STATE_FILE"; fi',
+    '  if [ -n "${FAKE_CONFIGURED_FILE:-}" ]; then : > "$FAKE_CONFIGURED_FILE"; fi',
+    '  exit "${FAKE_INSTALL_EXIT:-0}"',
     "fi",
     `# release fixture ${version}`,
     "exit 2",
@@ -307,7 +338,7 @@ async function createOfflineRelease(
     `${binaryHash}  ${binaryName}\n`,
   );
 
-  const metadataName = "manifest-bun-linux-x64.properties";
+  const metadataName = `manifest-${target}.properties`;
   const metadata = [
     "format=sana-mcp-release-v1",
     "manifestVersion=1",
@@ -322,8 +353,8 @@ async function createOfflineRelease(
     "semanticCapability=bundled",
     "installerAssetName=install.sh",
     `installerSha256=${installerHash}`,
-    "target=bun-linux-x64",
-    "libc=glibc",
+    `target=${target}`,
+    ...(platform === "linux" ? ["libc=glibc"] : []),
     `assetName=${binaryName}`,
     `checksumFileName=${binaryName}.sha256`,
     `sha256=${binaryHash}`,
@@ -339,35 +370,47 @@ async function createOfflineRelease(
     "#!/bin/sh",
     'out=""',
     'url=""',
+    'head_only=0',
     'while [ "$#" -gt 0 ]; do',
     '  case "$1" in',
     '    -o) shift; out=$1 ;;',
+    '    -I|-*I*) head_only=1 ;;',
     '    https://*) url=$1 ;;',
     "  esac",
     "  shift",
     "done",
-    '[ -n "$out" ] && [ -n "$url" ] || exit 64',
+    '[ -n "$url" ] || exit 64',
     'name=${url##*/}',
+    'if [ "$head_only" = "1" ]; then',
+    '  if [ -n "${FAKE_CURL_HEAD_EXIT:-}" ]; then exit "$FAKE_CURL_HEAD_EXIT"; fi',
+    '  size=$(wc -c < "$FIXTURE_ROOT/$name" | tr -d "[:space:]")',
+    '  printf "HTTP/1.1 200 OK\\r\\nContent-Length: %s\\r\\n\\r\\n" "$size"',
+    '  exit 0',
+    'fi',
+    '[ -n "$out" ] || exit 64',
+    'if [ -n "${FAKE_CURL_GET_EXIT:-}" ] && [ "$name" = "${FAKE_CURL_GET_NAME:-}" ]; then printf "%s\\n" "fake download failed" >&2; exit "$FAKE_CURL_GET_EXIT"; fi',
     'exec /bin/cp "$FIXTURE_ROOT/$name" "$out"',
     "",
   ].join("\n");
   const fakeUname = [
     "#!/bin/sh",
     'case "${1:-}" in',
-    "  -s) printf '%s\\n' Linux ;;",
-    "  -m) printf '%s\\n' x86_64 ;;",
+    `  -s) printf '%s\\n' ${platform === "darwin" ? "Darwin" : "Linux"} ;;`,
+    `  -m) printf '%s\\n' ${architecture === "arm64" ? "arm64" : "x86_64"} ;;`,
     "  *) exit 64 ;;",
     "esac",
     "",
   ].join("\n");
   await writeFile(path.join(commands, "curl"), fakeCurl);
+  await writeFile(path.join(commands, "sync"), "#!/bin/sh\nexit 0\n");
   await writeFile(path.join(commands, "uname"), fakeUname);
   await chmod(path.join(commands, "curl"), 0o755);
+  await chmod(path.join(commands, "sync"), 0o755);
   await chmod(path.join(commands, "uname"), 0o755);
   return fixture;
 }
 
-test("POSIX one-line installer verifies the tuple and does not mask config failure", async () => {
+test("POSIX one-line installer verifies the tuple and reports post-install setup failure", { timeout: 120_000 }, async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-installer-test-"));
   try {
@@ -376,7 +419,7 @@ test("POSIX one-line installer verifies the tuple and does not mask config failu
     const home = path.join(temporary, "home");
     await mkdir(home);
 
-    const run = (installName: string, configExit: string) => {
+    const run = (installName: string, setupExit: string) => {
       const installDirectory = path.join(temporary, installName);
       const runHome = path.join(temporary, `${installName}-home`);
       mkdirSync(runHome);
@@ -390,7 +433,7 @@ test("POSIX one-line installer verifies the tuple and does not mask config failu
           SANA_MCP_INSTALL_DIR: installDirectory,
           SANA_MCP_VERSION: "v0.3.2",
           SANA_MCP_YES: "1",
-          FAKE_CONFIG_EXIT: configExit,
+          FAKE_CONFIG_EXIT: setupExit,
         },
       });
       return { installDirectory, result };
@@ -399,7 +442,13 @@ test("POSIX one-line installer verifies the tuple and does not mask config failu
     const successful = run("success-bin", "0");
     assert.equal(successful.result.status, 0, successful.result.stderr);
     assert.match(successful.result.stdout, /Installing sana-mcp v0\.3\.2/);
-    assert.match(successful.result.stdout, /(?:^|\n)sana-mcp installed\.\n?$/);
+    assert.match(successful.result.stdout, /Platform: bun-linux-x64/);
+    assert.match(successful.result.stdout, /Downloading verified binary/);
+    assert.match(
+      successful.result.stdout,
+      /\[########################\]\s+100%\s+\S+\/\S+ MB\s+\S+ MB\/s\s+ETA 00:00/,
+    );
+    assert.doesNotMatch(successful.result.stdout, /sana-mcp installed\./);
     assert.doesNotMatch(successful.result.stdout, /(?:Added|Verified) .* to PATH/);
     assert.doesNotMatch(
       successful.result.stdout,
@@ -425,10 +474,10 @@ test("POSIX one-line installer verifies the tuple and does not mask config failu
     );
 
     const failed = run("failed-bin", "23");
-    assert.notEqual(failed.result.status, 0);
+    assert.equal(failed.result.status, 0);
     assert.match(
       failed.result.stderr,
-      /client configuration did not complete before changing client files/,
+      /installation succeeded, but client registration exited with code 1/,
     );
     await access(path.join(failed.installDirectory, "sana-mcp"));
     await access(
@@ -478,7 +527,448 @@ test("POSIX one-line installer verifies the tuple and does not mask config failu
   }
 });
 
-test("POSIX installer only writes startup files for explicitly supported shells", async () => {
+test("POSIX progress degrades cleanly when size discovery is unavailable", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-progress-fallback-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    await mkdir(home);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CURL_HEAD_EXIT: "22",
+        SANA_MCP_INSTALL_DIR: path.join(temporary, "managed-bin"),
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /\d+(?:\.\d)? MB\s+\d+(?:\.\d)? MB\/s/);
+    assert.doesNotMatch(result.stdout, /ETA|\[[#-]{24}\]/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX progress terminates cleanly when the binary download fails", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-progress-failure-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    await mkdir(home);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CURL_GET_EXIT: "22",
+        FAKE_CURL_GET_NAME: "sana-mcp-linux-x64",
+        SANA_MCP_INSTALL_DIR: path.join(temporary, "managed-bin"),
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /fake download failed/);
+    assert.match(result.stderr, /could not download the sana-mcp binary/);
+    assert.doesNotMatch(result.stdout, /\u001b/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX rolls back a malformed setup result before suggesting a retry", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-setup-malformed-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const transactionLog = path.join(temporary, "transactions.log");
+    await mkdir(home);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CONFIG_MALFORMED: "1",
+        FAKE_TRANSACTION_LOG_FILE: transactionLog,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /client registration exited with code 1/);
+    assert.equal(await readFile(transactionLog, "utf8"), "rollback\n");
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX rolls back contradictory setup properties instead of deleting authority", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-setup-contradiction-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const transactionLog = path.join(temporary, "transactions.log");
+    await mkdir(home);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CONFIG_OUTCOME: "interaction-unavailable",
+        FAKE_CONFIG_EXIT: "1",
+        FAKE_CONFIG_CREATE_JOURNAL: "1",
+        FAKE_CONFIG_AUTHENTICATION: "ready",
+        FAKE_CONFIG_DISPOSITION: "interaction-unavailable",
+        FAKE_TRANSACTION_LOG_FILE: transactionLog,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /client registration exited with code 1/);
+    assert.equal(await readFile(transactionLog, "utf8"), "apply\nrollback\n");
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX revalidates failed-rolled-back setup through rollback", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-setup-rolled-back-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const transactionLog = path.join(temporary, "transactions.log");
+    await mkdir(home);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CONFIG_OUTCOME: "failed-rolled-back",
+        FAKE_CONFIG_EXIT: "1",
+        FAKE_CONFIG_CREATE_JOURNAL: "1",
+        FAKE_CONFIG_AUTHENTICATION: "skipped",
+        FAKE_CONFIG_DISPOSITION: "no-clients",
+        FAKE_TRANSACTION_LOG_FILE: transactionLog,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await readFile(transactionLog, "utf8"), "apply\nrollback\n");
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX completed setup retirement is resumable after cleanup failure", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-setup-retirement-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const commands = path.join(temporary, "commands");
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const fakeRm = path.join(commands, "rm");
+    const rmFailure = path.join(temporary, "rm-failed");
+    await mkdir(home);
+    await writeFile(
+      fakeRm,
+      [
+        "#!/bin/sh",
+        'for candidate in "$@"; do',
+        '  case "$candidate" in',
+        '    *"/.sana-mcp-config-completed."*/client-config-transaction.json)',
+        '      if [ ! -f "$FAKE_RM_FAILURE_FILE" ]; then : > "$FAKE_RM_FAILURE_FILE"; exit 73; fi',
+        "      ;;",
+        "  esac",
+        "done",
+        'exec /usr/bin/rm "$@"',
+        "",
+      ].join("\n"),
+    );
+    await chmod(fakeRm, 0o755);
+    const environment = {
+      ...process.env,
+      PATH: `${commands}:/usr/bin:/bin`,
+      HOME: home,
+      FIXTURE_ROOT: fixture,
+      FAKE_RM_FAILURE_FILE: rmFailure,
+      SANA_MCP_INSTALL_DIR: installDirectory,
+      SANA_MCP_VERSION: "v0.3.2",
+      SANA_MCP_YES: "1",
+    };
+    const interrupted = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: environment,
+    });
+    assert.equal(interrupted.status, 0, interrupted.stderr);
+    assert.match(interrupted.stderr, /setup recovery is incomplete/);
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
+    );
+
+    await rm(fakeRm);
+    const resumed = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: environment,
+    });
+    assert.equal(resumed.status, 0, resumed.stderr);
+    assert.doesNotMatch(resumed.stderr, /setup recovery is incomplete/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX retries final cleanup of a completed canonical setup journal", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-canonical-retirement-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const commands = path.join(temporary, "commands");
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const journalDirectory = path.join(
+      installDirectory,
+      ".sana-mcp-config-transaction",
+    );
+    const journal = path.join(journalDirectory, "client-config-transaction.json");
+    const marker = path.join(journalDirectory, "installer-completed.properties");
+    const rmdirCount = path.join(temporary, "rmdir-count");
+    await mkdir(home);
+    await mkdir(journalDirectory, { recursive: true });
+    await writeFile(journal, "completed journal\n");
+    await writeFile(
+      marker,
+      [
+        "format=sana-mcp-completed-config-v1",
+        `journalSha256=${sha256("completed journal\n")}`,
+        "",
+      ].join("\n"),
+    );
+    const fakeRmdir = path.join(commands, "rmdir");
+    await writeFile(
+      fakeRmdir,
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "$FAKE_CANONICAL_CONFIG_DIR" ]; then',
+        "  count=0",
+        '  if [ -f "$FAKE_RMDIR_COUNT_FILE" ]; then count=$(cat "$FAKE_RMDIR_COUNT_FILE"); fi',
+        "  count=$((count + 1))",
+        '  printf "%s\\n" "$count" > "$FAKE_RMDIR_COUNT_FILE"',
+        '  if [ "$count" -eq 1 ]; then exit 73; fi',
+        "fi",
+        'exec /usr/bin/rmdir "$@"',
+        "",
+      ].join("\n"),
+    );
+    await chmod(fakeRmdir, 0o755);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${commands}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CANONICAL_CONFIG_DIR: journalDirectory,
+        FAKE_RMDIR_COUNT_FILE: rmdirCount,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /setup recovery is incomplete/);
+    await assert.rejects(access(journalDirectory));
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX suppresses unsafe retry guidance while setup recovery is incomplete", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-setup-recovery-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const transactionLog = path.join(temporary, "transactions.log");
+    await mkdir(home);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CONFIG_OUTCOME: "rollback-incomplete",
+        FAKE_CONFIG_EXIT: "2",
+        FAKE_CONFIG_CREATE_JOURNAL: "1",
+        FAKE_ROLLBACK_OUTCOME: "conflict",
+        FAKE_ROLLBACK_EXIT: "2",
+        FAKE_TRANSACTION_LOG_FILE: transactionLog,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /setup recovery is incomplete/);
+    assert.doesNotMatch(result.stderr, /retry with:/);
+    assert.equal(await readFile(transactionLog, "utf8"), "apply\nrollback\n");
+    await access(
+      path.join(
+        installDirectory,
+        ".sana-mcp-config-transaction",
+        "client-config-transaction.json",
+      ),
+    );
+    const recovered = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_TRANSACTION_LOG_FILE: transactionLog,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(
+      await readFile(transactionLog, "utf8"),
+      "apply\nrollback\nrollback\napply\n",
+    );
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX interrupt rolls back an in-flight setup transaction", { timeout: 30_000 }, async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-setup-interrupt-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const transactionLog = path.join(temporary, "transactions.log");
+    const appliedReady = path.join(temporary, "applied-ready");
+    const holdApply = path.join(temporary, "hold-apply");
+    await mkdir(home);
+    const child = spawn("/bin/sh", [path.join(root, "install.sh")], {
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CONFIG_APPLIED_READY_FILE: appliedReady,
+        FAKE_CONFIG_APPLIED_WAIT_FILE: holdApply,
+        FAKE_TRANSACTION_LOG_FILE: transactionLog,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    await waitForFile(appliedReady);
+    child.kill("SIGTERM");
+    const [code] = await once(child, "close") as [number];
+    assert.equal(code, 143, stderr);
+    assert.equal(await readFile(transactionLog, "utf8"), "apply\nrollback\n");
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX interrupt before journal publication is a safe no-op", { timeout: 30_000 }, async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-setup-early-interrupt-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const selectionReady = path.join(temporary, "selection-ready");
+    const holdSelection = path.join(temporary, "hold-selection");
+    await mkdir(home);
+    const child = spawn("/bin/sh", [path.join(root, "install.sh")], {
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_CONFIG_READY_FILE: selectionReady,
+        FAKE_CONFIG_WAIT_FILE: holdSelection,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    await waitForFile(selectionReady);
+    child.kill("SIGTERM");
+    const [code] = await once(child, "close") as [number];
+    assert.equal(code, 143, stderr);
+    assert.doesNotMatch(stderr, /setup recovery is incomplete/);
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX installer only writes startup files for explicitly supported shells", { timeout: 120_000 }, async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-shell-profile-"));
   try {
@@ -593,17 +1083,7 @@ test("POSIX installer only writes startup files for explicitly supported shells"
       );
 
       if (entry.expectedProfile === "none") {
-        assert.match(
-          result.stdout,
-          /PATH was not changed because no matching shell startup file exists\./,
-          entry.name,
-        );
-        assert.ok(
-          result.stdout.includes(
-            `Add ${installDirectory} to PATH manually`,
-          ),
-          `${entry.name} did not print the manual PATH command`,
-        );
+        assert.doesNotMatch(result.stdout, /PATH|\.local\/bin/, entry.name);
         assert.doesNotMatch(result.stdout, /(?:Added|Verified) .* to PATH/);
         for (const [startupFile, body] of original) {
           assert.equal(
@@ -787,27 +1267,7 @@ test("POSIX upgrades separate receipt-owned PATH state from current-shell availa
         entry.name,
       );
 
-      if (entry.expectedPresentation === "verified") {
-        assert.doesNotMatch(upgrade.stdout, /Add .* to PATH manually/);
-      } else {
-        assert.ok(
-          upgrade.stdout.includes(
-            `Add ${installDirectory} to PATH manually`,
-          ),
-          `${entry.name} did not print the manual PATH command`,
-        );
-        if (entry.expectedPresentation === "unsupported") {
-          assert.match(
-            upgrade.stdout,
-            /PATH was not changed because no matching shell startup file exists\./,
-          );
-        } else {
-          assert.match(
-            upgrade.stdout,
-            /installer-owned PATH block belongs to a different shell startup file\./,
-          );
-        }
-      }
+      assert.doesNotMatch(upgrade.stdout, /PATH|managed-bin/, entry.name);
 
       await assert.rejects(
         access(path.join(installDirectory, ".sana-mcp-install-lock")),
@@ -965,16 +1425,7 @@ test("POSIX upgrades preserve legacy receipt-owned profiles without claiming cur
       );
       assert.doesNotMatch(upgrade.stdout, /(?:Added|Verified) .* to PATH/);
       assert.doesNotMatch(upgrade.stdout, /(?:^|\n)Installed /);
-      assert.match(
-        upgrade.stdout,
-        /installer-owned PATH block belongs to a different shell startup file\./,
-      );
-      assert.ok(
-        upgrade.stdout.includes(
-          `Add ${installDirectory} to PATH manually`,
-        ),
-        `${entry.name} did not print manual PATH guidance`,
-      );
+      assert.doesNotMatch(upgrade.stdout, /PATH|managed-bin/, entry.name);
       await assert.rejects(
         access(path.join(installDirectory, ".sana-mcp-install-lock")),
       );
@@ -3943,8 +4394,8 @@ test("POSIX serializes PATH publication across different install destinations", 
           SHELL: "/bin/bash",
           FIXTURE_ROOT: fixture,
           FAKE_CONFIG_EXIT: "0",
-          FAKE_CONFIG_READY_FILE: ready,
-          FAKE_CONFIG_WAIT_FILE: releaseConfigurers,
+          FAKE_HEALTH_READY_FILE: ready,
+          FAKE_HEALTH_WAIT_FILE: releaseConfigurers,
           SANA_MCP_INSTALL_DIR: installDirectory,
           SANA_MCP_VERSION: "v0.3.2",
           SANA_MCP_YES: "1",
@@ -4016,8 +4467,8 @@ test("POSIX losing install-lock contenders never remove the winner's lock", asyn
       PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
       HOME: home,
       FIXTURE_ROOT: fixture,
-      FAKE_CONFIG_READY_FILE: configReady,
-      FAKE_CONFIG_WAIT_FILE: releaseConfig,
+      FAKE_HEALTH_READY_FILE: configReady,
+      FAKE_HEALTH_WAIT_FILE: releaseConfig,
       SANA_MCP_INSTALL_DIR: installDirectory,
       SANA_MCP_VERSION: "v0.3.2",
       SANA_MCP_YES: "1",
@@ -4066,8 +4517,8 @@ test("POSIX lost lock ownership blocks commit and leaves the winner's directory 
         PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
         HOME: home,
         FIXTURE_ROOT: fixture,
-        FAKE_CONFIG_READY_FILE: configReady,
-        FAKE_CONFIG_WAIT_FILE: releaseConfig,
+        FAKE_HEALTH_READY_FILE: configReady,
+        FAKE_HEALTH_WAIT_FILE: releaseConfig,
         SANA_MCP_INSTALL_DIR: installDirectory,
         SANA_MCP_VERSION: "v0.3.2",
         SANA_MCP_YES: "1",
@@ -4262,7 +4713,7 @@ test("POSIX lock loss during final rollback sync retains tail cleanup state", as
         '  : > "$FAKE_FINAL_SYNC_READY_FILE"',
         '  while [ ! -f "$FAKE_FINAL_SYNC_WAIT_FILE" ]; do sleep 0.02; done',
         "fi",
-        'exec /usr/bin/sync "$@"',
+        "exit 0",
         "",
       ].join("\n"),
     );
@@ -4350,117 +4801,6 @@ test("POSIX lock loss during final rollback sync retains tail cleanup state", as
   }
 });
 
-test("POSIX lock loss during completed-journal removal gates final cleanup", async () => {
-  if (process.platform !== "linux") return;
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-journal-lock-loss-"));
-  try {
-    const fixture = await createOfflineRelease(temporary);
-    const commands = path.join(temporary, "commands");
-    const home = path.join(temporary, "home");
-    const installDirectory = path.join(temporary, "managed-bin");
-    const journal = path.join(
-      installDirectory,
-      ".sana-mcp-config-transaction",
-      "client-config-transaction.json",
-    );
-    const removalReady = path.join(temporary, "journal-removal-ready");
-    const releaseRemoval = path.join(temporary, "release-journal-removal");
-    const removalLog = path.join(temporary, "rm.log");
-    await mkdir(home);
-    await writeFile(
-      path.join(commands, "rm"),
-      [
-        "#!/bin/sh",
-        'printf "%s\\n" "$*" >> "$FAKE_RM_LOG_FILE"',
-        'for candidate in "$@"; do',
-        '  if [ "$candidate" = "$FAKE_RM_WAIT_PATH" ]; then',
-        '    : > "$FAKE_RM_READY_FILE"',
-        '    while [ ! -f "$FAKE_RM_RELEASE_FILE" ]; do sleep 0.02; done',
-        "  fi",
-        "done",
-        'exec /usr/bin/rm "$@"',
-        "",
-      ].join("\n"),
-    );
-    await chmod(path.join(commands, "rm"), 0o755);
-
-    const child = spawn("/bin/sh", [path.join(root, "install.sh")], {
-      env: {
-        ...process.env,
-        PATH: `${commands}:/usr/bin:/bin`,
-        HOME: home,
-        TMPDIR: temporary,
-        FIXTURE_ROOT: fixture,
-        FAKE_RM_LOG_FILE: removalLog,
-        FAKE_RM_WAIT_PATH: journal,
-        FAKE_RM_READY_FILE: removalReady,
-        FAKE_RM_RELEASE_FILE: releaseRemoval,
-        SANA_MCP_INSTALL_DIR: installDirectory,
-        SANA_MCP_VERSION: "v0.3.2",
-        SANA_MCP_YES: "1",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stderr = "";
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    const closePromise = once(child, "close") as Promise<[number]>;
-    await Promise.race([
-      waitForFile(removalReady),
-      closePromise.then(([code]) => {
-        throw new Error(
-          `installer exited before completed-journal removal (${code}): ${stderr}`,
-        );
-      }),
-    ]);
-
-    const removalLogAtLoss = await readFile(removalLog, "utf8");
-    const pathLock = path.join(home, ".sana-mcp-installer-path.lock");
-    const pathLockEntries = await readdir(pathLock);
-    assert.equal(pathLockEntries.length, 1);
-    await writeFile(
-      path.join(pathLock, pathLockEntries[0]),
-      "changed-during-journal-removal\n",
-    );
-    await writeFile(releaseRemoval, "continue\n");
-
-    const [code] = await closePromise;
-    assert.equal(code, 1);
-    assert.match(stderr, /installer lock ownership was lost/);
-    assert.match(stderr, /lost before final lock release/);
-    assert.equal(await readFile(removalLog, "utf8"), removalLogAtLoss);
-    await access(path.join(installDirectory, "sana-mcp"));
-    await access(path.join(installDirectory, ".sana-mcp-install-v1"));
-    await assert.rejects(access(journal));
-    assert.equal(
-      await readFile(path.join(pathLock, pathLockEntries[0]), "utf8"),
-      "changed-during-journal-removal\n",
-    );
-    const installLock = path.join(
-      installDirectory,
-      ".sana-mcp-install-lock",
-    );
-    const installLockEntries = await readdir(installLock);
-    assert.equal(installLockEntries.length, 1);
-    assert.equal(
-      (await readFile(path.join(installLock, installLockEntries[0]), "utf8")).trim(),
-      installLockEntries[0],
-    );
-    const temporaryEntries = await readdir(temporary);
-    const recoveryInventories = temporaryEntries.filter((entry) =>
-      entry.startsWith("sana-mcp."),
-    );
-    assert.equal(recoveryInventories.length, 1);
-    const recoveryInventory = path.join(temporary, recoveryInventories[0]);
-    await access(path.join(recoveryInventory, "binary"));
-    await access(path.join(recoveryInventory, "config-apply.json"));
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
 test("POSIX revalidates only the exact managed block immediately before receipt commit", async () => {
   if (process.platform !== "linux") return;
   for (const tamperManagedBlock of [false, true]) {
@@ -4532,15 +4872,14 @@ test("POSIX revalidates only the exact managed block immediately before receipt 
   }
 });
 
-test("POSIX non-interactive install keeps the verified runtime and defers client configuration", async () => {
+test("POSIX non-interactive install attempts public setup without invalidating the runtime", async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-nontty-install-"));
   try {
     const fixture = await createOfflineRelease(temporary);
     const home = path.join(temporary, "home");
     const installDirectory = path.join(temporary, "managed bin");
-    const configReady = path.join(temporary, "config-ready");
-    const recoveryArgs = path.join(temporary, "recovery-args");
+    const transactionLog = path.join(temporary, "transactions.log");
     await mkdir(home);
     const result = spawnSync(
       "/usr/bin/setsid",
@@ -4552,7 +4891,8 @@ test("POSIX non-interactive install keeps the verified runtime and defers client
           PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
           HOME: home,
           FIXTURE_ROOT: fixture,
-          FAKE_CONFIG_READY_FILE: configReady,
+          FAKE_TRANSACTION_LOG_FILE: transactionLog,
+          FAKE_CONFIG_EXIT: "23",
           SANA_MCP_INSTALL_DIR: installDirectory,
           SANA_MCP_VERSION: "v0.3.2",
           SANA_MCP_YES: "",
@@ -4560,176 +4900,45 @@ test("POSIX non-interactive install keeps the verified runtime and defers client
       },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /configuration was skipped/);
-    const command = result.stdout.match(/^Run this command: (.+)$/mu)?.[1];
-    assert.ok(command);
-    const recovery = spawnSync("/bin/sh", ["-c", command], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        HOME: home,
-        SANA_DATA_DIR: path.join(temporary, "recovery-data"),
-        FAKE_INSTALL_ARGS_FILE: recoveryArgs,
-      },
-    });
-    assert.equal(recovery.status, 23, recovery.stderr);
-    assert.equal(recovery.stderr, "");
-    assert.equal(await readFile(recoveryArgs, "utf8"), "install\n");
+    assert.match(result.stderr, /installation succeeded, but setup exited with code 1/);
+    assert.equal(await readFile(transactionLog, "utf8"), "apply\n");
     await access(path.join(installDirectory, "sana-mcp"));
     await access(path.join(installDirectory, ".sana-mcp-install-v1"));
-    await assert.rejects(access(configReady));
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
 });
 
-test("POSIX retains the replacement runtime and journal when apply is incomplete", async () => {
-  if (process.platform !== "linux") return;
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-apply-incomplete-"));
-  try {
-    const fixture = await createOfflineRelease(temporary);
-    const home = path.join(temporary, "home");
-    const installDirectory = path.join(temporary, "managed-bin");
-    await mkdir(home);
-    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
-        HOME: home,
-        FIXTURE_ROOT: fixture,
-        FAKE_CONFIG_OUTCOME: "rollback-incomplete",
-        FAKE_CONFIG_EXIT: "2",
-        FAKE_CONFIG_CREATE_JOURNAL: "1",
-        FAKE_CONFIG_AUTHENTICATION: "unconfirmed",
-        FAKE_CONFIG_DISPOSITION: "configuration-unavailable",
-        SANA_MCP_INSTALL_DIR: installDirectory,
-        SANA_MCP_VERSION: "v0.3.2",
-        SANA_MCP_YES: "1",
-      },
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stdout, /could not be confirmed/);
-    assert.match(result.stderr, /replacement runtime and recovery journal were retained/);
-    await access(path.join(installDirectory, "sana-mcp"));
-    await access(
-      path.join(
-        installDirectory,
-        ".sana-mcp-config-transaction",
-        "client-config-transaction.json",
-      ),
-    );
-    await access(path.join(installDirectory, ".sana-mcp-install-v1"));
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
-test("POSIX rolls client configuration back but retains a live-state-touched runtime", async () => {
-  if (process.platform !== "linux") return;
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-config-rollback-"));
-  try {
-    const fixture = await createOfflineRelease(temporary);
-    const home = path.join(temporary, "home");
-    const installDirectory = path.join(temporary, "managed-bin");
-    const configured = path.join(temporary, "configured");
-    const transactionLog = path.join(temporary, "transactions");
-    await mkdir(home);
-    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
-        HOME: home,
-        FIXTURE_ROOT: fixture,
-        FAKE_CONFIGURED_FILE: configured,
-        FAKE_POST_CONFIG_HEALTH_EXIT: "77",
-        FAKE_TRANSACTION_LOG_FILE: transactionLog,
-        SANA_MCP_INSTALL_DIR: installDirectory,
-        SANA_MCP_VERSION: "v0.3.2",
-        SANA_MCP_YES: "1",
-      },
-    });
-    assert.equal(result.status, 1);
-    assert.deepEqual(
-      (await readFile(transactionLog, "utf8")).trim().split("\n"),
-      ["apply", "rollback"],
-    );
-    await access(path.join(installDirectory, "sana-mcp"));
-    await access(path.join(installDirectory, ".sana-mcp-install-v1"));
-    await assert.rejects(
-      access(path.join(installDirectory, ".sana-mcp-config-transaction")),
-    );
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
-test("POSIX keeps the replacement runtime, PATH, and recovery journal when rollback fails", async () => {
-  if (process.platform !== "linux") return;
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-rollback-fails-"));
-  try {
-    const fixture = await createOfflineRelease(temporary);
-    const home = path.join(temporary, "home");
-    const profile = path.join(home, ".bashrc");
-    const installDirectory = path.join(temporary, "managed-bin");
-    const configured = path.join(temporary, "configured");
-    await mkdir(home);
-    await writeFile(profile, "# profile\n");
-    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
-        HOME: home,
-        SHELL: "/bin/bash",
-        FIXTURE_ROOT: fixture,
-        FAKE_CONFIGURED_FILE: configured,
-        FAKE_POST_CONFIG_HEALTH_EXIT: "77",
-        FAKE_ROLLBACK_OUTCOME: "conflict",
-        FAKE_ROLLBACK_EXIT: "2",
-        SANA_MCP_INSTALL_DIR: installDirectory,
-        SANA_MCP_VERSION: "v0.3.2",
-        SANA_MCP_YES: "1",
-      },
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /configuration rollback was incomplete/);
-    assert.match(result.stderr, /retained the replacement runtime/);
-    await access(path.join(installDirectory, "sana-mcp"));
-    await access(
-      path.join(
-        installDirectory,
-        ".sana-mcp-config-transaction",
-        "client-config-transaction.json",
-      ),
-    );
-    assert.match(await readFile(profile, "utf8"), /sana-mcp installer/);
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
-test("POSIX retains transactional configuration while Windows defers public setup until commit", async () => {
+test("POSIX and Windows launch the same setup UI only after runtime commit", async () => {
   const posix = await readFile(path.join(root, "install.sh"), "utf8");
   const windows = await readFile(path.join(root, "install.ps1"), "utf8");
+  const cli = await readFile(path.join(root, "src", "cli.ts"), "utf8");
   assert.match(
     posix,
     /command -v apk[\s\S]*apk info --exists libstdc\+\+[\s\S]*apk info --exists libgcc[\s\S]*apk info --exists gcompat[\s\S]*apk add --no-cache libstdc\+\+ libgcc gcompat/,
   );
   assert.match(
     posix,
-    /__configure-transaction apply[\s\S]*--server-command "\$dest" \\\n    < \/dev\/tty > "\$tmp_dir\/config-apply\.json"/,
-  );
-  assert.doesNotMatch(
-    posix,
-    /--server-command "\$dest" \\\n    --yes \\\n    < \/dev\/tty/,
+    /committed=1[\s\S]*release_install_lock[\s\S]*finalize_committed_cleanup[\s\S]*__configure-transaction apply[\s\S]*< \/dev\/tty > "\$setup_result_file" 2> \/dev\/tty/u,
   );
   assert.doesNotMatch(windows, /__configure-transaction/u);
   assert.doesNotMatch(windows, /Read-ConfigTransactionResult/u);
   assert.match(
     windows,
     /\$RuntimeStateTouched = \$true[\s\S]*?Invoke-Lifecycle \$Destination "health"/u,
+  );
+  const applyAdapter = cli.slice(
+    cli.indexOf('.command("apply")'),
+    cli.indexOf('.command("rollback")'),
+  );
+  assert.ok(
+    applyAdapter.indexOf('opts.format !== "json"') <
+      applyAdapter.indexOf("runInstallerConfigTransaction"),
+  );
+  const rollbackAdapter = cli.slice(cli.indexOf('.command("rollback")'));
+  assert.ok(
+    rollbackAdapter.indexOf('opts.format !== "json"') <
+      rollbackAdapter.indexOf("rollbackConfigTransaction"),
   );
 });
 
@@ -4810,7 +5019,89 @@ test("POSIX installer checks Alpine runtime packages before release downloads", 
   }
 });
 
-test("POSIX defers only the canonical interaction-unavailable response from an interactive attempt", async () => {
+test("POSIX piped installer routes setup through the controlling terminal", { timeout: 30_000 }, async () => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-piped-tty-"));
+  try {
+    const fixture = await createOfflineRelease(
+      temporary,
+      "0.3.2",
+      process.platform === "darwin" ? "darwin" : "linux",
+      process.arch === "arm64" ? "arm64" : "x64",
+    );
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const selectedInput = path.join(temporary, "selected.txt");
+    await mkdir(home);
+    const installer = path.join(root, "install.sh");
+    const command = `/bin/cat '${installer}' | /bin/sh`;
+    const args =
+      process.platform === "darwin"
+        ? ["-q", "/dev/null", "/bin/sh", "-c", command]
+        : ["-qec", command, "/dev/null"];
+    const environment: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+      HOME: home,
+      SHELL: "/bin/sh",
+      TERM: "xterm-256color",
+      FIXTURE_ROOT: fixture,
+      FAKE_CONFIG_REQUIRE_TTY: "1",
+      FAKE_CONFIG_INPUT_FILE: selectedInput,
+      SANA_MCP_INSTALL_DIR: installDirectory,
+      SANA_MCP_VERSION: "v0.3.2",
+    };
+    delete environment.CI;
+    delete environment.NO_COLOR;
+    const result = spawnSync("/usr/bin/script", args, {
+      encoding: "utf8",
+      env: environment,
+      input: "cursor\n",
+      timeout: 30_000,
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Select clients:/);
+    assert.equal(await readFile(selectedInput, "utf8"), "cursor\n");
+    await access(path.join(installDirectory, "sana-mcp"));
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX direct reinstall opens setup again", { timeout: 30_000 }, async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-reinstall-setup-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const transactionLog = path.join(temporary, "transactions.log");
+    await mkdir(home);
+    const environment = {
+      ...process.env,
+      PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+      HOME: home,
+      SHELL: "/bin/bash",
+      FIXTURE_ROOT: fixture,
+      FAKE_TRANSACTION_LOG_FILE: transactionLog,
+      SANA_MCP_INSTALL_DIR: installDirectory,
+      SANA_MCP_VERSION: "v0.3.2",
+      SANA_MCP_YES: "1",
+    };
+    for (let run = 0; run < 2; run++) {
+      const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+        encoding: "utf8",
+        env: environment,
+      });
+      assert.equal(result.status, 0, result.stderr);
+    }
+    assert.equal(await readFile(transactionLog, "utf8"), "apply\napply\n");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX keeps installation successful when post-install setup is unavailable", async () => {
   if (process.platform !== "linux") return;
   for (const terminalEnv of [
     { CI: "1", TERM: "xterm-256color" },
@@ -4837,9 +5128,7 @@ test("POSIX defers only the canonical interaction-unavailable response from an i
             PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
             HOME: home,
             FIXTURE_ROOT: fixture,
-            FAKE_CONFIG_OUTCOME: "interaction-unavailable",
             FAKE_CONFIG_EXIT: "1",
-            FAKE_CONFIG_AUTHENTICATION: "not-attempted",
             SANA_MCP_INSTALL_DIR: installDirectory,
             SANA_MCP_VERSION: "v0.3.2",
             SANA_MCP_YES: "",
@@ -4847,83 +5136,15 @@ test("POSIX defers only the canonical interaction-unavailable response from an i
         },
       );
       assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stdout, /configuration was deferred/);
       assert.match(
-        result.stdout,
-        /Run this command: '.*managed-bin\/sana-mcp' install/u,
+        `${result.stdout}\n${result.stderr}`,
+        /installation succeeded, but setup exited with code 1/,
       );
       await access(path.join(installDirectory, "sana-mcp"));
       await access(path.join(installDirectory, ".sana-mcp-install-v1"));
     } finally {
       await rm(temporary, { recursive: true, force: true });
     }
-  }
-});
-
-test("POSIX rejects contradictory transaction counts before claiming authentication", async () => {
-  if (process.platform !== "linux") return;
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-config-contradiction-"));
-  try {
-    const fixture = await createOfflineRelease(temporary);
-    const home = path.join(temporary, "home");
-    const installDirectory = path.join(temporary, "managed-bin");
-    await mkdir(home);
-    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
-        HOME: home,
-        FIXTURE_ROOT: fixture,
-        FAKE_CONFIG_OUTCOME: "no-mutation",
-        FAKE_CONFIG_APPLIED_COUNT: "1",
-        FAKE_CONFIG_AUTHENTICATION: "ready",
-        SANA_MCP_INSTALL_DIR: installDirectory,
-        SANA_MCP_VERSION: "v0.3.2",
-        SANA_MCP_YES: "1",
-      },
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /invalid transaction response/);
-    assert.doesNotMatch(result.stdout, /authentication was confirmed/);
-    await access(path.join(installDirectory, "sana-mcp"));
-    await access(path.join(installDirectory, ".sana-mcp-install-v1"));
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
-test("POSIX rejects ready authentication on a failed transaction before presentation", async () => {
-  if (process.platform !== "linux") return;
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-ready-failure-"));
-  try {
-    const fixture = await createOfflineRelease(temporary);
-    const home = path.join(temporary, "home");
-    const installDirectory = path.join(temporary, "managed-bin");
-    await mkdir(home);
-    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
-        HOME: home,
-        FIXTURE_ROOT: fixture,
-        FAKE_CONFIG_OUTCOME: "configuration-unavailable",
-        FAKE_CONFIG_EXIT: "1",
-        FAKE_CONFIG_AUTHENTICATION: "ready",
-        SANA_MCP_INSTALL_DIR: installDirectory,
-        SANA_MCP_VERSION: "v0.3.2",
-        SANA_MCP_YES: "1",
-      },
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /invalid transaction response/);
-    assert.doesNotMatch(result.stdout, /authentication was confirmed/);
-    assert.match(result.stderr, /retained the replacement runtime/);
-    await access(path.join(installDirectory, "sana-mcp"));
-    await access(path.join(installDirectory, ".sana-mcp-install-v1"));
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
   }
 });
 

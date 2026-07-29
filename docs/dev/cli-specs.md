@@ -15,7 +15,7 @@ flags, environment variables, and exit/edge behaviour.
 
 Status legend used throughout:
 
-- [shipped] - implemented in the current `v0.4.16` release candidate.
+- [shipped] - implemented in the current `v0.4.17` release candidate.
 - [planned] - designed in the per-area documents but not implemented in the
   current release candidate.
 
@@ -80,11 +80,10 @@ Both scripts:
    - musl Linux: `sana-mcp-linux-{x64,arm64}-musl`;
    - macOS: `sana-mcp-darwin-{x64,arm64}`;
    - Windows: `sana-mcp-windows-x64.exe` (Windows ARM64 is not published).
-3. Download the binary with platform-specific progress:
-   - `install.sh` uses `curl --progress-bar` without deriving separate speed or
-     ETA fields.
-   - `install.ps1` uses a custom streamed renderer such as
-     `[####----] 45%  43.2/95.5 MB  2.4 MB/s  ETA 00:21`.
+3. Download the binary with the same progress contract on every platform:
+   `[####----] 45%  43.2/95.5 MB  2.4 MB/s  ETA 00:21`. When the server does not
+   provide a total size, show only transferred MB and speed rather than inventing
+   a percentage or ETA.
 4. Require and verify the SHA-256 sidecars for release metadata, the release
    manifest, and the selected binary. A missing, malformed, mismatched, or
    incorrectly named checksum aborts before installation; checksum verification
@@ -100,7 +99,8 @@ Both scripts:
 7. Complete the platform handoff:
    - A direct Windows script run commits the runtime transaction, releases its
      locks and temporary resources, then attempts to start the public configurer.
-   - POSIX keeps client configuration inside its installer transaction.
+   - A direct POSIX script run also commits and releases installer resources
+     before starting the same configurer UI through its journaled batch API.
    - An updater handoff does not start the configurer.
 
 Manual install: download the asset for your platform from the
@@ -117,7 +117,7 @@ Manual install: download the asset for your platform from the
 
 ### 2.3 Handoff and screen flow
 
-Windows and POSIX intentionally use different transaction boundaries:
+Windows and POSIX use the same user-facing setup flow:
 
 - Every successful direct Windows script run - local or one-line, fresh,
   compatible, or incompatible - attempts to start the public
@@ -134,12 +134,13 @@ Windows and POSIX intentionally use different transaction boundaries:
   A compatible Windows update preserves registration, authentication, and local
   meeting state without setup output. Only an incompatible Windows update prints
   the exact deferred command that opens client configuration and sign-in.
-- POSIX behavior is unchanged. A fresh interactive direct install runs the
-  private, journaled configuration transaction before installer commit. A fresh
-  direct non-TTY install defers configuration and prints the exact public
-  command; `SANA_MCP_YES=1` performs unattended transactional configuration.
-  A receipt-backed compatible existing direct install preserves client
-  configuration and does not reopen it.
+- Every direct POSIX script run opens the same configurer UI exactly once after
+  runtime commit, including a receipt-backed compatible reinstall. Its internal
+  journaled batch prevents a later client write failure from leaving earlier
+  registrations partially applied.
+  Interactive setup uses the controlling terminal even when the script itself
+  is piped to `sh`; `SANA_MCP_YES=1` runs `sana-mcp install --yes`. Updater
+  handoffs preserve configuration without reopening setup.
 
 The public configurer detects supported AI clients, allows checked selections to
 be toggled, and applies registrations. When at least one safely configurable row
@@ -545,11 +546,9 @@ No data leaves the machine except authenticated requests to Sana itself.
 - A bare `sana-mcp` invocation without a TTY prints a hint and exits 0 rather
   than hanging.
 - `sana-mcp install` without a TTY and without `--yes` reports
-  interaction-unavailable and exits 1. When a direct Windows installer launches
-  it after commit and cleanup, that local setup failure does not change the
-  successful runtime installation; the outer installer prints an exact retry
-  command. The POSIX installer instead detects non-TTY operation before invoking
-  configuration, keeps the installed runtime, and prints the later command.
+  interaction-unavailable and exits 1. When a direct installer launches it after
+  commit and cleanup, that local setup failure does not change the successful
+  runtime installation; the outer installer prints an exact retry command.
 - Interactive surfaces (app, configurer wizard) require a TTY on both stdin and
   stdout.
 - Color is applied only on a TTY and when `NO_COLOR`/`TERM=dumb` are unset.
