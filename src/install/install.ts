@@ -21,7 +21,12 @@ import {
 import { SanaClient } from "../sana/client.js";
 import { inspectCurrentSession } from "../sana/session-publication.js";
 import { SanaStore, type SessionVersion, type SyncState } from "../store/db.js";
-import { CLIENTS, detectClient, type ClientDef } from "./clients.js";
+import {
+  CLIENTS,
+  detectClient,
+  supportedClients,
+  type ClientDef,
+} from "./clients.js";
 import type { DetectionResult } from "./detect.js";
 import { ConfigurerPresentation } from "./presentation.js";
 import { serverTarget } from "./server-target.js";
@@ -1642,7 +1647,7 @@ export async function runInstall(
   interaction: InstallInteraction = {},
 ): Promise<InstallerFlowResult> {
   const presentation = presentationFor(interaction);
-  const clients = interaction.clients ?? CLIENTS;
+  const clients = supportedClients(interaction.clients ?? CLIENTS);
   const serverName = opts.name ?? "sana-mcp";
   validateServerName(serverName);
   const entry = interaction.target ?? serverTarget();
@@ -2503,7 +2508,7 @@ export async function runUninstall(
   interaction: InstallInteraction = {},
 ): Promise<UninstallerFlowResult> {
   const presentation = presentationFor(interaction);
-  const clients = interaction.clients ?? CLIENTS;
+  const clients = supportedClients(interaction.clients ?? CLIENTS);
   const serverName = opts.name ?? "sana-mcp";
   validateServerName(serverName);
   const dryRun = opts.dryRun === true;

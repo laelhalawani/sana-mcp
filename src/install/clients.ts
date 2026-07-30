@@ -29,9 +29,30 @@ export interface FileInstall {
 export interface ClientDef {
   id: string;
   name: string;
+  /** Platforms the client ships on. Omitted means it ships everywhere. */
+  platforms?: readonly NodeJS.Platform[];
   detect: () => DetectionResult;
   install: FileInstall;
   reloadHint: string;
+}
+
+/**
+ * A client that does not ship on this platform is not a detection failure and
+ * not a configuration failure; it simply does not exist here. Such clients are
+ * dropped before detection so they never reach the wizard or the output.
+ */
+export function isClientSupported(
+  client: ClientDef,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return client.platforms === undefined || client.platforms.includes(platform);
+}
+
+export function supportedClients(
+  clients: readonly ClientDef[],
+  platform: NodeJS.Platform = process.platform,
+): readonly ClientDef[] {
+  return clients.filter((client) => isClientSupported(client, platform));
 }
 
 export function detectClient(client: ClientDef): DetectionResult {
@@ -180,6 +201,8 @@ export const CLIENTS: readonly ClientDef[] = [
   {
     id: "claude-desktop",
     name: "Claude Desktop",
+    // Claude Desktop has no Linux build.
+    platforms: ["darwin", "win32"],
     detect: () =>
       combineDetections([
         detectResolvedPath(claudeDesktopConfig()),

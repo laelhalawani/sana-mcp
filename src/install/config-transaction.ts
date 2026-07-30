@@ -14,7 +14,12 @@ import {
   type ClientChange,
   type DesiredRegistration,
 } from "./apply.js";
-import { CLIENTS, detectClient, type ClientDef } from "./clients.js";
+import {
+  CLIENTS,
+  detectClient,
+  supportedClients,
+  type ClientDef,
+} from "./clients.js";
 import type { ServerTarget } from "./server-target.js";
 import { applyFileChange } from "./writers.js";
 import { boundedErrorText } from "./error-text.js";
@@ -1153,7 +1158,8 @@ export async function applyConfigTransaction(
       args: ["mcp"],
     };
     const mutations =
-      options.mutations ?? detectedMutations(options.clients ?? CLIENTS);
+      options.mutations ??
+      detectedMutations(supportedClients(options.clients ?? CLIENTS));
     prepared = await prepareTargets(mutations, serverTarget);
     try {
       validateNoopPreconditions(prepared);
