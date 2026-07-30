@@ -211,12 +211,16 @@ test("verified installer stop terminates only the exact stale identity", async (
         published: true,
         continuity: "confirmed",
       }),
-      terminateStale: (identity) => {
+      terminateStale: (identity, expectedExecutable) => {
         terminated.push(identity);
+        expect(expectedExecutable).toBe("/verified/sana-mcp");
         alive = false;
       },
     }),
-    { allowStaleTerminate: true },
+    {
+      allowStaleTerminate: true,
+      staleExecutablePath: "/verified/sana-mcp",
+    },
   );
   expect(terminated).toEqual([A]);
   expect(result).toEqual({ state: "stopped", changed: true });

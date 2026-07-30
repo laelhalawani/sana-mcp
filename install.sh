@@ -2,8 +2,8 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.21 sh
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.21/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.22 sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.22/install.sh | sh
 set -eu
 set -f
 umask 077
@@ -1622,8 +1622,10 @@ if [ -e "$dest" ] || [ -e "$receipt" ]; then
   read_inspect "$tmp_dir/old-inspect.properties" "$R_version" "$R_target" receipt
   [ "$R_stateCompatibility" = "$P_stateCompatibility" ] ||
     fail "existing local state is incompatible with this release; automatic POSIX state replacement is not supported yet"
-  "$dest" __lifecycle health --format properties --allow-stale-running > "$tmp_dir/lifecycle.properties" ||
-    fail "existing runtime does not support the required lifecycle protocol"
+  if ! "$dest" __lifecycle health --format properties > "$tmp_dir/lifecycle.properties" 2>/dev/null; then
+    "$tmp_dir/binary" __lifecycle health --format properties --allow-stale-running > "$tmp_dir/lifecycle.properties" ||
+      fail "existing runtime does not support the required lifecycle protocol"
+  fi
   read_lifecycle "$tmp_dir/lifecycle.properties"
   [ "$L_state" != "running" ] || old_was_running=1
   cp "$dest" "$tmp_dir/old-binary"
@@ -1677,7 +1679,9 @@ path_lock_acquired=1
 transaction_active=1
 if [ "$old_was_running" = "1" ]; then
   assert_installer_locks_owned
-  "$dest" __lifecycle stop --format properties --allow-stale-terminate > "$tmp_dir/lifecycle.properties" ||
+  "$tmp_dir/binary" __lifecycle stop --format properties \
+    --allow-legacy-cooperative --allow-stale-terminate \
+    --stale-executable "$dest" > "$tmp_dir/lifecycle.properties" ||
     fail "existing daemon could not be stopped safely"
   read_lifecycle "$tmp_dir/lifecycle.properties"
   [ "$L_state" = "stopped" ] || fail "existing daemon did not stop"

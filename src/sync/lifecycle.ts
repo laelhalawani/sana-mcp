@@ -136,6 +136,7 @@ export interface DaemonLifecycleOptions {
   readonly allowStaleRunning?: boolean;
   /** Verified POSIX installer authority to terminate one exact stale instance. */
   readonly allowStaleTerminate?: boolean;
+  readonly staleExecutablePath?: string;
 }
 
 export interface DaemonLifecycleDependencies {
@@ -145,7 +146,10 @@ export interface DaemonLifecycleDependencies {
   ) => DaemonStopRequestResult;
   readonly clearControl: (identity: DaemonControlIdentity) => void;
   readonly clearLegacyControl: (identity: DaemonControlIdentity) => void;
-  readonly terminateStale: (identity: DaemonControlIdentity) => void;
+  readonly terminateStale: (
+    identity: DaemonControlIdentity,
+    expectedExecutable: string,
+  ) => void;
   readonly ensureRunning: () => Promise<EnsureDaemonResult>;
   readonly pidAlive: (pid: number) => boolean;
   readonly monotonicNow: () => number;
@@ -162,7 +166,7 @@ const DEFAULT_DEPENDENCIES: DaemonLifecycleDependencies = {
   clearControl: (identity) => clearDaemonControl(identity),
   clearLegacyControl: (identity) =>
     clearDeadLegacyDaemonControl(identity),
-  terminateStale: (identity) => {
+  terminateStale: (identity, expectedExecutable) => {
     if (process.platform !== "linux") {
       throw new Error("forced stale daemon termination is available only on Linux");
     }
@@ -212,7 +216,7 @@ const DEFAULT_DEPENDENCIES: DaemonLifecycleDependencies = {
       }
       if (!stopped) throw new Error("stale daemon could not be suspended safely");
       const daemonExecutable = fs.realpathSync.native(`/proc/${identity.pid}/exe`);
-      const lifecycleExecutable = fs.realpathSync.native(process.execPath);
+      const lifecycleExecutable = fs.realpathSync.native(expectedExecutable);
       if (daemonExecutable !== lifecycleExecutable) {
         throw new Error("stale daemon executable does not match the verified runtime");
       }
@@ -500,7 +504,10 @@ export async function runDaemonLifecycleWith(
         options.allowStaleTerminate === true &&
         !terminatedStale.has(key)
       ) {
-        dependencies.terminateStale(control.identity);
+        dependencies.terminateStale(
+          control.identity,
+          options.staleExecutablePath ?? process.execPath,
+        );
         terminatedStale.add(key);
         changed = true;
       }
