@@ -81,7 +81,89 @@ switching. Search shows the index state (`semantic index 32/240`), the mode
 Fix while porting: ESC is not advertised as "back" in the meetings footer, and
 two rapid ESC presses get swallowed.
 
-## Search architecture
+## Search architecture - FINAL
+
+> Read this section. Everything below it is the investigation trail, in the order
+> it happened, including conclusions that later proved wrong.
+
+### The founding premise was false
+
+The brief for this work said: *searching "Fabrics PIM" picks up "Fabrik", but
+semantic embeddings still find the results.* **On the real corpus they do not.**
+
+A gold set of 11 chunks where "Fabrik" unambiguously means the Fabrix product was
+built **by reading them** (`#11218` "do porównania między Fabrik, a Northwind, a
+Lumen"; `#11720` "co już mamy dostępne w Fabrik, jest po prostu za słabe"). Rank of
+the best gold chunk:
+
+| Query | BM25 | potion | **all-MiniLM (production)** |
+|---|---|---|---|
+| `fabrics vs lumen testing` | 156 | 1152 | **451** |
+| `Fabrics PIM` | 169 | 61 | **296** |
+| `comparison of lumen and fabrics for copywriting` | 288 | 2327 | **1317** |
+| `fabrics limitations` | 3421 | 298 | **99** |
+
+**Zero of 11 gold chunks appear in the top 50 for any method, including the model
+in production today.** The semantic search never found these. It *looked* like it
+worked because ~40 other chunks spell "Fabrics"/"Fabrix" correctly, so the queries
+return plausible results while the Fabrik chunks are silently missing.
+
+Searched using the transcript's own spelling - `porownanie Lumen i Fabrik
+copywriting` - **BM25 returns the gold chunk at rank 1**, while potion is at 75
+and MiniLM at 166.
+
+### What actually works: an alias map
+
+A ~10-line glossary (`fabrics -> fabrics|fabrix|akineo|fabrik`) applied as query
+expansion:
+
+| Query | BM25 plain | **BM25 + alias** |
+|---|---|---|
+| `fabrics vs lumen testing` | 156 | **4** |
+| `Fabrics PIM` | 173 | **5** |
+| `comparison of lumen and fabrics for copywriting` | 288 | **9** |
+| `fabrics limitations` | 3421 | **3** |
+| `what is weak in fabrics` | 565 | **2** |
+
+A hand-written table beats every embedding model by two orders of magnitude on
+the case that motivated this entire investigation.
+
+### Revised recommendation
+
+**FTS5 BM25 + an alias/glossary expansion layer is the primary search.**
+The dense channel is secondary and optional.
+
+- `modernc.org/sqlite` **alone** covers the core need: pure Go, no cgo, FTS5 and
+  trigram verified, **6.0 MB binary**. **v1 can ship with no embedding model at
+  all.**
+- Keep a dense channel only as a supplement for conceptual queries where it
+  demonstrably helped (`data import issues`, `what did we decide about the
+  crawler`). If kept, use potion in Go: **19.2 s / 119 MB peak RSS** for 12,914
+  chunks, versus MiniLM ONNX at **over 16 minutes** on the same corpus, versus the
+  Bun daemon's 4,260 MB. `modernc.org/sqlite/vec` runs sqlite-vec v0.1.9 with no
+  cgo on all six platforms.
+
+**The real design question is no longer which model - it is how to build the
+alias map.** The entity set is small and stable (Lumen, Fabrics, Northwind, Vantik,
+Zenolith, Storyblok, Marketly, Electrolux). A curated glossary of 20-50 entries,
+user-editable, is cheap and highly effective. Automatic mining will not find it -
+"Fabrik" is edit distance 4 from "Fabrics" and phonetically unrelated - but the MCP
+already has an LLM in the loop that could propose candidates from context for
+human approval.
+
+### Open
+
+- **Dense models collapsed on this corpus:** the same generic chunks (`#5600`,
+  `#230`, `#11390`) surfaced for nearly every query, suggesting 96-word chunks of
+  conversational ASR speech embed to mush. Chunk-size sweep needed if dense is kept.
+- `potion-multilingual-128M` untested. 8.2 % of chunks are Polish/Swedish/
+  Norwegian and **the key gold chunks are Polish**, so it matters. Note the size:
+  489 MB f32, ~122 MB int8 - a meaningful download.
+- Fusion weights must be retested on real data.
+
+---
+
+## Investigation trail (superseded conclusions kept deliberately)
 
 **Settled and fully verified - the storage and runtime half:**
 `modernc.org/sqlite` + `modernc.org/sqlite/vec` (sqlite-vec v0.1.9), pure Go, no
