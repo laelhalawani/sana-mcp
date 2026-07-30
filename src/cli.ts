@@ -151,6 +151,18 @@ function requireStandaloneInstallerCommand(command: string): void {
 }
 
 program
+  .command("__installer-fsync <kind>", { hidden: true })
+  .description("Persist one installer-owned file or directory")
+  .requiredOption("--path <path>", "absolute file or directory path")
+  .action(async (kind: string, opts: { path: string }) => {
+    requireStandaloneInstallerCommand("__installer-fsync");
+    if (kind !== "file" && kind !== "directory")
+      throw new Error("__installer-fsync kind must be file or directory");
+    const { syncInstallerPath } = await import("./install/durability.js");
+    syncInstallerPath(kind, opts.path);
+  });
+
+program
   .command("__reset-incompatible-state <operation>", { hidden: true })
   .description("Run the installer incompatible-state reset protocol")
   .requiredOption("--journal <directory>", "private reset journal directory")
