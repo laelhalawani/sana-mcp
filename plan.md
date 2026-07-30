@@ -128,10 +128,138 @@ expansion:
 A hand-written table beats every embedding model by two orders of magnitude on
 the case that motivated this entire investigation.
 
+### Why every model failed: the general law
+
+Measured IDF over the real corpus:
+
+| Term | chunks | % of corpus | IDF | |
+|---|---|---|---|---|
+| **lumen** | 478 | 3.70 % | 3.30 | near-stopword |
+| **northwind** | 189 | 1.46 % | 4.22 | near-stopword |
+| lumen | 409 | 3.17 % | 3.45 | near-stopword |
+| pim | 179 | 1.39 % | 4.28 | low |
+| **fabrics** | 25 | 0.19 % | **6.23** | high signal |
+| **fabrix** | 15 | 0.12 % | **6.73** | high signal |
+| **zenolith** | 6 | 0.05 % | **7.59** | high signal |
+| vantik | 46 | 0.36 % | 5.63 | high signal |
+
+**ASR garbles rare proper nouns, and rare proper nouns are exactly the high-IDF
+tokens retrieval depends on.** In "comparison of lumen and fabrics", the only
+discriminative token is `fabrics` - the garbled one. Lumen (own company) and
+Northwind (main client) appear in 3.7 % and 1.5 % of all chunks and carry almost no
+discriminative power, so the correctly-spelled entities in a query cannot carry
+it. This is why *every* method failed: it is not a model-quality problem.
+
+Word-order/structure was tested separately: all-MiniLM (a transformer) does beat
+mean-pooled potion on comparison-shaped queries (451 vs 1152; 1317 vs 2327), so
+structure helps measurably - but moving gold from rank 2327 to 1317 is
+practically irrelevant. **Structure is not the bottleneck; the missing high-IDF
+token is.**
+
+### potion-multilingual-128M: rejected
+
+| | int8 size | encode 12,914 chunks | peak RSS |
+|---|---|---|---|
+| potion-retrieval-32M (Go) | **31 MB** | **19.2 s** | **119 MB** |
+| potion-multilingual-128M | 122 MB | 21.5 s | ~150-200 MB in Go |
+| all-MiniLM-L6-v2 ONNX q8 | 22 MB | **> 16 min** | - |
+
+Rank of best gold chunk:
+
+| Query | BM25 | potion-32M | all-MiniLM | potion-ml-128M | **BM25+alias** |
+|---|---|---|---|---|---|
+| `fabrics vs lumen testing` | 156 | 1152 | 451 | 184 | **4** |
+| `Fabrics PIM` | 169 | 61 | 296 | 235 | **5** |
+| `comparison of lumen and fabrics for copywriting` | 288 | 2327 | 1317 | 465 | **9** |
+| `fabrics limitations` | 3421 | 298 | 99 | 4337 | **3** |
+| `what is weak in fabrics` | 565 | - | - | 951 | **2** |
+| `porownanie Lumen i Fabrik copywriting` (Polish, correct term) | **1** | 75 | 166 | 244 | - |
+
+On the **Polish** query using the transcript's own spelling, plain BM25 ranks gold
+**1st** while the multilingual model manages **244**. Being multilingual did not
+rescue the Polish chunks. **122 MB not justified.**
+
+### Automatic alias discovery: measured, and it fails
+
+- **Distributional similarity** (PPMI context vectors, 7,780 candidates): `fabrik`
+  ranks **713 / 7780** among `fabrics`'s neighbours (cos 0.139). It fails because
+  the context vector encodes **language, not topic** - `fabrik` occurs
+  overwhelmingly in Polish chunks so its neighbours are Polish function words -
+  and because `fabrik` has df=101 split across two senses (a person named Antoni,
+  and the product).
+- **Pseudo-relevance feedback (RM3)**: exactly **one** chunk in 12,914 contains
+  both an Fabrics variant and `fabrik`. RM3 never surfaces it; two queries improved
+  marginally, two got worse (`what is weak in fabrics` 562 -> 1858).
+- **One genuine win:** distributional mining *does* find spelling near-misses for
+  free - `fabriks` is the top neighbour of `fabrics` (cos 0.48), `kineo` of
+  `fabrix` (0.51). Combined with edit distance and double metaphone it harvests
+  `fabrix`/`akineo`/`fabriks`/`crawlery` with no LLM at all. It simply cannot
+  bridge to `fabrik`.
+
+**No unsupervised statistical method recovers `Fabrik`. The signal is not in the
+corpus statistics.**
+
+### The upstream fix is closed
+
+`src/sana/types.ts` defines `TranscriptWord` as `{text, start_timestamp,
+end_timestamp}`. **No confidence, no alternatives, no n-best, no lattice** - Sana
+returns 1-best only. The literature is clear that lattice / n-best retrieval is
+the correct answer for this problem class (Saraclar & Sproat; n-best spoken
+content retrieval), and it is unavailable to us. **Worth asking Sana whether the
+API can expose word alternatives - that would make everything below unnecessary.**
+
+### Prior art, scored against our actual case
+
+| Approach | Retrieves the Fabrik chunks? | Pure Go, no cgo? |
+|---|---|---|
+| ASR lattice / n-best | **Yes** - the literature's answer | N/A, API does not expose it |
+| Phonetic embeddings / phone indexing | **No** (`AKN` vs `ANTK`, measured) | Yes |
+| fastText-style subword n-grams | **No** (zero trigram overlap, measured) | Yes |
+| SPLADE / doc2query expansion | **No** - cannot invent `Fabrics` from `Fabrik` | No, needs a transformer |
+| Distributional alias mining | **No** (rank 713, measured) | Yes |
+| PRF / RM3 | **No** (measured) | Yes |
+| **LLM alias mining from context** | **Yes** (demonstrated) | Yes - LLM already in the loop |
+
+Closest published analogue: Apple's retrieval-augmented correction of named-entity
+ASR errors, which is an LLM plus an entity database - structurally the same as the
+recommendation below.
+
 ### Revised recommendation
 
-**FTS5 BM25 + an alias/glossary expansion layer is the primary search.**
-The dense channel is secondary and optional.
+**FTS5 BM25 + an alias table mined automatically at index time by the LLM that is
+already in the loop.** The dense channel is secondary and optional.
+
+No one enumerates anything ahead of time; the mining is a per-user, per-corpus
+batch job:
+
+1. Extract rare proper-noun candidates: **1,944 terms** at `3 <= df <= 2 %` of
+   chunks (measured). `Fabrik`, `Fabrics`, `Fabrix`, `Akineo`, `Vantik`, `Zenolith`
+   are all in that set.
+2. Harvest free wins locally first - edit distance + double metaphone (**both**
+   codes) + distributional neighbours - clustering `fabrics`/`fabrix`/`akineo`/
+   `fabriks` and `zenolith`/`crawlery` with no LLM.
+3. Send the remainder with 2-3 context snippets each to the LLM - roughly **350k
+   tokens, one cheap batch pass per user** - asking which rare tokens denote the
+   same entity. **Existence proof:** the investigating agent built the 11-chunk
+   gold set exactly this way, from context alone, with no prior knowledge and no
+   curation.
+4. Store the alias table in SQLite; expand queries at search time.
+
+Measured upper bound of this mechanism: **3421 -> 3, 288 -> 9, 156 -> 4.** Two
+orders of magnitude, against every embedding model failing.
+
+**Unsolved design detail, prototype it early:** `Fabrik` denotes a *person* in ~90
+of its 101 chunks. A blanket alias would inject false positives, so the mined
+entry must be **sense-scoped** (applying only in chunks co-occurring with
+PIM/product/comparison context) or applied as a **soft boost** rather than a hard
+OR.
+
+**If the LLM mining pass is also unacceptable**, the honest answer is that this
+class of miss is unrecoverable from 1-best transcripts, and the right move is to
+press Sana for word alternatives rather than build a workaround that measures
+worse than the problem.
+
+### SUPERSEDED framing (kept for the trail)
 
 - `modernc.org/sqlite` **alone** covers the core need: pure Go, no cgo, FTS5 and
   trigram verified, **6.0 MB binary**. **v1 can ship with no embedding model at
