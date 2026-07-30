@@ -19,15 +19,18 @@ import {
 import {
   semanticEnabled,
   semanticCapabilityState,
+  embedTexts,
   embedMeeting,
   ensureVec,
   EMBED_DIM,
   EMBED_MODEL,
   SEMANTIC_INDEX_VERSION,
   SemanticUnavailableError,
+  type EmbedTexts,
   type VectorBackend,
   vectorBackendForPlatform,
 } from "../semantic/semantic.js";
+import { EmbeddingWorkerClient } from "../semantic/embedding-worker.js";
 import { RUNTIME_ENV } from "../runtime/env.js";
 import { dataDirectory, ensureDataDir } from "../config.js";
 import {
@@ -49,6 +52,36 @@ const HEARTBEAT_MS = 5_000;
 const REQUEST_DELAY_MS = RUNTIME_ENV.requestDelayMs;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export async function awaitEmbeddingWithHeartbeat(
+  embedBatch: EmbedTexts,
+  texts: string[],
+  heartbeatOrStop: () => void,
+  intervalMs = HEARTBEAT_MS,
+): Promise<Float32Array[]> {
+  const controller = new AbortController();
+  const outcome = embedBatch(texts, controller.signal).then(
+    (vectors) => ({ kind: "done" as const, vectors }),
+    (error: unknown) => ({ kind: "error" as const, error }),
+  );
+  for (;;) {
+    const result = await Promise.race([
+      outcome,
+      sleep(intervalMs).then(() => null),
+    ]);
+    if (result !== null) {
+      if (result.kind === "error") throw result.error;
+      return result.vectors;
+    }
+    try {
+      heartbeatOrStop();
+    } catch (error) {
+      controller.abort(error);
+      await outcome;
+      throw error;
+    }
+  }
+}
 
 function log(...a: unknown[]): void {
   try {
@@ -181,11 +214,25 @@ export async function syncOnce(
   leaseInstanceId: string,
   stopRequested: () => boolean = () => false,
   controlHeartbeat: () => void = () => {},
+  embedBatch: EmbedTexts = embedTexts,
 ): Promise<void> {
   const heartbeatOrStop = (): void => {
     heartbeatDaemonLease(store, leaseInstanceId);
     controlHeartbeat();
     if (stopRequested()) throw new DaemonStopRequestedError();
+  };
+  const embedWithHeartbeat: EmbedTexts = async (texts) => {
+    try {
+      return await awaitEmbeddingWithHeartbeat(
+        embedBatch,
+        texts,
+        heartbeatOrStop,
+      );
+    } finally {
+      // Revalidate after every attempt, including fast failures and batches
+      // that finish before the periodic heartbeat, before any publication.
+      heartbeatOrStop();
+    }
   };
   const initialState = store.getSyncState();
   const identityChanged =
@@ -421,9 +468,12 @@ export async function syncOnce(
           t.fetched_ms,
           lines,
           (commit) => write(commit),
+          embedWithHeartbeat,
         );
         emb++;
       } catch (e) {
+        if (e instanceof DaemonLeaseLostError) throw e;
+        if (e instanceof DaemonStopRequestedError) throw e;
         if (e instanceof SyncGenerationChangedError) throw e;
         if (e instanceof SemanticUnavailableError) {
           // Embeddings can't run in this environment; degrade to keyword-only
@@ -462,6 +512,7 @@ export async function runDaemon(): Promise<void> {
     clearControl: (identity) => clearDaemonControl(identity),
   });
   const store = new SanaStore();
+  const embeddingWorker = new EmbeddingWorkerClient();
   let leaseAcquired = false;
   let leaseInstanceId: string | undefined;
   let control: DaemonControlIdentity | undefined;
@@ -532,8 +583,9 @@ export async function runDaemon(): Promise<void> {
           currentClient,
           activeCycle,
           activeControl.instanceId,
-          () => daemonStopRequested(activeControl.instanceId),
+          () => stopping || daemonStopRequested(activeControl.instanceId),
           () => refreshDaemonControl(activeControl),
+          embeddingWorker.embed,
         );
       } catch (e) {
         if (e instanceof DaemonLeaseLostError) throw e;
@@ -590,6 +642,11 @@ export async function runDaemon(): Promise<void> {
     process.off("SIGINT", onSigint);
     const errors: unknown[] = [];
     let retainControl = false;
+    try {
+      await embeddingWorker.close();
+    } catch (error) {
+      errors.push(error);
+    }
     try {
       finalizeDaemonResources(
         store,
