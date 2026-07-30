@@ -81,11 +81,26 @@ switching. Search shows the index state (`semantic index 32/240`), the mode
 Fix while porting: ESC is not advertised as "back" in the meetings footer, and
 two rapid ESC presses get swallowed.
 
-## RESOLVED: search architecture (investigation complete, measured)
+## Search architecture
 
-Recommendation, pending validation on the real corpus:
-**`modernc.org/sqlite` + `modernc.org/sqlite/vec` (sqlite-vec) + a hand-written
-model2vec/potion encoder in Go + FTS5 BM25 as a gated booster.** Pure Go, no cgo.
+**Settled and fully verified - the storage and runtime half:**
+`modernc.org/sqlite` + `modernc.org/sqlite/vec` (sqlite-vec v0.1.9), pure Go, no
+cgo, all six cross-compile targets, 9.6 MB binary. Nothing below changes this.
+
+**Settled - a genuine hybrid of dense + FTS5 BM25.** Both channels are
+load-bearing on the real corpus: BM25 wins on proper nouns that appear spelled
+correctly somewhere, dense wins on ASR garblings ("Crawliera", "lumen"). Fusion
+weights must be tuned on real data - see the correction section.
+
+**Open - which embedding model.** potion is 36x lighter on RAM (119 MB vs
+4,260 MB, measured on the real corpus) and far faster, but it lost to BM25 on
+proper nouns and is English-only against a corpus with an 8.2 % non-English tail.
+Deciding this needs the pending MiniLM like-for-like run and a
+`potion-multilingual-128M` comparison.
+
+> The two sections that follow were written from a **24-chunk synthetic corpus**
+> and are partly superseded. Read the real-corpus correction further down before
+> acting on either.
 
 ### The "Fabrics PIM" -> "Fabrik" case is not phonetic
 
@@ -108,7 +123,12 @@ via `fts5vocab` + an in-memory double-metaphone map (all measured matching):
 Kubernetes/"Cooper Netties", Postgres/"Post grass", Grafana/"Graphana",
 Datadog/"Data dog", and the Fabrix/Fabrics user typo.
 
-### Real query shapes are the easy case (measured)
+### Real query shapes are the easy case (measured on the SYNTHETIC corpus)
+
+> Superseded in part - see the real-corpus correction below. The BM25 "MISS" in
+> the table did not reproduce on the real data, where BM25 found correctly-spelled
+> "Fabrix" chunks at rank 3.
+
 
 The garbled proper noun gets **outvoted** by the surrounding content words. Rank
 of the correct chunk:
@@ -193,7 +213,57 @@ int8 quantization is free (identical to f32, 123 MB -> 31 MB). **Ship 512d int8.
 process, no arena: nothing to leak. Compare 20k chunks indexed in under 2 seconds
 against a daemon that reached 6.79 GB and had to be SIGKILLed.
 
-### Ranking: dense-first, lexical gated. Not naive RRF.
+### CORRECTION: validated against the real corpus (12,914 chunks)
+
+Everything above this point came from a 24-chunk synthetic corpus. The
+investigation was then re-run against **12,914 chunks rebuilt from
+`~/.sana-mcp/sana.db`** (240 meetings, 1.24M words). Two synthetic conclusions
+**did not survive**, and the sections above are kept only to show the reasoning.
+
+**1. Memory and speed - confirmed, on real data:**
+
+| | Time | Peak RSS |
+|---|---|---|
+| **Go + potion** | **19.2 s** | **119 MB** |
+| Current Bun daemon | - | **4,260 MB** |
+
+~36x less memory for the same work, with a flat allocation profile: no worker
+process, no ONNX arena, no cross-process serialization, nothing to leak. Also
+confirmed: `embedMeeting` is called from the sync daemon
+(`src/sync/daemon.ts:464`), so this runs **during normal usage on every sync**,
+not at build time. That is exactly where the leak lives.
+
+**2. BM25 is much stronger on the real corpus than the synthetic test showed.**
+For `fabrics vs lumen testing`, BM25 did **not** miss: it returned "I will be
+testing the products, I think, both in Fabrix and..." at rank 3 and "data
+structure in Fabrics" at rank 5. The real transcripts contain "Fabrix"/"Fabrics"
+spelled **correctly in many places** - something a 24-chunk corpus could not
+show. potion did not surface those chunks at all. **On proper-noun queries BM25
+beat potion.**
+
+Consequences:
+- "Dense-first, BM25 as a gated booster" is **wrong for this corpus**.
+- The "RRF hurts" result **does not transfer** - it was an artifact of a corpus
+  where BM25 had no real signal.
+- A **genuine hybrid** is needed, with fusion weights retested on real data.
+
+**3. Dense still earns its place, visibly.** For `what did we decide about the
+crawler`, potion surfaced chunks containing **"Crawliera"** and **"zenolith"** -
+ASR garblings BM25 cannot reach. The `lumen` -> `lumen` error appears literally
+in the data: potion's top hit contained "create a custom, **lumen** only
+property". Both channels are load-bearing, for different failure modes.
+
+**4. Language tail is real:** the corpus is **8.2 % non-English** - 694 Polish,
+306 Swedish, 61 Norwegian chunks. Both potion-retrieval-32M and the current
+MiniLM are English-only, so this is not a regression, but
+`potion-multilingual-128M` (distilled from bge-m3) would be a genuine upgrade.
+
+**Still open:** a like-for-like MiniLM quality/cost run on the real corpus, and
+the same queries against `potion-multilingual-128M`. Those decide between
+"potion + real hybrid" and "keep MiniLM and pay the cgo cost". The storage and
+runtime half is unchanged and fully verified.
+
+### SUPERSEDED (synthetic corpus): dense-first, lexical gated
 
 | Method | R@1 | R@3 | MRR |
 |---|---|---|---|
