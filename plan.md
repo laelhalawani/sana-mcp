@@ -199,14 +199,13 @@ rescue the Polish chunks. **122 MB not justified.**
 **No unsupervised statistical method recovers `Fabrik`. The signal is not in the
 corpus statistics.**
 
-### The upstream fix is closed
+### The upstream fix is closed, permanently
 
 `src/sana/types.ts` defines `TranscriptWord` as `{text, start_timestamp,
-end_timestamp}`. **No confidence, no alternatives, no n-best, no lattice** - Sana
-returns 1-best only. The literature is clear that lattice / n-best retrieval is
-the correct answer for this problem class (Saraclar & Sproat; n-best spoken
-content retrieval), and it is unavailable to us. **Worth asking Sana whether the
-API can expose word alternatives - that would make everything below unnecessary.**
+end_timestamp}`: no confidence, no alternatives, no n-best, no lattice. The
+literature's correct answer for this problem class is lattice / n-best retrieval
+(Saraclar & Sproat), and it is unavailable. **Sana has no API to request it
+from.** Treat 1-best text as a hard constraint, not something to negotiate.
 
 ### Prior art, scored against our actual case
 
@@ -218,46 +217,72 @@ API can expose word alternatives - that would make everything below unnecessary.
 | SPLADE / doc2query expansion | **No** - cannot invent `Fabrics` from `Fabrik` | No, needs a transformer |
 | Distributional alias mining | **No** (rank 713, measured) | Yes |
 | PRF / RM3 | **No** (measured) | Yes |
-| **LLM alias mining from context** | **Yes** (demonstrated) | Yes - LLM already in the loop |
+| Index-time LLM alias mining | n/a - **not possible** | **No LLM exists at index time** |
 
-Closest published analogue: Apple's retrieval-augmented correction of named-entity
-ASR errors, which is an LLM plus an entity database - structurally the same as the
-recommendation below.
+**REJECTED - index-time LLM mining.** There is no LLM in the loop during sync or
+indexing. The LLM is a *user* of this tool via MCP, never an indexer. Any design
+that assumes a model available at index time is invalid. (Apple's
+retrieval-augmented ASR entity correction is the published analogue and is
+structurally unavailable to us for the same reason.)
 
-### Revised recommendation
+### What is actually left
 
-**FTS5 BM25 + an alias table mined automatically at index time by the LLM that is
-already in the loop.** The dense channel is secondary and optional.
+With 1-best text, no index-time model, and every unsupervised method measured as
+failing, **automatic recovery of the `Fabrik` class is not achievable.** State that
+plainly rather than shipping a mechanism that measures worse than the problem.
 
-No one enumerates anything ahead of time; the mining is a per-user, per-corpus
-batch job:
+What remains, and is worth building:
 
-1. Extract rare proper-noun candidates: **1,944 terms** at `3 <= df <= 2 %` of
-   chunks (measured). `Fabrik`, `Fabrics`, `Fabrix`, `Akineo`, `Vantik`, `Zenolith`
-   are all in that set.
-2. Harvest free wins locally first - edit distance + double metaphone (**both**
-   codes) + distributional neighbours - clustering `fabrics`/`fabrix`/`akineo`/
-   `fabriks` and `zenolith`/`crawlery` with no LLM.
-3. Send the remainder with 2-3 context snippets each to the LLM - roughly **350k
-   tokens, one cheap batch pass per user** - asking which rare tokens denote the
-   same entity. **Existence proof:** the investigating agent built the 11-chunk
-   gold set exactly this way, from context alone, with no prior knowledge and no
-   curation.
-4. Store the alias table in SQLite; expand queries at search time.
+1. **FTS5 BM25 as primary search.** It wins on proper nouns and returns the gold
+   chunk at **rank 1** whenever the query spelling matches the transcript.
+2. **Free, fully automatic alias harvesting for spelling near-misses**: edit
+   distance + double metaphone (**both** codes) + distributional neighbours
+   cluster `fabrics`/`fabrix`/`akineo`/`fabriks` and `zenolith`/`crawlery` with no
+   model and no curation. This is a real win and costs nothing. It cannot bridge
+   to `fabrik`, and nothing can.
+3. **Optional dense channel** (potion-retrieval-32M in Go, 31 MB) as a secondary
+   signal for conceptual queries. Not required for v1.
+4. **User- and agent-driven transcript correction** - see the section below. This
+   is the only mechanism that fixes the `Fabrik` class, and it fixes it durably,
+   because once the line reads "Fabrix" BM25 ranks it 1st.
 
-Measured upper bound of this mechanism: **3421 -> 3, 288 -> 9, 156 -> 4.** Two
-orders of magnitude, against every embedding model failing.
+### Transcript correction (current design direction)
 
-**Unsolved design detail, prototype it early:** `Fabrik` denotes a *person* in ~90
-of its 101 chunks. A blanket alias would inject false positives, so the mined
-entry must be **sense-scoped** (applying only in chunks co-occurring with
-PIM/product/comparison context) or applied as a **soft boost** rather than a hard
-OR.
+Aliasing was considered and **rejected on correctness**: aliases are global and
+unscoped, so aliasing `Fabrics` <-> `Fabrik` means a legitimate search for the
+person `Fabrik` returns product results. Measured: `Fabrik` is a person in ~90 of
+its 101 chunks, so a global alias corrupts 90 lines to fix 11. Once an alias has
+to be scoped per line, it is simply a worse spelling of an edit.
 
-**If the LLM mining pass is also unacceptable**, the honest answer is that this
-class of miss is unrecoverable from 1-best transcripts, and the right move is to
-press Sana for word alternatives rather than build a workaround that measures
-worse than the problem.
+**Editing the local transcript is the right primitive.** Design under discussion:
+
+- Edits are **per line**, non-destructive: the original is always retained
+  alongside the current version.
+- The MCP edit tool takes **the full existing line** plus the replacement, and
+  applies the change only if the existing text matches exactly - a
+  compare-and-swap, so an agent cannot edit a line it misread or that has shifted.
+- **Never edit without explicit user permission**, stated in the tool
+  description. Transcripts are full of real names that only *look* misspelled -
+  `Zenolith` is a real product, and both the investigating agent and the assistant
+  wrongly "corrected" it during this very investigation. That failure mode is
+  demonstrated, not hypothetical.
+- TUI: open transcript or summary, free-form edit, `ctrl+s` to save with y/n
+  confirm, `esc` with unsaved changes prompts y/n.
+- History: `h` in the transcript/summary view lists each changed line as original
+  plus latest version; select and press `r` to restore, y/n confirm.
+- Tool: line history by meeting id (list of changed lines), by meeting id + line
+  number (detail of the change), and with a restore flag to revert to original.
+
+**Open questions on this design - see the assessment in the conversation:**
+re-sync conflict handling (edits must survive re-download, keyed by original-text
+hash), whether the original text stays searchable alongside the edited text,
+summary editing being a structured document rather than lines, and a
+meeting-scoped "apply to all occurrences" affordance so 11 identical corrections
+are not 11 manual edits.
+
+**The honest limitation:** this makes a miss *fixable*, not *findable*. You can
+only correct an error you have already noticed by some other route. Since every
+automatic detection method measured failed, that discovery gap is permanent.
 
 ### SUPERSEDED framing (kept for the trail)
 
