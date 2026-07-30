@@ -247,11 +247,30 @@ Consequences:
   where BM25 had no real signal.
 - A **genuine hybrid** is needed, with fusion weights retested on real data.
 
-**3. Dense still earns its place, visibly.** For `what did we decide about the
-crawler`, potion surfaced chunks containing **"Crawliera"** and **"zenolith"** -
-ASR garblings BM25 cannot reach. The `lumen` -> `lumen` error appears literally
-in the data: potion's top hit contained "create a custom, **lumen** only
-property". Both channels are load-bearing, for different failure modes.
+**3. Dense earns its place, but on thinner real-data evidence than first claimed.**
+
+The `lumen` -> `lumen` error appears literally in the data and potion retrieved
+it: its top hit contained "create a custom, **lumen** only property". That case
+stands.
+
+**RETRACTED:** the "Crawliera"/"zenolith" example was originally offered as an
+ASR garbling of "crawler" that only dense could reach. It is not. **Zenolith is
+one of our own product names**, confirmed in chunk `#11218`: *"nie potrzebujemy
+nawet tej crawlery... Jak Zenolith będzie g[otowa]"*. A correctly-spelled product
+name is exactly the case BM25 handles well, so this example demonstrates nothing
+about dense retrieval and has been withdrawn.
+
+Net position: both channels still look load-bearing - BM25 for proper nouns
+spelled correctly somewhere, dense for genuine ASR substitutions - but the
+real-corpus evidence for the dense side currently rests on the `lumen` case plus
+the original `fabrics`/`Fabrik` observation, not on a broad set of examples. Treat
+the hybrid design as sound and the *relative weighting* as unmeasured.
+
+This is also a caution about method: two of the "garbled name" examples that
+motivated this whole investigation turned out, on inspection, to be real product
+names (Zenolith) or correctly spelled elsewhere in the corpus (Fabrix). Before
+tuning anything, **establish gold labels by reading the actual chunks**, rather
+than assuming a rare token is an ASR error.
 
 **4. Language tail is real:** the corpus is **8.2 % non-English** - 694 Polish,
 306 Swedish, 61 Norwegian chunks. Both potion-retrieval-32M and the current
