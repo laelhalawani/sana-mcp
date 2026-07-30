@@ -1,4 +1,6 @@
 import { performance } from "node:perf_hooks";
+import fs from "node:fs";
+import { dlopen, FFIType } from "bun:ffi";
 import {
   DaemonStopPublishedError,
   DaemonStopRequestRejectedError,
@@ -21,6 +23,104 @@ const LIFECYCLE_TIMEOUT_MS = 10_000;
 const LIFECYCLE_POLL_MS = 50;
 const STOPPED_OBSERVATIONS = 3;
 
+interface PidfdLibrary {
+  readonly keepAlive: unknown;
+  readonly syscall: (
+    number: bigint,
+    first: bigint,
+    second: bigint,
+    info: null,
+    fourth: bigint,
+  ) => bigint;
+  readonly sysconf: (name: number) => bigint;
+  readonly poll: (fds: Uint8Array, count: bigint, timeout: number) => number;
+}
+
+let pidfdLibrary: PidfdLibrary | undefined;
+
+function linuxPidfdLibrary(): PidfdLibrary {
+  if (pidfdLibrary !== undefined) return pidfdLibrary;
+  const architecture = process.arch === "arm64" ? "aarch64" : "x86_64";
+  const failures: unknown[] = [];
+  for (const candidate of [
+    "libc.so.6",
+    `libc.musl-${architecture}.so.1`,
+    `/lib/libc.musl-${architecture}.so.1`,
+    "libc.so",
+  ]) {
+    try {
+      const library = dlopen(candidate, {
+        syscall: {
+          args: [
+            FFIType.i64,
+            FFIType.i64,
+            FFIType.i64,
+            FFIType.ptr,
+            FFIType.i64,
+          ],
+          returns: FFIType.i64,
+        },
+        sysconf: { args: [FFIType.i32], returns: FFIType.i64 },
+        poll: {
+          args: [FFIType.ptr, FFIType.u64, FFIType.i32],
+          returns: FFIType.i32,
+        },
+      });
+      pidfdLibrary = {
+        keepAlive: library,
+        syscall: library.symbols.syscall,
+        sysconf: library.symbols.sysconf,
+        poll: library.symbols.poll,
+      };
+      return pidfdLibrary;
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  throw new AggregateError(failures, "Linux pidfd support is unavailable");
+}
+
+function linuxProcessStat(pid: number): { state: string; startTicks: bigint } {
+  const body = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  const end = body.lastIndexOf(") ");
+  const fields = end < 0 ? [] : body.slice(end + 2).trim().split(/\s+/u);
+  const state = fields[0];
+  const start = fields[19];
+  if (
+    state === undefined ||
+    !/^[A-Za-z]$/u.test(state) ||
+    start === undefined ||
+    !/^[1-9][0-9]*$/u.test(start)
+  ) {
+    throw new Error("stale daemon process-birth identity is unavailable");
+  }
+  return { state, startTicks: BigInt(start) };
+}
+
+function linuxBootSecond(): bigint {
+  const matches = [
+    ...fs.readFileSync("/proc/stat", "utf8").matchAll(/^btime ([0-9]+)$/gmu),
+  ];
+  if (matches.length !== 1) throw new Error("Linux boot time is unavailable");
+  return BigInt(matches[0]![1]!);
+}
+
+function pidfdSignal(
+  library: PidfdLibrary,
+  pidfd: number,
+  signal: number,
+): boolean {
+  // Linux uses the asm-generic numbers on all release architectures.
+  return library.syscall(424n, BigInt(pidfd), BigInt(signal), null, 0n) === 0n;
+}
+
+function pidfdTargetExited(library: PidfdLibrary, pidfd: number): boolean {
+  const descriptor = Buffer.alloc(8);
+  descriptor.writeInt32LE(pidfd, 0);
+  descriptor.writeInt16LE(1, 4);
+  return library.poll(descriptor, 1n, 0) === 1 && descriptor.readInt16LE(6) !== 0;
+}
+
 export interface DaemonLifecycleResult {
   readonly state: "running" | "stopped";
   readonly changed: boolean;
@@ -34,6 +134,8 @@ export interface DaemonLifecycleOptions {
   readonly allowLegacyCooperative?: boolean;
   /** Installer-only read authority after receipt, digest, and path verification. */
   readonly allowStaleRunning?: boolean;
+  /** Verified POSIX installer authority to terminate one exact stale instance. */
+  readonly allowStaleTerminate?: boolean;
 }
 
 export interface DaemonLifecycleDependencies {
@@ -43,6 +145,7 @@ export interface DaemonLifecycleDependencies {
   ) => DaemonStopRequestResult;
   readonly clearControl: (identity: DaemonControlIdentity) => void;
   readonly clearLegacyControl: (identity: DaemonControlIdentity) => void;
+  readonly terminateStale: (identity: DaemonControlIdentity) => void;
   readonly ensureRunning: () => Promise<EnsureDaemonResult>;
   readonly pidAlive: (pid: number) => boolean;
   readonly monotonicNow: () => number;
@@ -59,6 +162,106 @@ const DEFAULT_DEPENDENCIES: DaemonLifecycleDependencies = {
   clearControl: (identity) => clearDaemonControl(identity),
   clearLegacyControl: (identity) =>
     clearDeadLegacyDaemonControl(identity),
+  terminateStale: (identity) => {
+    if (process.platform !== "linux") {
+      throw new Error("forced stale daemon termination is available only on Linux");
+    }
+    const library = linuxPidfdLibrary();
+    const pidfd = Number(
+      library.syscall(434n, BigInt(identity.pid), 0n, null, 0n),
+    );
+    if (pidfd < 0) throw new Error("stale daemon process handle is unavailable");
+    let stopped = false;
+    let suspendedByInstaller = false;
+    try {
+      const initial = linuxProcessStat(identity.pid);
+      if (initial.state === "T" || initial.state === "t") {
+        stopped = true;
+      } else {
+        if (!pidfdSignal(library, pidfd, 19)) {
+          if (pidfdTargetExited(library, pidfd)) return;
+          throw new Error("kernel-bound stale daemon suspension failed");
+        }
+        suspendedByInstaller = true;
+      }
+      for (let attempt = 0; !stopped && attempt < 100; attempt++) {
+        let current: ReturnType<typeof linuxProcessStat>;
+        try {
+          current = linuxProcessStat(identity.pid);
+        } catch (error) {
+          if (
+            (error as NodeJS.ErrnoException).code === "ENOENT" ||
+            pidfdTargetExited(library, pidfd)
+          ) return;
+          throw error;
+        }
+        if (current.startTicks !== initial.startTicks) {
+          throw new Error("stale daemon process identity changed while suspending it");
+        }
+        if (current.state === "T" || current.state === "t") {
+          stopped = true;
+          break;
+        }
+        if (current.state === "Z" || current.state === "X") return;
+        Atomics.wait(
+          new Int32Array(new SharedArrayBuffer(4)),
+          0,
+          0,
+          10,
+        );
+      }
+      if (!stopped) throw new Error("stale daemon could not be suspended safely");
+      const daemonExecutable = fs.realpathSync.native(`/proc/${identity.pid}/exe`);
+      const lifecycleExecutable = fs.realpathSync.native(process.execPath);
+      if (daemonExecutable !== lifecycleExecutable) {
+        throw new Error("stale daemon executable does not match the verified runtime");
+      }
+      const observed = observeDaemonControl();
+      if (
+        observed.kind !== "ready" ||
+        observed.freshness !== "stale" ||
+        observed.identity.pid !== identity.pid ||
+        observed.identity.instanceId !== identity.instanceId
+      ) {
+        throw new Error("stale daemon control identity changed before termination");
+      }
+      const ticksPerSecond = library.sysconf(2);
+      if (ticksPerSecond <= 0n) throw new Error("Linux clock tick rate is unavailable");
+      const finalStat = linuxProcessStat(identity.pid);
+      if (finalStat.startTicks !== initial.startTicks) {
+        throw new Error("stale daemon process identity changed before termination");
+      }
+      const processCreatedMs =
+        Number(linuxBootSecond()) * 1000 +
+        Number((initial.startTicks * 1000n) / ticksPerSecond);
+      if (
+        !Number.isSafeInteger(processCreatedMs) ||
+        processCreatedMs + 2_000 > observed.heartbeatMs
+      ) {
+        throw new Error(
+          "stale daemon birth does not safely predate its control heartbeat",
+        );
+      }
+      if (!pidfdSignal(library, pidfd, 9)) {
+        if (pidfdTargetExited(library, pidfd)) return;
+        throw new Error("kernel-bound stale daemon termination failed");
+      }
+      stopped = false;
+      suspendedByInstaller = false;
+    } catch (error) {
+      if (pidfdTargetExited(library, pidfd)) return;
+      throw error;
+    } finally {
+      if (
+        suspendedByInstaller &&
+        !pidfdSignal(library, pidfd, 18) &&
+        !pidfdTargetExited(library, pidfd)
+      ) {
+        throw new Error("installer-suspended daemon could not be resumed");
+      }
+      fs.closeSync(pidfd);
+    }
+  },
   ensureRunning: ensureDaemonRunning,
   pidAlive,
   monotonicNow: performance.now.bind(performance),
@@ -214,6 +417,7 @@ export async function runDaemonLifecycleWith(
   const attempted = new Map<string, DaemonControlIdentity>();
   const published = new Set<string>();
   const provenExited = new Set<string>();
+  const terminatedStale = new Set<string>();
   const publishStop = (identity: DaemonControlIdentity): void => {
     const key = identityKey(identity);
     try {
@@ -290,6 +494,15 @@ export async function runDaemonLifecycleWith(
       const key = identityKey(control.identity);
       if (!published.has(key)) {
         publishStop(control.identity);
+      }
+      if (
+        control.kind === "stale-live" &&
+        options.allowStaleTerminate === true &&
+        !terminatedStale.has(key)
+      ) {
+        dependencies.terminateStale(control.identity);
+        terminatedStale.add(key);
+        changed = true;
       }
       stableStopped = 0;
     } else {
