@@ -601,7 +601,12 @@ export async function unloadModel(): Promise<void> {
   await embeddingRuntime.unload();
 }
 
-async function embed(
+export type EmbedTexts = (
+  texts: string[],
+  signal?: AbortSignal,
+) => Promise<Float32Array[]>;
+
+export async function embedTexts(
   texts: string[],
   signal?: AbortSignal,
 ): Promise<Float32Array[]> {
@@ -615,7 +620,7 @@ export async function embedQuery(
   text: string,
   signal?: AbortSignal,
 ): Promise<Buffer> {
-  const [v] = await embed([text], signal);
+  const [v] = await embedTexts([text], signal);
   return toBuf(v);
 }
 
@@ -965,6 +970,7 @@ export async function embedMeeting(
   transcriptFetchedMs: number,
   lines: { n: number; speaker: string; text: string }[],
   commit: <Value>(write: () => Value) => Value,
+  embedBatch: EmbedTexts = embedTexts,
 ): Promise<void> {
   const backend = await ensureVec(db, commit);
   const table = backend === "sqlite-vec"
@@ -981,7 +987,9 @@ export async function embedMeeting(
   const vectors: Float32Array[] = [];
   for (let index = 0; index < chunks.length; index += BATCH) {
     vectors.push(
-      ...await embed(chunks.slice(index, index + BATCH).map((chunk) => chunk.text)),
+      ...await embedBatch(
+        chunks.slice(index, index + BATCH).map((chunk) => chunk.text),
+      ),
     );
   }
   commit(() => {

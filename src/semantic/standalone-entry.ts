@@ -1,4 +1,6 @@
-if (process.argv[2] === "__semantic-smoke") {
+if (process.argv[2] === "__semantic-worker") {
+  await import("./embedding-worker-entry.js");
+} else if (process.argv[2] === "__semantic-smoke") {
   try {
     const { runStandaloneSemanticSmoke } = await import("./smoke.js");
     await runStandaloneSemanticSmoke();

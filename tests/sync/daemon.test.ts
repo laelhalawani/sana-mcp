@@ -24,6 +24,8 @@ class TestSemanticUnavailableError extends Error {}
 mock.module("../../src/semantic/semantic.js", () => ({
   semanticEnabled: () => true,
   semanticCapabilityState: () => ({ kind: "available" as const }),
+  embedTexts: async () => [new Float32Array(384)],
+  unloadModel: async () => {},
   ensureVec: async () => "sqlite-vec" as const,
   vectorBackendForPlatform: () => testVectorBackend,
   embedMeeting: async (
@@ -33,8 +35,10 @@ mock.module("../../src/semantic/semantic.js", () => ({
     _transcriptFetchedMs: number,
     _lines: unknown,
     commit: (write: () => void) => void,
+    embedBatch: (texts: string[]) => Promise<Float32Array[]>,
   ): Promise<void> => {
     embedCalls.push({ meetingId, createdAtMs });
+    await embedBatch(["test chunk"]);
     beforeEmbedCommit?.();
     commit(() => {
       embeddedWrites.push(meetingId);
@@ -47,6 +51,7 @@ mock.module("../../src/semantic/semantic.js", () => ({
 }));
 
 const {
+  awaitEmbeddingWithHeartbeat,
   DaemonResourceFinalizationError,
   daemonSessionPreflight,
   finalizeDaemonResources,
@@ -92,6 +97,44 @@ test("daemon startup resets retry history exactly once", () => {
     },
   });
   expect(resets).toBe(1);
+});
+
+test("embedding inference refreshes lifecycle heartbeat while pending", async () => {
+  let heartbeats = 0;
+  const vectors = await awaitEmbeddingWithHeartbeat(
+    async () => {
+      await Bun.sleep(30);
+      return [new Float32Array([1])];
+    },
+    ["text"],
+    () => {
+      heartbeats++;
+    },
+    5,
+  );
+  expect(heartbeats).toBeGreaterThanOrEqual(1);
+  expect(vectors[0]?.[0]).toBe(1);
+});
+
+test("embedding inference is aborted when lifecycle authority stops", async () => {
+  const stopped = new Error("stop");
+  let aborted = false;
+  const inference = awaitEmbeddingWithHeartbeat(
+    async (_texts: string[], signal?: AbortSignal) =>
+      await new Promise<Float32Array[]>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(signal.reason);
+        }, { once: true });
+      }),
+    ["text"],
+    () => {
+      throw stopped;
+    },
+    5,
+  );
+  await expect(inference).rejects.toBe(stopped);
+  expect(aborted).toBe(true);
 });
 
 test("portable runtime refuses cross-account replacement while sqlite vectors remain", async () => {
@@ -357,6 +400,7 @@ test("embedding errors are retried without mutating artifact failures", async ()
   const marked: string[] = [];
   const cleared: string[] = [];
   const missingEmbeddingCalls = { count: 0 };
+  let missingEmbeddingIds = ["meeting-missing-date", "meeting-valid"];
   const transcriptJson = JSON.stringify([
     {
       speaker: "Speaker",
@@ -401,7 +445,7 @@ test("embedding errors are retried without mutating artifact failures", async ()
     countTranscripts: () => 2,
     meetingsMissingEmbedding: () => {
       missingEmbeddingCalls.count++;
-      return ["meeting-missing-date", "meeting-valid"];
+      return missingEmbeddingIds;
     },
     getTranscript: (meetingId: string) => ({
       meeting_id: meetingId,
@@ -461,6 +505,26 @@ test("embedding errors are retried without mutating artifact failures", async ()
   expect(marked).toEqual([]);
   expect(cleared).toEqual([]);
   expect(missingEmbeddingCalls.count).toBe(1);
+
+  missingEmbeddingIds = ["meeting-valid"];
+  embeddedWrites.length = 0;
+  await expect(syncOnce(
+    store,
+    client,
+    {
+      generation: 1,
+      publicationToken: "11111111-1111-4111-8111-111111111111",
+      userId: "user-a",
+      workspaceId: "workspace-a",
+    },
+    TEST_DAEMON_INSTANCE,
+    () => true,
+    () => {},
+    async () => {
+      throw new Error("inference failed");
+    },
+  )).rejects.toThrow("Daemon stop requested");
+  expect(embeddedWrites).toEqual([]);
 });
 
 test("stale cycle cannot commit vector rows after embedding await", async () => {
