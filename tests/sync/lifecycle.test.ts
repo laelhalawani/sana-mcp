@@ -100,6 +100,20 @@ test("health fails closed for a stale-live control record", async () => {
   ).rejects.toThrow(/stale while process/u);
 });
 
+test("verified installer health classifies a stale live daemon as running", async () => {
+  const result = await runDaemonLifecycleWith(
+    "health",
+    dependencies({
+      control: [
+        { kind: "ready", identity: A, heartbeatMs: 1_000, freshness: "stale" },
+      ],
+      pidAlive: () => true,
+    }),
+    { allowStaleRunning: true },
+  );
+  expect(result).toEqual({ state: "running", changed: false });
+});
+
 test("health rejects a future-dated control heartbeat", async () => {
   await expect(
     runDaemonLifecycleWith(
@@ -152,6 +166,30 @@ test("stop publishes a stop request and reaches a stable stopped state", async (
   expect(stopped).toEqual([A]);
   expect(result.state).toBe("stopped");
   expect(result.changed).toBe(true);
+});
+
+test("stop publishes an authenticated request for a stale live daemon", async () => {
+  const stopped: DaemonControlIdentity[] = [];
+  let alive = true;
+  const result = await runDaemonLifecycleWith(
+    "stop",
+    dependencies({
+      control: [
+        { kind: "ready", identity: A, heartbeatMs: 1_000, freshness: "stale" },
+        { kind: "missing" },
+        { kind: "missing" },
+        { kind: "missing" },
+      ],
+      pidAlive: () => alive,
+      requestStop: (identity) => {
+        stopped.push(identity);
+        alive = false;
+        return { identity, published: true, continuity: "confirmed" };
+      },
+    }),
+  );
+  expect(stopped).toEqual([A]);
+  expect(result).toEqual({ state: "stopped", changed: true });
 });
 
 test("stop retries a transient rejection until the request is published", async () => {
