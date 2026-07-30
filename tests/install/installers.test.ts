@@ -202,6 +202,24 @@ async function createOfflineRelease(
     `  printf '%s\\n' inspectProtocol=1 version=${version} target=${target} installerProtocol=1 lifecycleProtocol=1 stateCompatibility=1 semanticCapability=bundled`,
     "  exit 0",
     "fi",
+    'if [ "${1:-}" = "__recover-legacy-posix" ]; then',
+    '  operation=${2:-}',
+    '  if [ -n "${FAKE_LEGACY_RECOVERY_LOG_FILE:-}" ]; then printf "%s\\n" "$operation" >> "$FAKE_LEGACY_RECOVERY_LOG_FILE"; fi',
+    '  if [ "$operation" = "recover" ]; then',
+    '    if [ -n "${FAKE_LEGACY_INSTALL_LOCK:-}" ]; then /bin/rm -rf "$FAKE_LEGACY_INSTALL_LOCK"; fi',
+    '    if [ -n "${FAKE_LEGACY_PATH_LOCK:-}" ]; then /bin/rm -rf "$FAKE_LEGACY_PATH_LOCK"; fi',
+    '    printf "%s\\n" format=sana-mcp-legacy-posix-recovery-result-v1 status=completed fingerprint=${FAKE_LEGACY_RECOVERY_FINGERPRINT:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff} recoveredCount=4',
+    '    exit 0',
+    '  fi',
+    '  case "${FAKE_LEGACY_RECOVERY_STATUS:-none}" in',
+    '    none) printf "%s\\n" format=sana-mcp-legacy-posix-recovery-result-v1 status=none ;;',
+    '    confirmation-required) printf "%s\\n" format=sana-mcp-legacy-posix-recovery-result-v1 status=confirmation-required fingerprint=${FAKE_LEGACY_RECOVERY_FINGERPRINT:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff} ;;',
+    '    pending) printf "%s\\n" format=sana-mcp-legacy-posix-recovery-result-v1 status=pending fingerprint=${FAKE_LEGACY_RECOVERY_FINGERPRINT:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff} phase=prepared ;;',
+    '    blocked) printf "%s\\n" format=sana-mcp-legacy-posix-recovery-result-v1 status=blocked code=PROCESS_EVIDENCE_INVALID messageBase64=YmxvY2tlZA== ;;',
+    '    *) exit 64 ;;',
+    '  esac',
+    '  exit 0',
+    "fi",
     'if [ "${1:-}" = "__installer-fsync" ]; then',
     '  kind=${2:-}',
     '  shift 2',
@@ -4294,6 +4312,83 @@ test("POSIX installer refuses a foreign destination without a receipt", async ()
       await readFile(path.join(installDirectory, "sana-mcp"), "utf8"),
       "foreign\n",
     );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX installer runs explicitly approved legacy recovery before locking", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-legacy-handoff-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const installLock = path.join(installDirectory, ".sana-mcp-install-lock");
+    const pathLock = path.join(home, ".sana-mcp-installer-path.lock");
+    const recoveryLog = path.join(temporary, "legacy-recovery.log");
+    await mkdir(home);
+    await mkdir(installDirectory);
+    await mkdir(installLock);
+    await mkdir(pathLock);
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        SHELL: "/bin/bash",
+        FIXTURE_ROOT: fixture,
+        FAKE_LEGACY_RECOVERY_STATUS: "confirmation-required",
+        FAKE_LEGACY_RECOVERY_LOG_FILE: recoveryLog,
+        FAKE_LEGACY_INSTALL_LOCK: installLock,
+        FAKE_LEGACY_PATH_LOCK: pathLock,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+        SANA_MCP_RECOVER_INTERRUPTED: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await readFile(recoveryLog, "utf8"), "inspect\nrecover\n");
+    assert.match(result.stdout, /Recovered an interrupted install/);
+    await access(path.join(installDirectory, ".sana-mcp-install-v1"));
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX installer resumes a confirmed legacy journal after locks moved", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-legacy-resume-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const recoveryLog = path.join(temporary, "legacy-recovery.log");
+    await mkdir(home);
+    await mkdir(installDirectory);
+    await writeFile(
+      path.join(home, ".sana-mcp-legacy-posix-recovery.json"),
+      "confirmed journal fixture\n",
+    );
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        FIXTURE_ROOT: fixture,
+        FAKE_LEGACY_RECOVERY_STATUS: "pending",
+        FAKE_LEGACY_RECOVERY_LOG_FILE: recoveryLog,
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await readFile(recoveryLog, "utf8"), "inspect\nrecover\n");
+    await access(path.join(installDirectory, ".sana-mcp-install-v1"));
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
