@@ -108,6 +108,50 @@ via `fts5vocab` + an in-memory double-metaphone map (all measured matching):
 Kubernetes/"Cooper Netties", Postgres/"Post grass", Grafana/"Graphana",
 Datadog/"Data dog", and the Fabrix/Fabrics user typo.
 
+### Real query shapes are the easy case (measured)
+
+The garbled proper noun gets **outvoted** by the surrounding content words. Rank
+of the correct chunk:
+
+| Query | potion | MiniLM | BM25 |
+|---|---|---|---|
+| `northwind issues with proofreading` | #1 | #1 | #1 |
+| `vantik planned release date for hockey environment` | #1 | #1 | #1 |
+| `lumen problems with the copy review` | #1 | #1 | #1 |
+| `Alex notes on the release schedule` | #1 | #1 | #1 |
+| `vantik hiring plan` | #1 | #1 | #1 |
+| `fabrics vs lumen testing` | **#2** | #1 | **MISS** |
+
+In "vantik planned release date for hockey environment", `planned release date
+environment` carry the meaning and one junk token cannot drag the mean-pooled
+vector away from them. **The last row is the entire justification for keeping
+embeddings**: every content-bearing word is garbled and only the generic
+"testing" survives, so BM25 misses completely and only the dense channel finds it.
+
+### Phonetic channel: two rules from measurement
+
+| Pair | Double metaphone | Levenshtein | Verdict |
+|---|---|---|---|
+| `Alex` / `Jazmin` | `ASMN` vs `JSMN`+**`ASMN`** | 2 | caught, **via the secondary code** |
+| `lumen` / `lumen` | `ATLS` vs `A0S`+`ATS` | 2 | missed by exact code, **caught by edit distance on codes** |
+| `northwind` / `northwind` | `PRS` = `PRS` | 2 | caught |
+| `vantik` / `spot big` | `SPPK` vs `SPTPK` | 3 | missed |
+| `Fabrics` / `Fabrik` | `AKN` vs `ANTK` | 4 | missed |
+
+1. **Index both double-metaphone codes**, not just the primary - that alone is
+   what catches Alex/Jazmin, and it is why double metaphone beats soundex.
+2. **Allow edit distance 1 on the codes**, not exact lookup - `lumen`/`lumen` are
+   1 apart phonetically but 2 apart as strings.
+
+Build this channel **last**, and only if users complain about name lookups.
+
+### Do not build (measured as unhelpful or harmful)
+
+- **Dropping unknown query tokens** as an ASR mitigation: no improvement
+  (MRR 0.917 either way) and it sometimes strips useful words.
+- **Unconditional RRF**: drops MRR 0.958 -> 0.847.
+- **spellfix1**: unavailable in modernc, and would not help the hard case anyway.
+
 ### sqlite-vec runs on pure-Go SQLite
 
 Verified end to end, not taken from docs:
@@ -187,10 +231,30 @@ against 115 MB today.
    as query expansion.
 6. ONNX/bleve comparison rows were not verified (those research agents stopped).
 
-**Prototype order:** (1) export the real corpus and rerun the benchmark against
-existing MiniLM vectors, including "fabrics vs lumen testing" - this is the only
-open question; (2) port the encoder and wire it to `modernc.org/sqlite/vec`;
-(3) only then tune the gated BM25 booster.
+**Tests to run next, in priority order:**
+
+1. **Replay real queries against the real corpus.** The only test that settles the
+   decision. Dump existing chunks + MiniLM vectors, encode the same chunks with
+   potion, compare top-10 overlap and human judgement on 30-50 real queries.
+2. **Word-order sensitivity.** The real weakness of static embeddings, and the
+   benchmark corpus does not probe it. Test "did we pick A over B" vs "B over A",
+   "client rejected our proposal" vs "we rejected the client proposal".
+   **If potion cannot separate these and users ask such questions, that is the one
+   finding that flips the recommendation to ONNX.**
+3. **Hard negatives at real scale.** The 24-chunk corpus is topically distinct, so
+   almost everything ranks #1. Real meetings have hundreds of near-duplicate
+   chunks (weekly standups on the same project). Re-measure at ~20k chunks and
+   expect ranks to spread.
+4. **Language check.** `Fabrik`, `Alex`, `Jazmin` suggest Polish context. Both
+   potion-retrieval-32M and the current MiniLM are English-only - if meetings are
+   substantially Polish this is a pre-existing problem, fixed by
+   `potion-multilingual-128M`.
+5. **Chunk-size sweep.** Static embeddings dilute with length, since every token
+   gets equal weight in the mean. The current 96-word "large" chunks may be past
+   the useful point for potion specifically. Sweep 32/64/96/128 words on real data.
+
+Then: port the encoder, wire it to `modernc.org/sqlite/vec`, and only afterwards
+tune the gated BM25 booster.
 
 Fallback: keep all-MiniLM-L6-v2 via `github.com/yalue/onnxruntime_go`, accepting
 a per-platform shared library and the loss of trivial cross-compilation - i.e.
