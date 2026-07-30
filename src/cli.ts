@@ -107,12 +107,14 @@ async function daemonLifecycle(
   allowLegacyCooperative: boolean,
   allowStaleRunning: boolean,
   allowStaleTerminate: boolean,
+  staleExecutablePath?: string,
 ): Promise<{ state: "running" | "stopped"; changed: boolean }> {
   const { runDaemonLifecycle } = await import("./sync/lifecycle.js");
   return await runDaemonLifecycle(operation, {
     allowLegacyCooperative,
     allowStaleRunning,
     allowStaleTerminate,
+    staleExecutablePath,
   });
 }
 
@@ -132,6 +134,10 @@ program
     "--allow-stale-terminate",
     "installer-only termination of an exact verified stale Linux daemon",
   )
+  .option(
+    "--stale-executable <path>",
+    "verified installed executable expected for stale termination",
+  )
   .action(async (
     operation: string,
       opts: {
@@ -139,6 +145,7 @@ program
         allowLegacyCooperative?: boolean;
         allowStaleRunning?: boolean;
         allowStaleTerminate?: boolean;
+        staleExecutable?: string;
       },
   ) => {
     if (!BUILD_INFO.standalone) {
@@ -152,6 +159,7 @@ program
       opts.allowLegacyCooperative === true,
       opts.allowStaleRunning === true,
       opts.allowStaleTerminate === true,
+      opts.staleExecutable,
     );
     process.stdout.write(
       [
