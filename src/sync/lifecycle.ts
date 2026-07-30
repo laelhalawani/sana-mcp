@@ -32,6 +32,8 @@ export interface DaemonLifecycleOptions {
    * prove the receipt, binary digest, and exact executable path.
    */
   readonly allowLegacyCooperative?: boolean;
+  /** Installer-only read authority after receipt, digest, and path verification. */
+  readonly allowStaleRunning?: boolean;
 }
 
 export interface DaemonLifecycleDependencies {
@@ -157,6 +159,7 @@ function inspectOnce(
     );
   }
   if (control.kind === "stale-live") {
+    if (options.allowStaleRunning === true) return "running";
     throw new Error(
       `daemon control heartbeat is stale while process ${control.identity.pid} is still running; stop it manually`,
     );
@@ -258,11 +261,6 @@ export async function runDaemonLifecycleWith(
         }
       }
     }
-    if (control.kind === "stale-live") {
-      throw new Error(
-        `daemon control heartbeat is stale while process ${control.identity.pid} is still running; stop it manually`,
-      );
-    }
     if (control.kind === "legacy-live") {
       if (options.allowLegacyCooperative !== true) {
         throw new Error(
@@ -285,7 +283,10 @@ export async function runDaemonLifecycleWith(
         );
       }
       stableStopped = 0;
-    } else if (control.kind === "ready-running") {
+    } else if (
+      control.kind === "ready-running" ||
+      control.kind === "stale-live"
+    ) {
       const key = identityKey(control.identity);
       if (!published.has(key)) {
         publishStop(control.identity);

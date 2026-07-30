@@ -105,10 +105,12 @@ program
 async function daemonLifecycle(
   operation: string,
   allowLegacyCooperative: boolean,
+  allowStaleRunning: boolean,
 ): Promise<{ state: "running" | "stopped"; changed: boolean }> {
   const { runDaemonLifecycle } = await import("./sync/lifecycle.js");
   return await runDaemonLifecycle(operation, {
     allowLegacyCooperative,
+    allowStaleRunning,
   });
 }
 
@@ -120,9 +122,17 @@ program
     "--allow-legacy-cooperative",
     "installer-only compatibility after receipt, digest, and executable-path verification",
   )
+  .option(
+    "--allow-stale-running",
+    "installer-only stale daemon classification after receipt, digest, and path verification",
+  )
   .action(async (
     operation: string,
-    opts: { format: string; allowLegacyCooperative?: boolean },
+      opts: {
+        format: string;
+        allowLegacyCooperative?: boolean;
+        allowStaleRunning?: boolean;
+      },
   ) => {
     if (!BUILD_INFO.standalone) {
       throw new Error("__lifecycle is available only in a standalone build");
@@ -133,6 +143,7 @@ program
     const result = await daemonLifecycle(
       operation,
       opts.allowLegacyCooperative === true,
+      opts.allowStaleRunning === true,
     );
     process.stdout.write(
       [

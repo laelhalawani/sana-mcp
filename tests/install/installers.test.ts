@@ -252,7 +252,7 @@ async function createOfflineRelease(
     '    state=$(cat "$FAKE_LIFECYCLE_STATE_FILE")',
     "  fi",
     '  case "$operation" in',
-    '    health) if [ -n "${FAKE_HEALTH_READY_FILE:-}" ]; then : > "$FAKE_HEALTH_READY_FILE"; fi; while [ -n "${FAKE_HEALTH_WAIT_FILE:-}" ] && [ ! -f "$FAKE_HEALTH_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_POST_CONFIG_HEALTH_EXIT:-}" ]; then exit "$FAKE_POST_CONFIG_HEALTH_EXIT"; fi; changed=false ;;',
+    '    health) if [ -n "${FAKE_HEALTH_READY_FILE:-}" ]; then : > "$FAKE_HEALTH_READY_FILE"; fi; while [ -n "${FAKE_HEALTH_WAIT_FILE:-}" ] && [ ! -f "$FAKE_HEALTH_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_STALE_HEALTH_ONCE_FILE:-}" ] && [ ! -f "$FAKE_STALE_HEALTH_ONCE_FILE" ]; then : > "$FAKE_STALE_HEALTH_ONCE_FILE"; case " $* " in *" --allow-stale-running "*) state=running ;; *) exit 77 ;; esac; fi; if [ -n "${FAKE_POST_CONFIG_HEALTH_EXIT:-}" ]; then exit "$FAKE_POST_CONFIG_HEALTH_EXIT"; fi; changed=false ;;',
     '    stop) changed=$([ "$state" = running ] && printf true || printf false); state=stopped ;;',
     '    start) if [ -n "${FAKE_CONFIGURED_FILE:-}" ] && [ -f "$FAKE_CONFIGURED_FILE" ] && [ -n "${FAKE_POST_CONFIG_START_EXIT:-}" ]; then if [ -n "${FAKE_START_READY_FILE:-}" ]; then : > "$FAKE_START_READY_FILE"; fi; while [ -n "${FAKE_START_WAIT_FILE:-}" ] && [ ! -f "$FAKE_START_WAIT_FILE" ]; do sleep 0.02; done; if [ -n "${FAKE_LIFECYCLE_LOG_FILE:-}" ]; then printf "%s:%s\\n" start-attempt "$state" >> "$FAKE_LIFECYCLE_LOG_FILE"; fi; exit "$FAKE_POST_CONFIG_START_EXIT"; fi; changed=$([ "$state" = stopped ] && printf true || printf false); state=running ;;',
     "    *) exit 64 ;;",
@@ -4194,6 +4194,7 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
     const installDirectory = path.join(temporary, "managed-bin");
     const stateFile = path.join(temporary, "daemon-state");
     const lifecycleLog = path.join(temporary, "lifecycle.log");
+    const staleHealthOnce = path.join(temporary, "stale-health-once");
     const profile = path.join(home, ".bashrc");
     await mkdir(home);
     await writeFile(profile, "# existing profile\n");
@@ -4203,6 +4204,7 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
       fixture: string,
       version: string,
       configExit: string,
+      extraEnvironment: Record<string, string> = {},
     ) =>
       spawnSync("/bin/sh", [path.join(root, "install.sh")], {
         encoding: "utf8",
@@ -4218,6 +4220,7 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
           SANA_MCP_INSTALL_DIR: installDirectory,
           SANA_MCP_VERSION: `v${version}`,
           SANA_MCP_YES: "1",
+          ...extraEnvironment,
         },
       });
 
@@ -4248,8 +4251,11 @@ test("POSIX upgrades journal binary, PATH, receipt, and daemon state", async () 
 
     await writeFile(stateFile, "running\n");
     const secondFixture = await createOfflineRelease(temporary, "0.3.3");
-    const upgrade = run(secondFixture, "0.3.3", "23");
+    const upgrade = run(secondFixture, "0.3.3", "23", {
+      FAKE_STALE_HEALTH_ONCE_FILE: staleHealthOnce,
+    });
     assert.equal(upgrade.status, 0, upgrade.stderr);
+    await access(staleHealthOnce);
     assert.doesNotMatch(
       upgrade.stdout,
       /Existing client configuration was left unchanged\./,
