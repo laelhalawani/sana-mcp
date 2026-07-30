@@ -202,6 +202,31 @@ async function createOfflineRelease(
     `  printf '%s\\n' inspectProtocol=1 version=${version} target=${target} installerProtocol=1 lifecycleProtocol=1 stateCompatibility=1 semanticCapability=bundled`,
     "  exit 0",
     "fi",
+    'if [ "${1:-}" = "__installer-fsync" ]; then',
+    '  kind=${2:-}',
+    '  shift 2',
+    '  fsync_path=""',
+    '  while [ "$#" -gt 0 ]; do',
+    '    case "$1" in --path) shift; fsync_path=${1:-} ;; *) exit 64 ;; esac',
+    '    shift',
+    '  done',
+    '  case "$kind" in file|directory) ;; *) exit 64 ;; esac',
+    '  [ -n "$fsync_path" ] || exit 64',
+    '  if [ -n "${FAKE_FSYNC_LOG_FILE:-}" ]; then printf "%s:%s\\n" "$kind" "$fsync_path" >> "$FAKE_FSYNC_LOG_FILE"; fi',
+    '  count=0',
+    '  if [ -n "${FAKE_FSYNC_COUNT_FILE:-}" ]; then',
+    '    if [ -f "$FAKE_FSYNC_COUNT_FILE" ]; then count=$(cat "$FAKE_FSYNC_COUNT_FILE"); fi',
+    '    count=$((count + 1))',
+    '    printf "%s\\n" "$count" > "$FAKE_FSYNC_COUNT_FILE"',
+    '    if [ -n "${FAKE_FSYNC_READY_COUNT:-}" ] && [ "$count" -eq "$FAKE_FSYNC_READY_COUNT" ]; then',
+    '      : > "$FAKE_FSYNC_READY_FILE"',
+    '      while [ ! -f "$FAKE_FSYNC_WAIT_FILE" ]; do sleep 0.02; done',
+    '    fi',
+    '  fi',
+    '  if [ -n "${FAKE_FSYNC_FAIL_COUNT:-}" ] && [ "$count" -eq "$FAKE_FSYNC_FAIL_COUNT" ]; then exit 73; fi',
+    '  if [ -n "${FAKE_FSYNC_FAIL_PATH:-}" ] && [ "$fsync_path" = "$FAKE_FSYNC_FAIL_PATH" ]; then exit 73; fi',
+    '  exit "${FAKE_FSYNC_EXIT:-0}"',
+    "fi",
     'if [ "${1:-}" = "__lifecycle" ]; then',
     '  operation=${2:-}',
     '  state=stopped',
@@ -402,7 +427,7 @@ async function createOfflineRelease(
     "",
   ].join("\n");
   await writeFile(path.join(commands, "curl"), fakeCurl);
-  await writeFile(path.join(commands, "sync"), "#!/bin/sh\nexit 0\n");
+  await writeFile(path.join(commands, "sync"), "#!/bin/sh\nexit 91\n");
   await writeFile(path.join(commands, "uname"), fakeUname);
   await chmod(path.join(commands, "curl"), 0o755);
   await chmod(path.join(commands, "sync"), 0o755);
@@ -422,6 +447,7 @@ test("POSIX one-line installer verifies the tuple and reports post-install setup
     const run = (installName: string, setupExit: string) => {
       const installDirectory = path.join(temporary, installName);
       const runHome = path.join(temporary, `${installName}-home`);
+      const fsyncLog = path.join(temporary, `${installName}-fsync.log`);
       mkdirSync(runHome);
       const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
         encoding: "utf8",
@@ -429,14 +455,16 @@ test("POSIX one-line installer verifies the tuple and reports post-install setup
           ...process.env,
           PATH: `${commands}:/usr/bin:/bin`,
           HOME: runHome,
+          SHELL: "/bin/bash",
           FIXTURE_ROOT: fixture,
           SANA_MCP_INSTALL_DIR: installDirectory,
           SANA_MCP_VERSION: "v0.3.2",
           SANA_MCP_YES: "1",
           FAKE_CONFIG_EXIT: setupExit,
+          FAKE_FSYNC_LOG_FILE: fsyncLog,
         },
       });
-      return { installDirectory, result };
+      return { fsyncLog, installDirectory, result };
     };
 
     const successful = run("success-bin", "0");
@@ -471,6 +499,26 @@ test("POSIX one-line installer verifies the tuple and reports post-install setup
         "utf8",
       ),
       /(?:^|\n)sourceCommit=0123456789abcdef0123456789abcdef01234567\n/,
+    );
+    const durabilityCalls = (await readFile(successful.fsyncLog, "utf8"))
+      .trim()
+      .split("\n");
+    assert.equal(durabilityCalls.length, 5);
+    assert.ok(
+      durabilityCalls[0].startsWith(
+        `file:${successful.installDirectory}/.sana-mcp.`,
+      ),
+    );
+    assert.match(durabilityCalls[1], /^file:.*\.sana-mcp\./);
+    assert.match(durabilityCalls[2], /^file:/);
+    assert.ok(
+      durabilityCalls[3].startsWith(
+        `file:${successful.installDirectory}/.sana-mcp-receipt.`,
+      ),
+    );
+    assert.equal(
+      durabilityCalls[4],
+      `directory:${successful.installDirectory}`,
     );
 
     const failed = run("failed-bin", "23");
@@ -580,6 +628,45 @@ test("POSIX progress terminates cleanly when the binary download fails", async (
     assert.match(result.stderr, /fake download failed/);
     assert.match(result.stderr, /could not download the sana-mcp binary/);
     assert.doesNotMatch(result.stdout, /\u001b/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("POSIX targeted durability failure aborts before runtime publication", async () => {
+  if (process.platform !== "linux") return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-fsync-failure-"));
+  try {
+    const fixture = await createOfflineRelease(temporary);
+    const home = path.join(temporary, "home");
+    const profile = path.join(home, ".bashrc");
+    const installDirectory = path.join(temporary, "managed-bin");
+    const fsyncCount = path.join(temporary, "fsync-count");
+    await mkdir(home);
+    await writeFile(profile, "# original profile\n");
+    const result = spawnSync("/bin/sh", [path.join(root, "install.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${path.join(temporary, "commands")}:/usr/bin:/bin`,
+        HOME: home,
+        TMPDIR: temporary,
+        SHELL: "/bin/bash",
+        FIXTURE_ROOT: fixture,
+        FAKE_FSYNC_COUNT_FILE: fsyncCount,
+        FAKE_FSYNC_FAIL_COUNT: "1",
+        SANA_MCP_INSTALL_DIR: installDirectory,
+        SANA_MCP_VERSION: "v0.3.2",
+        SANA_MCP_YES: "1",
+      },
+    });
+    assert.equal(result.status, 73, result.stderr);
+    assert.equal((await readFile(fsyncCount, "utf8")).trim(), "2");
+    await assert.rejects(access(path.join(installDirectory, "sana-mcp")));
+    await assert.rejects(
+      access(path.join(installDirectory, ".sana-mcp-install-v1")),
+    );
+    assert.equal(await readFile(profile, "utf8"), "# original profile\n");
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
@@ -4665,7 +4752,7 @@ test("POSIX lock-token change during rollback stops every later cleanup mutation
   }
 });
 
-test("POSIX lock loss during final rollback sync retains tail cleanup state", async () => {
+test("POSIX lock loss during final rollback fsync retains tail cleanup state", async () => {
   if (process.platform !== "linux") return;
   const temporary = await mkdtemp(path.join(os.tmpdir(), "sana-final-sync-lock-loss-"));
   try {
@@ -4674,9 +4761,9 @@ test("POSIX lock loss during final rollback sync retains tail cleanup state", as
     const home = path.join(temporary, "home");
     const profile = path.join(home, ".bashrc");
     const installDirectory = path.join(temporary, "managed-bin");
-    const syncCount = path.join(temporary, "sync-count");
-    const finalSyncReady = path.join(temporary, "final-sync-ready");
-    const releaseFinalSync = path.join(temporary, "release-final-sync");
+    const fsyncCount = path.join(temporary, "fsync-count");
+    const finalFsyncReady = path.join(temporary, "final-fsync-ready");
+    const releaseFinalFsync = path.join(temporary, "release-final-fsync");
     await mkdir(home);
     await writeFile(profile, "# original profile\n");
     await writeFile(
@@ -4701,24 +4788,8 @@ test("POSIX lock loss during final rollback sync retains tail cleanup state", as
         "",
       ].join("\n"),
     );
-    await writeFile(
-      path.join(commands, "sync"),
-      [
-        "#!/bin/sh",
-        "count=0",
-        'if [ -f "$FAKE_SYNC_COUNT_FILE" ]; then count=$(cat "$FAKE_SYNC_COUNT_FILE"); fi',
-        "count=$((count + 1))",
-        'printf "%s\\n" "$count" > "$FAKE_SYNC_COUNT_FILE"',
-        'if [ "$count" -eq 4 ]; then',
-        '  : > "$FAKE_FINAL_SYNC_READY_FILE"',
-        '  while [ ! -f "$FAKE_FINAL_SYNC_WAIT_FILE" ]; do sleep 0.02; done',
-        "fi",
-        "exit 0",
-        "",
-      ].join("\n"),
-    );
     await Promise.all(
-      ["mktemp", "rm", "sync"].map((command) =>
+      ["mktemp", "rm"].map((command) =>
         chmod(path.join(commands, command), 0o755),
       ),
     );
@@ -4731,9 +4802,10 @@ test("POSIX lock loss during final rollback sync retains tail cleanup state", as
         SHELL: "/bin/bash",
         FIXTURE_ROOT: fixture,
         FAKE_RM_FAIL_PATH: path.join(installDirectory, "sana-mcp"),
-        FAKE_SYNC_COUNT_FILE: syncCount,
-        FAKE_FINAL_SYNC_READY_FILE: finalSyncReady,
-        FAKE_FINAL_SYNC_WAIT_FILE: releaseFinalSync,
+        FAKE_FSYNC_COUNT_FILE: fsyncCount,
+        FAKE_FSYNC_READY_COUNT: "5",
+        FAKE_FSYNC_READY_FILE: finalFsyncReady,
+        FAKE_FSYNC_WAIT_FILE: releaseFinalFsync,
         SANA_MCP_INSTALL_DIR: installDirectory,
         SANA_MCP_VERSION: "v0.3.2",
         SANA_MCP_YES: "1",
@@ -4747,10 +4819,10 @@ test("POSIX lock loss during final rollback sync retains tail cleanup state", as
     });
     const closePromise = once(child, "close") as Promise<[number]>;
     await Promise.race([
-      waitForFile(finalSyncReady),
+      waitForFile(finalFsyncReady),
       closePromise.then(([code]) => {
         throw new Error(
-          `installer exited before final rollback sync (${code}): ${stderr}`,
+          `installer exited before final rollback fsync (${code}): ${stderr}`,
         );
       }),
     ]);
@@ -4762,11 +4834,11 @@ test("POSIX lock loss during final rollback sync retains tail cleanup state", as
       path.join(pathLock, pathLockEntries[0]),
       "changed-during-final-sync\n",
     );
-    await writeFile(releaseFinalSync, "continue\n");
+    await writeFile(releaseFinalFsync, "continue\n");
 
     const [code] = await closePromise;
     assert.equal(code, 1);
-    assert.equal((await readFile(syncCount, "utf8")).trim(), "4");
+    assert.equal((await readFile(fsyncCount, "utf8")).trim(), "5");
     assert.match(stderr, /installer lock ownership was lost/);
     assert.match(stderr, /no further persistent rollback changes were attempted/);
     assert.equal(await readFile(profile, "utf8"), "# original profile\n");
@@ -5085,6 +5157,7 @@ test("POSIX piped installer routes setup through the controlling terminal", { ti
     }
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /Select clients:/);
+    assert.match(result.stdout, /\u001b\[K/);
     assert.equal(await readFile(selectedInput, "utf8"), "cursor\n");
     await access(path.join(installDirectory, "sana-mcp"));
   } finally {

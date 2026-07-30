@@ -2,8 +2,8 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.17 sh
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.17/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.18 sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.18/install.sh | sh
 set -eu
 set -f
 umask 077
@@ -509,13 +509,19 @@ cleanup() {
           refresh_cleanup_lock_ownership &&
           chmod 755 "$rollback_binary" &&
           refresh_cleanup_lock_ownership &&
+          installer_fsync file "$rollback_binary" &&
+          refresh_cleanup_lock_ownership &&
           mv -f "$rollback_binary" "$dest" &&
           refresh_cleanup_lock_ownership &&
           cp "$tmp_dir/old-receipt" "$rollback_receipt" &&
           refresh_cleanup_lock_ownership &&
           chmod 600 "$rollback_receipt" &&
           refresh_cleanup_lock_ownership &&
-          mv -f "$rollback_receipt" "$receipt"; then
+          installer_fsync file "$rollback_receipt" &&
+          refresh_cleanup_lock_ownership &&
+          mv -f "$rollback_receipt" "$receipt" &&
+          refresh_cleanup_lock_ownership &&
+          installer_fsync directory "$install_dir"; then
           files_restored=1
         else
           rollback_errors=1
@@ -535,6 +541,13 @@ cleanup() {
           rollback_errors=1
           files_restored=0
         }
+        if [ "$files_restored" = "1" ]; then
+          refresh_cleanup_lock_ownership &&
+            installer_fsync directory "$install_dir" || {
+            rollback_errors=1
+            files_restored=0
+          }
+        fi
       fi
     else
       files_restored=0
@@ -557,14 +570,14 @@ cleanup() {
               refresh_cleanup_lock_ownership &&
               cp -p "$tmp_dir/old-path-file" "$rollback_path" &&
               refresh_cleanup_lock_ownership &&
-              sync &&
+              installer_fsync file "$rollback_path" &&
               [ "$(hash_file "$path_file")" = "$path_written_sha256" ] &&
               refresh_cleanup_lock_ownership &&
               mv -f "$rollback_path" "$path_file"; then
               staged_path=""
               refresh_cleanup_lock_ownership || :
               if [ "$cleanup_lock_ownership_lost" = "0" ]; then
-                sync || rollback_errors=1
+                installer_fsync file "$path_file" || rollback_errors=1
               fi
             else
               rollback_errors=1
@@ -574,7 +587,7 @@ cleanup() {
               rm -f "$path_file" || rollback_errors=1
             refresh_cleanup_lock_ownership || :
             if [ "$cleanup_lock_ownership_lost" = "0" ]; then
-              sync || rollback_errors=1
+              installer_fsync directory "$(dirname "$path_file")" || rollback_errors=1
             fi
           fi
         elif [ "$current_path_sha256" = "$path_preimage_sha256" ]; then
@@ -691,9 +704,12 @@ else
 fi
 
 host_color=0
-if [ -t 1 ] && [ "${TERM:-}" != "dumb" ] && [ -z "${CI:-}" ] &&
-  [ -z "${NO_COLOR+x}" ]; then
-  host_color=1
+host_control=0
+if [ -t 1 ] && [ "${TERM:-}" != "dumb" ] && [ -z "${CI:-}" ]; then
+  host_control=1
+  if [ -z "${NO_COLOR+x}" ]; then
+    host_color=1
+  fi
 fi
 color_cyan=$(printf '\033[36m')
 color_gray=$(printf '\033[90m')
@@ -866,13 +882,21 @@ format_download_progress() {
   fi
   if [ -t 1 ]; then
     if [ "$host_color" = "1" ]; then
-      printf '\r%s%s%s ' "$progress_color" "$progress_text" "$color_reset"
+      printf '\r%s%s%s \033[K' "$progress_color" "$progress_text" "$color_reset"
+    elif [ "$host_control" = "1" ]; then
+      printf '\r%s \033[K' "$progress_text"
     else
       printf '\r%s ' "$progress_text"
     fi
   else
     printf '%s' "$progress_text"
   fi
+}
+
+installer_fsync() {
+  fsync_kind=$1
+  fsync_path=$2
+  "$tmp_dir/binary" __installer-fsync "$fsync_kind" --path "$fsync_path"
 }
 
 validate_release_tag() {
@@ -1256,7 +1280,7 @@ verify_or_apply_path_block() {
   cat "$tmp_dir/path-block" >> "$staged_path"
   path_written_sha256=$(hash_file "$staged_path")
   path_changed=1
-  sync
+  installer_fsync file "$staged_path"
 
   current_path_sha256=absent
   if [ -f "$path_file" ]; then
@@ -1269,7 +1293,7 @@ verify_or_apply_path_block() {
   staged_path=""
   [ "$(hash_file "$path_file")" = "$path_written_sha256" ] ||
     fail "published shell PATH update could not be verified"
-  sync
+  installer_fsync file "$path_file"
 }
 
 revalidate_path_block_for_commit() {
@@ -1532,6 +1556,7 @@ staged_binary=$(mktemp "$install_dir/.sana-mcp.XXXXXX") ||
   fail "could not stage the binary in $install_dir"
 cp "$tmp_dir/binary" "$staged_binary"
 chmod 755 "$staged_binary"
+installer_fsync file "$staged_binary"
 assert_installer_locks_owned
 mv -f "$staged_binary" "$dest"
 staged_binary=""
@@ -1556,13 +1581,15 @@ staged_receipt=$(mktemp "$install_dir/.sana-mcp-receipt.XXXXXX") ||
   fail "could not stage the installer receipt in $install_dir"
 cp "$tmp_dir/new-receipt" "$staged_receipt"
 chmod 600 "$staged_receipt"
+installer_fsync file "$staged_receipt"
 revalidate_path_block_for_commit "$path_profile"
 assert_installer_locks_owned
 mv -f "$staged_receipt" "$receipt"
 staged_receipt=""
+installer_fsync directory "$install_dir"
 
-live_state_touched=1
 assert_installer_locks_owned
+live_state_touched=1
 if [ "$should_run_after_install" = "1" ]; then
   "$dest" __lifecycle start --format properties > "$tmp_dir/lifecycle.properties" ||
     fail "new daemon could not be restarted"
