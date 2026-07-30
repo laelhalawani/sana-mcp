@@ -2,8 +2,8 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.18 sh
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.18/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.19 sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.19/install.sh | sh
 set -eu
 set -f
 umask 077
@@ -421,6 +421,7 @@ finalize_committed_cleanup() {
     "$tmp_dir/binary-download.error" \
     "$tmp_dir/binary-download.done" \
     "$tmp_dir/inspect.properties" \
+    "$tmp_dir/legacy-recovery.properties" \
     "$tmp_dir/old-binary" \
     "$tmp_dir/old-receipt" \
     "$tmp_dir/old-inspect.properties" \
@@ -659,7 +660,8 @@ cleanup() {
          "$tmp_dir/binary.sha256" \
          "$tmp_dir/binary-download.error" \
          "$tmp_dir/binary-download.done" \
-         "$tmp_dir/inspect.properties"; then
+         "$tmp_dir/inspect.properties" \
+         "$tmp_dir/legacy-recovery.properties"; then
         record_cleanup_failure "the downloaded temporary files could not be removed"
       fi
       if ! rm -f \
@@ -1010,6 +1012,132 @@ read_checksum() {
   esac
   [ "$checksum_body" = "$checksum_hash  $expected_name" ] ||
     fail "checksum file for $expected_name is malformed or names the wrong asset"
+}
+
+read_legacy_recovery_result() {
+  legacy_result_file=$1
+  LR_format=""; LR_status=""; LR_fingerprint=""; LR_phase=""
+  LR_code=""; LR_messageBase64=""; LR_recoveredCount=""; LR_seen=" "
+  while IFS= read -r legacy_line || [ -n "$legacy_line" ]; do
+    [ -n "$legacy_line" ] || continue
+    case "$legacy_line" in
+      *=*) legacy_key=${legacy_line%%=*}; legacy_value=${legacy_line#*=} ;;
+      *) fail "legacy installer recovery returned malformed state" ;;
+    esac
+    case "$LR_seen" in
+      *" $legacy_key "*) fail "legacy installer recovery repeated $legacy_key" ;;
+    esac
+    LR_seen="${LR_seen}${legacy_key} "
+    case "$legacy_key" in
+      format|status|phase|code)
+        case "$legacy_value" in
+          ""|*[!A-Za-z0-9._+-]*) fail "legacy installer recovery returned invalid $legacy_key" ;;
+        esac
+        ;;
+      fingerprint)
+        [ "${#legacy_value}" -eq 64 ] || fail "legacy installer recovery returned an invalid fingerprint"
+        case "$legacy_value" in *[!a-f0-9]*) fail "legacy installer recovery returned an invalid fingerprint" ;; esac
+        ;;
+      messageBase64)
+        case "$legacy_value" in *[!A-Za-z0-9+/=]*) fail "legacy installer recovery returned an invalid message" ;; esac
+        ;;
+      recoveredCount)
+        case "$legacy_value" in ""|*[!0-9]*) fail "legacy installer recovery returned an invalid count" ;; esac
+        ;;
+      *) fail "legacy installer recovery returned an unknown field" ;;
+    esac
+    case "$legacy_key" in
+      format) LR_format=$legacy_value ;;
+      status) LR_status=$legacy_value ;;
+      fingerprint) LR_fingerprint=$legacy_value ;;
+      phase) LR_phase=$legacy_value ;;
+      code) LR_code=$legacy_value ;;
+      messageBase64) LR_messageBase64=$legacy_value ;;
+      recoveredCount) LR_recoveredCount=$legacy_value ;;
+    esac
+  done < "$legacy_result_file"
+  [ "$LR_format" = "sana-mcp-legacy-posix-recovery-result-v1" ] ||
+    fail "legacy installer recovery protocol is unsupported"
+  case "$LR_status" in
+    none)
+      [ "$LR_seen" = " format status " ] || fail "legacy installer recovery state is contradictory"
+      ;;
+    confirmation-required)
+      [ -n "$LR_fingerprint" ] && [ "$LR_seen" = " format status fingerprint " ] ||
+        fail "legacy installer recovery confirmation state is incomplete"
+      ;;
+    pending)
+      [ -n "$LR_fingerprint" ] && [ -n "$LR_phase" ] &&
+        [ "$LR_seen" = " format status fingerprint phase " ] ||
+        fail "legacy installer recovery journal state is incomplete"
+      ;;
+    completed)
+      [ -n "$LR_fingerprint" ] && [ "$LR_recoveredCount" = "4" ] &&
+        [ "$LR_seen" = " format status fingerprint recoveredCount " ] ||
+        fail "legacy installer recovery completion state is incomplete"
+      ;;
+    blocked|error)
+      [ -n "$LR_code" ] && [ -n "$LR_messageBase64" ] &&
+        [ "$LR_seen" = " format status code messageBase64 " ] ||
+        fail "legacy installer recovery failure state is incomplete"
+      ;;
+    *) fail "legacy installer recovery returned an unknown status" ;;
+  esac
+}
+
+recover_legacy_interrupted_install() {
+  legacy_path_lock="$HOME/.sana-mcp-installer-path.lock"
+  legacy_journal="$HOME/.sana-mcp-legacy-posix-recovery.json"
+  legacy_journal_temporary="$legacy_journal.tmp"
+  if [ ! -d "$install_lock" ] && [ ! -d "$legacy_path_lock" ] &&
+    [ ! -f "$legacy_journal" ] && [ ! -f "$legacy_journal_temporary" ]; then
+    return 0
+  fi
+  legacy_result="$tmp_dir/legacy-recovery.properties"
+  "$tmp_dir/binary" __recover-legacy-posix inspect \
+    --home "$HOME" --install-dir "$install_dir" > "$legacy_result" ||
+    fail "legacy installer recovery inspection failed"
+  read_legacy_recovery_result "$legacy_result"
+  case "$LR_status" in
+    none) return 0 ;;
+    blocked|error)
+      fail "interrupted installer recovery was refused safely ($LR_code)"
+      ;;
+    pending)
+      legacy_fingerprint=""
+      ;;
+    confirmation-required)
+      legacy_fingerprint=$LR_fingerprint
+      legacy_approved=0
+      if [ "${SANA_MCP_RECOVER_INTERRUPTED:-0}" = "1" ]; then
+        legacy_approved=1
+      elif { true </dev/tty >/dev/tty; } 2>/dev/null; then
+        printf 'An interrupted sana-mcp install was detected. Stop it and continue? [y/N] ' > /dev/tty
+        IFS= read -r legacy_answer < /dev/tty || legacy_answer=""
+        case "$legacy_answer" in y|Y|yes|YES|Yes) legacy_approved=1 ;; esac
+      else
+        fail "interrupted installer recovery requires confirmation in a terminal"
+      fi
+      if [ "$legacy_approved" != "1" ]; then
+        host_line "$color_gray" "Interrupted install recovery cancelled."
+        exit 0
+      fi
+      ;;
+  esac
+  if [ -n "$legacy_fingerprint" ]; then
+    "$tmp_dir/binary" __recover-legacy-posix recover \
+      --home "$HOME" --install-dir "$install_dir" \
+      --fingerprint "$legacy_fingerprint" > "$legacy_result" ||
+      fail "interrupted installer recovery failed"
+  else
+    "$tmp_dir/binary" __recover-legacy-posix recover \
+      --home "$HOME" --install-dir "$install_dir" > "$legacy_result" ||
+      fail "interrupted installer recovery failed"
+  fi
+  read_legacy_recovery_result "$legacy_result"
+  [ "$LR_status" = "completed" ] ||
+    fail "interrupted installer recovery did not complete ($LR_code)"
+  host_line "$color_gray" "  Recovered an interrupted install."
 }
 
 read_inspect() {
@@ -1449,6 +1577,9 @@ mkdir -p "$install_dir"
 dest="$install_dir/sana-mcp"
 receipt="$install_dir/.sana-mcp-install-v1"
 install_lock="$install_dir/.sana-mcp-install-lock"
+if [ "$os" = "Linux" ] && [ -n "${HOME:-}" ]; then
+  recover_legacy_interrupted_install
+fi
 if ! mkdir "$install_lock" 2>/dev/null; then
   fail "another sana-mcp installation is active in $install_dir"
 fi

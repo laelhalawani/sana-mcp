@@ -163,6 +163,42 @@ program
   });
 
 program
+  .command("__recover-legacy-posix <operation>", { hidden: true })
+  .description("Recover the exact interrupted legacy POSIX installer transaction")
+  .requiredOption("--home <directory>", "canonical user home directory")
+  .requiredOption("--install-dir <directory>", "canonical installation directory")
+  .option("--fingerprint <sha256>", "explicitly confirmed recovery evidence")
+  .action(async (
+    operation: string,
+    opts: { home: string; installDir: string; fingerprint?: string },
+  ) => {
+    requireStandaloneInstallerCommand("__recover-legacy-posix");
+    const {
+      inspectLegacyPosixRecovery,
+      recoverLegacyPosixInstall,
+      serializeLegacyPosixRecoveryResult,
+    } = await import("./install/legacy-posix-recovery.js");
+    const result =
+      operation === "inspect"
+        ? await inspectLegacyPosixRecovery({
+            home: opts.home,
+            installDir: opts.installDir,
+          })
+        : operation === "recover"
+          ? await recoverLegacyPosixInstall({
+              home: opts.home,
+              installDir: opts.installDir,
+              fingerprint: opts.fingerprint,
+            })
+          : (() => {
+              throw new Error(
+                "__recover-legacy-posix operation must be inspect or recover",
+              );
+            })();
+    process.stdout.write(serializeLegacyPosixRecoveryResult(result));
+  });
+
+program
   .command("__reset-incompatible-state <operation>", { hidden: true })
   .description("Run the installer incompatible-state reset protocol")
   .requiredOption("--journal <directory>", "private reset journal directory")

@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing package-matching tag to release (for example v0.4.18)"
+        description: "Existing package-matching tag to release (for example v0.4.19)"
         required: true
         type: string
 
@@ -292,6 +292,8 @@ jobs:
           PACKAGE_VERSION="$(bun -e 'process.stdout.write(require("./package.json").version)')"
           EXECUTED_SHA256="$(sha256sum "$ASSET" | awk '{print $1}')"
           SEMANTIC_SMOKE_ROOT="$(mktemp -d)"
+          mkdir -p "$SEMANTIC_SMOKE_ROOT/legacy-home/bin"
+          chmod 700 "$SEMANTIC_SMOKE_ROOT/legacy-home" "$SEMANTIC_SMOKE_ROOT/legacy-home/bin"
           trap 'rm -rf "$SEMANTIC_SMOKE_ROOT"' EXIT
           if [ "$LIBC" = musl ]; then
             docker run --rm -v "$PWD/$ASSET:/execution/artifact:ro" \
@@ -306,6 +308,15 @@ jobs:
                 [ "$(sha256sum "$1" | awk "{print \$1}")" = "$EXPECTED_SHA256" ]
                 [ "$("$1" --version)" = "$PACKAGE_VERSION" ]
                 "$1" --help >/dev/null
+                LEGACY_ROOT="$(mktemp -d)"
+                mkdir -p "$LEGACY_ROOT/home/bin"
+                chmod 700 "$LEGACY_ROOT/home" "$LEGACY_ROOT/home/bin"
+                "$1" __recover-legacy-posix recover \
+                  --home "$LEGACY_ROOT/home" \
+                  --install-dir "$LEGACY_ROOT/home/bin" \
+                  > /execution/semantic-smoke/legacy-recovery.properties
+                grep -qx "status=none" /execution/semantic-smoke/legacy-recovery.properties
+                rm -rf "$LEGACY_ROOT"
                 "$1" __semantic-smoke > /execution/semantic-smoke/evidence.json
                 "$1" __inspect --format json
               ' _ /execution/artifact > "inspect-$TARGET.json"
@@ -313,6 +324,11 @@ jobs:
           else
             [ "$("./$ASSET" --version)" = "$PACKAGE_VERSION" ]
             "./$ASSET" --help >/dev/null
+            "./$ASSET" __recover-legacy-posix recover \
+              --home "$SEMANTIC_SMOKE_ROOT/legacy-home" \
+              --install-dir "$SEMANTIC_SMOKE_ROOT/legacy-home/bin" \
+              > "$SEMANTIC_SMOKE_ROOT/legacy-recovery.properties"
+            grep -qx 'status=none' "$SEMANTIC_SMOKE_ROOT/legacy-recovery.properties"
             SANA_SEMANTIC_SMOKE_ROOT="$SEMANTIC_SMOKE_ROOT" \
               "./$ASSET" __semantic-smoke > "semantic-smoke-$TARGET.json"
             "./$ASSET" __inspect --format json > "inspect-$TARGET.json"
