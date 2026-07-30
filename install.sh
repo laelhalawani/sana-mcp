@@ -2,8 +2,8 @@
 # Install the latest sana-mcp release:
 #   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 # Pin a release:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.20 sh
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.20/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | SANA_MCP_VERSION=v0.4.21 sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/download/v0.4.21/install.sh | sh
 set -eu
 set -f
 umask 077
@@ -1677,7 +1677,7 @@ path_lock_acquired=1
 transaction_active=1
 if [ "$old_was_running" = "1" ]; then
   assert_installer_locks_owned
-  "$dest" __lifecycle stop --format properties > "$tmp_dir/lifecycle.properties" ||
+  "$dest" __lifecycle stop --format properties --allow-stale-terminate > "$tmp_dir/lifecycle.properties" ||
     fail "existing daemon could not be stopped safely"
   read_lifecycle "$tmp_dir/lifecycle.properties"
   [ "$L_state" = "stopped" ] || fail "existing daemon did not stop"

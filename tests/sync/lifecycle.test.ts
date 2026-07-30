@@ -36,6 +36,7 @@ function dependencies(
     requestStop: defaultStop,
     clearControl: () => {},
     clearLegacyControl: () => {},
+    terminateStale: () => {},
     ensureRunning: async () => ({ alreadyRunning: false, spawned: true }),
     pidAlive: () => false,
     monotonicNow: () => clock,
@@ -189,6 +190,35 @@ test("stop publishes an authenticated request for a stale live daemon", async ()
     }),
   );
   expect(stopped).toEqual([A]);
+  expect(result).toEqual({ state: "stopped", changed: true });
+});
+
+test("verified installer stop terminates only the exact stale identity", async () => {
+  const terminated: DaemonControlIdentity[] = [];
+  let alive = true;
+  const result = await runDaemonLifecycleWith(
+    "stop",
+    dependencies({
+      control: [
+        { kind: "ready", identity: A, heartbeatMs: 1_000, freshness: "stale" },
+        { kind: "missing" },
+        { kind: "missing" },
+        { kind: "missing" },
+      ],
+      pidAlive: () => alive,
+      requestStop: (identity) => ({
+        identity,
+        published: true,
+        continuity: "confirmed",
+      }),
+      terminateStale: (identity) => {
+        terminated.push(identity);
+        alive = false;
+      },
+    }),
+    { allowStaleTerminate: true },
+  );
+  expect(terminated).toEqual([A]);
   expect(result).toEqual({ state: "stopped", changed: true });
 });
 
