@@ -1,9 +1,8 @@
-node_modules/
-dist/
-data/
-*.log
-.env
-.DS_Store
+# Build output
+/sana-mcp
+/sana-mcp.exe
+/dist/
 
-# throwaway dev test scripts
-scripts/test-*.ts
+# Local secrets and data
+.env
+/data/

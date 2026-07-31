@@ -1,130 +1,52 @@
-# Repository agent workflow
+# Agent Guidelines
 
-These instructions apply to every task in this repository.
+## Project shape
 
-## `.env` is immutable without explicit user approval
+`sana-mcp` syncs Sana.AI meeting transcripts to this machine and serves them to
+an agent over MCP, to a person through a full-screen application, and to scripts
+through a CLI. It follows the layout and conventions of
+`interactive-terminal-mcp` and `apis-mcp`.
 
-Never delete the `.env` file, and never delete, overwrite, blank, or otherwise
-remove any value from it, unless the user explicitly requests that specific
-change in the current task. Reading `.env` to use a value (for example, to run a
-push with a token from the URL) is allowed; mutating or removing its contents is
-not. If a task seems to require changing `.env`, stop and ask the user first and
-do not act until they confirm. There is no fallback or "cleanup" path that
-justifies touching `.env` without this confirmation.
+Read `docs/tool-contract.md` before changing anything an agent sees, and
+`docs/app-design.md` before changing a screen. Both are contracts.
 
-Before creating `.env`, always check whether it already exists. If it exists,
-never recreate, replace, or truncate it; edit the existing file in place and
-preserve every unrelated key and value exactly. When adding or updating one
-requested variable, change only that variable. Create a new `.env` only when no
-file exists and the user has explicitly requested values to be stored there.
+## Hard constraints
 
-## Store credentials when explicitly requested
+- **`CGO_ENABLED=0`.** Every dependency must be pure Go, because release builds
+  cross-compile six targets from one host. This is why the SQLite driver is
+  `modernc.org/sqlite` and not `mattn/go-sqlite3`.
+- **stdout belongs to the MCP protocol.** In server mode, diagnostics go to
+  stderr. A stray byte on stdout corrupts the session.
+- **The database is the shared state.** There is no IPC layer: the daemon is
+  only the single writer under a `flock`, and every reader opens SQLite
+  directly. Do not add a socket.
 
-When the user provides a credential and explicitly asks to store it, save it in
-`.env` under the requested environment-variable name. If the variable name is
-not clear, ask one short clarification question before writing it. Never print
-the credential, commit `.env`, or move it into Git configuration, credential
-helpers, source files, logs, or test fixtures.
+## Things that are load-bearing
 
-## Required delivery workflow
+- **`line_edits` is user-owned data, not cache.** Deleting the database loses
+  corrections that cannot be re-synced. Any migration, reset, or recovery path
+  must preserve it.
+- **A stored transcript is never re-downloaded.** `NeedsTranscript` decides
+  this. Re-listing meetings must not write `transcript_state` or `word_count` -
+  the list carries neither, and writing them resets what a fetch established.
+  There is a regression test; it exists because this bug shipped once.
+- **Edits re-attach by content hash, not line number.** Re-transcription shifts
+  line boundaries. An edit whose line cannot be found becomes `stale` and stays
+  in history: never dropped, never applied to a different line.
+- **The tool description's warning about editing is part of the contract.** It
+  is the only thing between a confident model and a corrupted transcript, and a
+  test pins it. Transcripts are full of real names that look like misspellings -
+  `Zenolith`, `Fabrix`, `Vantik` are real.
 
-1. Read the affected code and understand the behavior before editing.
-2. Make the smallest correct change that satisfies the request.
-3. Run the relevant tests, type checks, builds, and end-to-end checks.
-4. Have a separate read-only agent review the finished implementation for code
-   correctness. The review should look for concrete logic errors, broken API or
-   state transitions, missed error handling, regressions, and missing tests.
-5. Fix valid review findings and re-run the affected checks. Request another
-   review only when the correction is substantial enough to need one.
+## Testing
 
-Do not require planning fan-out, multiple plan reviewers, adversarial review
-rounds, fresh-review chains, or process evidence for routine work. Add extra
-review only when the user asks for it or a specific high-risk change clearly
-needs it.
-
-## Scope and compatibility rules
-
-- Preserve the existing agent/LLM-facing output contracts unless a task
-  explicitly changes them. This includes tool names, argument meanings, Markdown
-  free text, and optional YAML frontmatter.
-- Until the project reaches `1.0.0`, do not add complexity solely to preserve
-  compatibility for internal APIs, local cache schemas, installer receipts,
-  human CLI navigation, or other pre-release implementation details. Prefer the
-  cleanest correct design and document the breaking change.
-- Human CLI and installer presentation must use structured core APIs. Do not
-  reuse LLM-coaching strings in human-facing screens.
-- Give concurrent agents exclusive file ownership. Agents must not edit files
-  owned by another active scope.
-- Preserve unrelated worktree changes and generated/runtime data.
-- Tests and development validation must use isolated temporary data, HOME, PATH,
-  client configs, clocks, process probes, and network fakes. They must never read,
-  write, migrate, or delete the live `data/` tree.
-- Treat installers, upgrades, migrations, authentication, local transcript
-  storage, daemon control, and release publication as security-sensitive paths.
-
-## Pre-1.0 upgrade and replacement policy
-
-Before `1.0.0`, every release declares an explicit positive state-compatibility
-epoch in the release manifest, standalone binary, and installer receipt.
-
-- A receipt-backed installation with the same epoch is a compatible update. Stop
-  its verified daemon, replace only proven installer-owned runtime artifacts, and
-  preserve its local authentication and meeting/cache state without inspecting,
-  parsing, or revalidating authentication. The update must not require Sana to be
-  reachable.
-- A recognized official pre-receipt installation, or a receipt-backed installation
-  with a different epoch, is incompatible. Before any mutation, tell the user that
-  it cannot be updated in place, that replacement requires meetings to be
-  resynced and a new login, and ask for explicit confirmation. Declining is a
-  successful no-op.
-- A platform may offer that consent only after its destructive replacement
-  coordinator has been implemented and reviewed end to end. Until then it must
-  refuse an epoch-changing update before confirmation or persistent mutation;
-  currently the automatic incompatible replacement coordinator is Windows-only.
-- After confirmation, perform a controlled destructive replacement: stop the
-  proven old daemon, replace only proven installer-owned runtime artifacts, and
-  reset the canonical default local state. Do not migrate, copy, or revalidate
-  authentication from the incompatible installation.
-- Never overwrite an unrecognized receiptless executable. Never automatically
-  reset an overridden data or transcript directory; stop with actionable manual
-  guidance instead.
-- Journal and quarantine the incompatible state until binary replacement, receipt
-  and PATH publication, smoke/health checks, and required daemon transition have
-  succeeded. Roll back on failure; delete the quarantine only after commit.
-- Recreate rebuildable local databases, full-text indexes, embeddings, generated
-  state, and caches after a confirmed incompatible replacement. Do not build
-  elaborate compatibility layers for pre-release formats.
-- `sana-mcp update` must prove the installed standalone runtime and adjacent
-  receipt before network access, resolve an exact release tuple, and hand off to
-  that release's checksum-verified installer. A current version is a no-op and an
-  installed version newer than the latest release is never downgraded.
-- Only the reviewed, serialized pre-1.0 replacement coordinator may quarantine or
-  delete the canonical rebuildable live state. Ordinary agents, tests, and ad hoc
-  scripts must preserve runtime data.
-
-## No hardcoded fallback values
-
-Never hardcode a value in a fallback or recovery path when doing so could hide an
-error, invent state, route data incorrectly, or make a failed operation appear
-successful.
-
-In particular, fallback paths must not invent or substitute:
-
-- account, user, workspace, meeting, asset, or tenant identifiers;
-- versions, release tags, architectures, platforms, or asset names;
-- origins, API endpoints, redirect targets, paths, or executable locations;
-- model identifiers, embedding dimensions, cursors, timestamps, counts, or
-  pagination state;
-- authentication/session values, checksums, configuration entries, or empty
-  successful API results.
-
-When a required value is missing or invalid, do one of the following:
-
-1. derive it from an authoritative source and validate it;
-2. return a typed unavailable/error state with actionable context; or
-3. stop safely without mutating persistent state.
-
-Fallbacks must be observable and must not downgrade integrity checks, privacy
-boundaries, authentication, or error reporting. A documented product default is
-allowed only when it is the intentional primary behavior, not an error-recovery
-substitute.
+- `go vet ./... && go test ./... && go test -race ./...` before every commit.
+- Verify all six targets build: `CGO_ENABLED=0 GOOS=... GOARCH=... go build`.
+- **Live tests need `SANA_LIVE=1`** and the machine's stored session. They are
+  read-only and write to temporary databases. CI skips them, so live
+  verification is something you do locally.
+- **Drive the real thing.** Every bug worth its commit message in this repo was
+  found by running the binary, not by reading it: a nil context that hung
+  forever, a schema that rejected every call, a config write that emptied every
+  meeting, a disconnect reported as a crash. Unit tests with mocks would have
+  passed all four.
