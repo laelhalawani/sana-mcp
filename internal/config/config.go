@@ -56,11 +56,6 @@ func PathsUnder(root string) Paths {
 type Config struct {
 	Version int `toml:"version"`
 
-	// SemanticSearch enables the dense channel. It is off by default: keyword
-	// search answers most queries, and leaving it off means no model download
-	// and no indexing pass at all.
-	SemanticSearch bool `toml:"semantic_search"`
-
 	// SyncIntervalMinutes is how often the daemon polls Sana for new meetings.
 	SyncIntervalMinutes int `toml:"sync_interval_minutes"`
 }
@@ -69,7 +64,6 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Version:             currentVersion,
-		SemanticSearch:      false,
 		SyncIntervalMinutes: 15,
 	}
 }
