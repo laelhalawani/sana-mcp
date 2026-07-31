@@ -3,6 +3,7 @@ module github.com/laelhalawani/sana-mcp
 go 1.26.5
 
 require (
+	github.com/gofrs/flock v0.13.0
 	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.55.0
 )
