@@ -1,4 +1,11 @@
-package render
+// Package tui holds what the two terminal surfaces share and nothing else
+// needs: the colour palette, and the small interaction primitives.
+//
+// It is separate from internal/render because render lays out domain values as
+// text for every surface, including the CLI and the MCP server - neither of
+// which has a terminal. Putting keystroke handling and lipgloss there dragged a
+// TUI framework into the dependencies of a stdio server.
+package tui
 
 import (
 	tea "github.com/charmbracelet/bubbletea"

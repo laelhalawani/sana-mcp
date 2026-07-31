@@ -5,6 +5,7 @@ import (
 
 	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/store"
+	"github.com/laelhalawani/sana-mcp/internal/tui"
 	"strings"
 )
 
@@ -36,30 +37,30 @@ func (m model) View() string {
 		body += "\n" + m.viewConfirm()
 	}
 	if m.failure != "" {
-		body += "\n" + render.Failed.Render("  "+m.failure)
+		body += "\n" + tui.Failed.Render("  "+m.failure)
 	} else if m.message != "" {
-		body += "\n" + render.On.Render("  "+m.message)
+		body += "\n" + tui.On.Render("  "+m.message)
 	}
 	return body
 }
 
 func footer(keys string) string {
-	return "\n" + render.Dim.Render("  "+keys)
+	return "\n" + tui.Dim.Render("  "+keys)
 }
 
 func (m model) viewMenu() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("sana-mcp") + render.Dim.Render("  "+m.version) + "\n\n")
+	out.WriteString(tui.Title.Render("sana-mcp") + tui.Dim.Render("  "+m.version) + "\n\n")
 	for index, item := range menuItems {
 		pointer := "  "
 		label := item.label
 		if index == m.menuCursor {
-			pointer = render.Cursor.Render("> ")
-			label = render.Cursor.Render(item.label)
+			pointer = tui.Cursor.Render("> ")
+			label = tui.Cursor.Render(item.label)
 		}
 		fmt.Fprintf(&out, "  %s%s\n", pointer, label)
 	}
-	out.WriteString("\n  " + render.Dim.Render(render.StatusLabel(m.status)))
+	out.WriteString("\n  " + tui.Dim.Render(render.StatusLabel(m.status)))
 	return out.String() + footer("up/down navigate  enter select  q quit")
 }
 
@@ -72,49 +73,49 @@ func (m model) viewMeetings() string {
 	if m.statusFilter != "" {
 		title += "  status: " + m.statusFilter
 	}
-	out.WriteString(render.Title.Render(title) + "\n\n")
+	out.WriteString(tui.Title.Render(title) + "\n\n")
 
 	if m.filtering {
 		fmt.Fprintf(&out, "  Filter by name: %s\n\n", m.filterInput)
 	}
 	if len(m.meetings) == 0 {
-		out.WriteString(render.Dim.Render("  No meetings yet. Sync runs in the background.") + "\n")
+		out.WriteString(tui.Dim.Render("  No meetings yet. Sync runs in the background.") + "\n")
 	}
 	for index, meeting := range m.meetings {
 		pointer := "  "
 		title := meeting.Title
 		if index == m.meetingCursor {
-			pointer = render.Cursor.Render("> ")
-			title = render.Cursor.Render(title)
+			pointer = tui.Cursor.Render("> ")
+			title = tui.Cursor.Render(title)
 		}
 		fmt.Fprintf(&out, "%s%s\n", pointer, title)
 		fmt.Fprintf(&out, "    %s  %d words  %s\n",
 			render.Timestamp(meeting.CreatedMS),
 			meeting.WordCount,
-			render.Dim.Render(meeting.Status))
+			tui.Dim.Render(meeting.Status))
 	}
 	pages := store.ListOptions{Limit: m.pageSize()}.Pages(m.meetingTotal)
-	fmt.Fprintf(&out, "\n  %s", render.Dim.Render(fmt.Sprintf("page %d of %d", m.meetingPage, pages)))
+	fmt.Fprintf(&out, "\n  %s", tui.Dim.Render(fmt.Sprintf("page %d of %d", m.meetingPage, pages)))
 	return out.String() + footer(
 		"enter/t transcript  s summary  p participants  o recording  / name  f status  PgUp/PgDn page  esc menu")
 }
 
 func (m model) viewTranscript() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render(m.current.Title) + "\n\n")
+	out.WriteString(tui.Title.Render(m.current.Title) + "\n\n")
 	visible := m.height - 6
 	end := min(len(m.lines), m.offset+visible)
 	for index := m.offset; index < end; index++ {
 		line := m.lines[index]
 		pointer := " "
 		if index == m.lineCursor {
-			pointer = render.Cursor.Render(">")
+			pointer = tui.Cursor.Render(">")
 		}
 		// A corrected line is marked, so nobody mistakes an edit for what was
 		// said. The original stays one keypress away under h.
 		marker := ""
 		if line.Text != line.OriginalText {
-			marker = render.Warn.Render(" *")
+			marker = tui.Warn.Render(" *")
 		}
 		fmt.Fprintf(&out, "%s %s%s\n", pointer, render.TranscriptLine(line, true), marker)
 	}
@@ -124,25 +125,25 @@ func (m model) viewTranscript() string {
 
 func (m model) viewDetail() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render(m.current.Title) + "\n\n")
+	out.WriteString(tui.Title.Render(m.current.Title) + "\n\n")
 	out.WriteString(m.detail + "\n")
 	return out.String() + footer("t transcript  s summary  p participants  o recording  esc meetings")
 }
 
 func (m model) viewSearch() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("Search transcripts") + "\n\n")
+	out.WriteString(tui.Title.Render("Search transcripts") + "\n\n")
 	if m.searchTyped {
 		fmt.Fprintf(&out, "  > %s\n", m.queryInput)
 		return out.String() + footer("enter search  esc menu")
 	}
 	if m.searching {
-		out.WriteString(render.Dim.Render("  Searching...") + "\n")
+		out.WriteString(tui.Dim.Render("  Searching...") + "\n")
 		return out.String() + footer("esc edit query")
 	}
 	if len(m.hits) == 0 {
 		fmt.Fprintf(&out, "  Nothing matched %q.\n\n", m.query)
-		out.WriteString(render.Dim.Render("  "+render.NoMatchHint) + "\n")
+		out.WriteString(tui.Dim.Render("  "+render.NoMatchHint) + "\n")
 		return out.String() + footer("esc edit query")
 	}
 	fmt.Fprintf(&out, "  %d results for %q\n\n", len(m.hits), m.query)
@@ -152,18 +153,18 @@ func (m model) viewSearch() string {
 		hit := m.hits[index]
 		pointer := "  "
 		if index == m.hitCursor {
-			pointer = render.Cursor.Render("> ")
+			pointer = tui.Cursor.Render("> ")
 		}
 		fmt.Fprintf(&out, "%s%s  %s  line %d\n", pointer,
-			hit.Title, render.Dim.Render(render.Date(hit.CreatedMS)), hit.LineNo)
-		fmt.Fprintf(&out, "    %s\n", render.Dim.Render(render.Truncate(strings.TrimSpace(hit.Text), m.width-6)))
+			hit.Title, tui.Dim.Render(render.Date(hit.CreatedMS)), hit.LineNo)
+		fmt.Fprintf(&out, "    %s\n", tui.Dim.Render(render.Truncate(strings.TrimSpace(hit.Text), m.width-6)))
 	}
 	return out.String() + footer("up/down navigate  enter open at that line  esc edit query  q quit")
 }
 
 func (m model) viewStatus() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("Sync status") + "\n\n")
+	out.WriteString(tui.Title.Render("Sync status") + "\n\n")
 	fmt.Fprintf(&out, "  %s\n\n", render.StatusLabel(m.status))
 	fmt.Fprintf(&out, "  %s\n", render.ProgressBar(m.status.TranscriptsDone, m.status.TranscriptsTotal, 30))
 	for _, line := range strings.Split(strings.TrimRight(render.StatusLines(m.status), "\n"), "\n") {
@@ -174,10 +175,10 @@ func (m model) viewStatus() string {
 
 func (m model) viewAccount() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("Sana account") + "\n\n")
+	out.WriteString(tui.Title.Render("Sana account") + "\n\n")
 	if !m.session.SignedIn() {
 		out.WriteString("  Not signed in.\n\n")
-		out.WriteString(render.Dim.Render("  Sign in with: sana-mcp login") + "\n")
+		out.WriteString(tui.Dim.Render("  Sign in with: sana-mcp login") + "\n")
 		return out.String() + footer("esc menu")
 	}
 	fmt.Fprintf(&out, "  Signed in as %s\n", m.session.Email)
@@ -187,17 +188,17 @@ func (m model) viewAccount() string {
 
 func (m model) viewConfig() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("Configuration") + "\n\n")
+	out.WriteString(tui.Title.Render("Configuration") + "\n\n")
 	fmt.Fprintf(&out, "  Data          %s\n", m.runtime.Paths.Root)
 	fmt.Fprintf(&out, "  Sync every    %d minutes\n", m.runtime.Config.SyncIntervalMinutes)
 	fmt.Fprintf(&out, "  Search        keyword (BM25)\n")
-	out.WriteString("\n" + render.Dim.Render("  Change which AI clients are connected: sana-mcp configure") + "\n")
+	out.WriteString("\n" + tui.Dim.Render("  Change which AI clients are connected: sana-mcp configure") + "\n")
 	return out.String() + footer("esc menu")
 }
 
 func (m model) viewEdit() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("Edit line "+fmt.Sprint(m.editLine)) + "\n\n")
+	out.WriteString(tui.Title.Render("Edit line "+fmt.Sprint(m.editLine)) + "\n\n")
 	original := ""
 	for _, line := range m.lines {
 		if line.LineNo == m.editLine {
@@ -205,9 +206,9 @@ func (m model) viewEdit() string {
 			break
 		}
 	}
-	out.WriteString(render.Dim.Render("  As transcribed: "+original) + "\n\n")
+	out.WriteString(tui.Dim.Render("  As transcribed: "+original) + "\n\n")
 	fmt.Fprintf(&out, "  %s\n", m.editBuffer)
-	out.WriteString("\n" + render.Warn.Render(
+	out.WriteString("\n" + tui.Warn.Render(
 		"  Transcripts contain real product and personal names that look like\n"+
 			"  misspellings. Only correct what you know is wrong.") + "\n")
 	return out.String() + footer("ctrl+s save  esc cancel")
@@ -215,21 +216,21 @@ func (m model) viewEdit() string {
 
 func (m model) viewHistory() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("Edits in "+m.current.Title) + "\n\n")
+	out.WriteString(tui.Title.Render("Edits in "+m.current.Title) + "\n\n")
 	if len(m.history) == 0 {
-		out.WriteString(render.Dim.Render("  Nothing in this meeting has been changed.") + "\n")
+		out.WriteString(tui.Dim.Render("  Nothing in this meeting has been changed.") + "\n")
 		return out.String() + footer("esc transcript")
 	}
 	for index, edit := range m.history {
 		pointer := "  "
 		if index == m.historyCursor {
-			pointer = render.Cursor.Render("> ")
+			pointer = tui.Cursor.Render("> ")
 		}
 		fmt.Fprintf(&out, "%sline %d  %s  %s  %s\n", pointer, edit.LineNo,
 			render.Timestamp(edit.EditedMS),
-			edit.Author, render.Dim.Render(edit.State))
-		fmt.Fprintf(&out, "    %s %s\n", render.Dim.Render("original:"), render.Truncate(edit.OriginalText, m.width-16))
-		fmt.Fprintf(&out, "    %s  %s\n", render.Dim.Render("current: "), render.Truncate(edit.EditedText, m.width-16))
+			edit.Author, tui.Dim.Render(edit.State))
+		fmt.Fprintf(&out, "    %s %s\n", tui.Dim.Render("original:"), render.Truncate(edit.OriginalText, m.width-16))
+		fmt.Fprintf(&out, "    %s  %s\n", tui.Dim.Render("current: "), render.Truncate(edit.EditedText, m.width-16))
 	}
 	return out.String() + footer("up/down navigate  r restore original  esc transcript")
 }
@@ -237,12 +238,12 @@ func (m model) viewHistory() string {
 func (m model) viewConfirm() string {
 	switch m.confirming {
 	case "save":
-		return render.Warn.Render("  Save this correction? [y/n]")
+		return tui.Warn.Render("  Save this correction? [y/n]")
 	case "discard":
-		return render.Warn.Render("  Discard your changes? [y/n]")
+		return tui.Warn.Render("  Discard your changes? [y/n]")
 	case "restore":
 		if m.historyCursor < len(m.history) {
-			return render.Warn.Render(fmt.Sprintf(
+			return tui.Warn.Render(fmt.Sprintf(
 				"  Restore line %d to what Sana delivered? [y/n]", m.history[m.historyCursor].LineNo))
 		}
 	}

@@ -33,6 +33,22 @@ const SessionCookie = "sana-ai-session"
 // than retrying.
 var ErrUnauthorized = errors.New("sana session is not valid; sign in again")
 
+// sharedTransport is process-wide, which is what a transport is for: it is the
+// connection pool. The daemon builds a client per sync cycle, so a transport
+// per client meant every cycle re-dialled and re-handshaked - measured at
+// 149-428 ms of TCP and TLS setup against a ~550 ms warm request - and left the
+// abandoned pool holding idle sockets for its full idle timeout.
+//
+// The default keeps two idle connections per host, fewer than the daemon
+// fetches in parallel; eight matches the four-way fan-out doubled by the paired
+// metadata requests. Cookie jars stay per-client, so sessions cannot mix.
+var sharedTransport = &http.Transport{
+	Proxy:               http.ProxyFromEnvironment,
+	MaxIdleConns:        16,
+	MaxIdleConnsPerHost: 8,
+	IdleConnTimeout:     90 * time.Second,
+}
+
 // Client is an authenticated Sana client.
 type Client struct {
 	baseURL string
@@ -68,17 +84,9 @@ func New(baseURL string, session *Session) *Client {
 		session:     session,
 		workspaceID: workspaceID,
 		http: &http.Client{
-			Jar: jar,
-			// The default transport keeps two idle connections per host, which
-			// is fewer than the daemon fetches in parallel - so half of every
-			// batch would re-dial and re-handshake. This matches the fan-out.
-			Transport: &http.Transport{
-				Proxy:               http.ProxyFromEnvironment,
-				MaxIdleConns:        16,
-				MaxIdleConnsPerHost: 8,
-				IdleConnTimeout:     90 * time.Second,
-			},
-			Timeout: 60 * time.Second,
+			Jar:       jar,
+			Transport: sharedTransport,
+			Timeout:   60 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// Credentials must never follow a redirect off the configured
 				// origin, so cross-origin hops are refused rather than trusted.

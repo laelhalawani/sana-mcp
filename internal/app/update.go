@@ -4,8 +4,8 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/store"
+	"github.com/laelhalawani/sana-mcp/internal/tui"
 )
 
 func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -68,9 +68,9 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) menuKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "up", "k":
-		m.menuCursor = render.Wrap(m.menuCursor, -1, len(menuItems))
+		m.menuCursor = tui.Wrap(m.menuCursor, -1, len(menuItems))
 	case "down", "j":
-		m.menuCursor = render.Wrap(m.menuCursor, 1, len(menuItems))
+		m.menuCursor = tui.Wrap(m.menuCursor, 1, len(menuItems))
 	case "enter":
 		target := menuItems[m.menuCursor].target
 		if target == screenQuit {
@@ -128,16 +128,16 @@ func (m model) meetingsKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filtering = false
 			m.filterInput = ""
 		default:
-			m.filterInput, _ = render.Typed(m.filterInput, key)
+			m.filterInput, _ = tui.Typed(m.filterInput, key)
 		}
 		return m, nil
 	}
 
 	switch key.String() {
 	case "up", "k":
-		m.meetingCursor = render.Wrap(m.meetingCursor, -1, len(m.meetings))
+		m.meetingCursor = tui.Wrap(m.meetingCursor, -1, len(m.meetings))
 	case "down", "j":
-		m.meetingCursor = render.Wrap(m.meetingCursor, 1, len(m.meetings))
+		m.meetingCursor = tui.Wrap(m.meetingCursor, 1, len(m.meetings))
 	case "pgdown", "right":
 		if m.meetingPage*m.pageSize() < m.meetingTotal {
 			m.meetingPage++
@@ -263,16 +263,16 @@ func (m model) searchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 		default:
-			m.queryInput, _ = render.Typed(m.queryInput, key)
+			m.queryInput, _ = tui.Typed(m.queryInput, key)
 		}
 		return m, nil
 	}
 
 	switch key.String() {
 	case "up", "k":
-		m.hitCursor = render.Wrap(m.hitCursor, -1, len(m.hits))
+		m.hitCursor = tui.Wrap(m.hitCursor, -1, len(m.hits))
 	case "down", "j":
-		m.hitCursor = render.Wrap(m.hitCursor, 1, len(m.hits))
+		m.hitCursor = tui.Wrap(m.hitCursor, 1, len(m.hits))
 	case "enter":
 		if m.hitCursor < len(m.hits) {
 			hit := m.hits[m.hitCursor]
@@ -316,7 +316,7 @@ func (m model) editKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
 	default:
-		buffer, changed := render.Typed(m.editBuffer, key)
+		buffer, changed := tui.Typed(m.editBuffer, key)
 		m.editBuffer = buffer
 		m.editDirty = m.editDirty || changed
 	}
@@ -326,9 +326,9 @@ func (m model) editKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) historyKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "up", "k":
-		m.historyCursor = render.Wrap(m.historyCursor, -1, len(m.history))
+		m.historyCursor = tui.Wrap(m.historyCursor, -1, len(m.history))
 	case "down", "j":
-		m.historyCursor = render.Wrap(m.historyCursor, 1, len(m.history))
+		m.historyCursor = tui.Wrap(m.historyCursor, 1, len(m.history))
 	case "r":
 		if m.historyCursor < len(m.history) {
 			m.confirming = "restore"

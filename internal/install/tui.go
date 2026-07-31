@@ -12,6 +12,7 @@ import (
 	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
+	"github.com/laelhalawani/sana-mcp/internal/tui"
 	detectharness "github.com/sairaph/detect-harness"
 )
 
@@ -161,9 +162,9 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case stepHarnesses:
 		switch key.String() {
 		case "up", "k":
-			m.cursor = render.Wrap(m.cursor, -1, len(m.harnesses))
+			m.cursor = tui.Wrap(m.cursor, -1, len(m.harnesses))
 		case "down", "j":
-			m.cursor = render.Wrap(m.cursor, 1, len(m.harnesses))
+			m.cursor = tui.Wrap(m.cursor, 1, len(m.harnesses))
 		case " ":
 			if m.cursor < len(m.harnesses) {
 				harness := m.harnesses[m.cursor]
@@ -223,7 +224,7 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.quit = true
 			return m, tea.Quit
 		default:
-			m.input, _ = render.Typed(m.input, key)
+			m.input, _ = tui.Typed(m.input, key)
 		}
 	case stepSyncing:
 		switch key.String() {
@@ -311,7 +312,7 @@ func (m model) readStatus() tea.Cmd {
 
 func (m model) View() string {
 	var out strings.Builder
-	out.WriteString(render.Title.Render("sana-mcp setup") + "\n\n")
+	out.WriteString(tui.Title.Render("sana-mcp setup") + "\n\n")
 
 	switch m.step {
 	case stepDetecting:
@@ -331,20 +332,20 @@ func (m model) View() string {
 				// user knows it was considered, but reads as "not detected":
 				// they want to know whether it is there, not why the library
 				// could not reach it.
-				out.WriteString(render.Dim.Render(
+				out.WriteString(tui.Dim.Render(
 					fmt.Sprintf("    ( ) %s%s", name, harness.StatusText())) + "\n")
 				continue
 			case m.selected[harness.ID]:
-				box = render.On.Render("(x)")
+				box = tui.On.Render("(x)")
 			}
 			if index == m.cursor {
-				pointer = render.Cursor.Render(">")
-				name = render.Cursor.Render(name)
+				pointer = tui.Cursor.Render(">")
+				name = tui.Cursor.Render(name)
 			}
 			fmt.Fprintf(&out, "  %s %s %s%s\n",
-				pointer, box, name, render.Dim.Render(harness.StatusText()))
+				pointer, box, name, tui.Dim.Render(harness.StatusText()))
 		}
-		out.WriteString("\n" + render.Dim.Render(
+		out.WriteString("\n" + tui.Dim.Render(
 			"  up/down move  space toggle  a all  enter confirm  esc cancel") + "\n")
 
 	case stepApplying:
@@ -352,28 +353,28 @@ func (m model) View() string {
 
 	case stepSignInAsk:
 		out.WriteString("  Sign in to Sana now? [Y/n]\n")
-		out.WriteString(render.Dim.Render("  You can also sign in later with: sana-mcp login") + "\n")
+		out.WriteString(tui.Dim.Render("  You can also sign in later with: sana-mcp login") + "\n")
 
 	case stepSignInEmail:
 		if m.failure != "" {
-			out.WriteString("  " + render.Failed.Render(m.failure) + "\n\n")
+			out.WriteString("  " + tui.Failed.Render(m.failure) + "\n\n")
 		}
 		fmt.Fprintf(&out, "  Email: %s\n", m.input)
-		out.WriteString(render.Dim.Render("  enter to send a sign-in code, esc to skip") + "\n")
+		out.WriteString(tui.Dim.Render("  enter to send a sign-in code, esc to skip") + "\n")
 
 	case stepSignInCode:
 		if m.failure != "" {
-			out.WriteString("  " + render.Failed.Render(m.failure) + "\n\n")
+			out.WriteString("  " + tui.Failed.Render(m.failure) + "\n\n")
 		}
 		fmt.Fprintf(&out, "  A code was emailed to %s\n\n", m.email)
 		fmt.Fprintf(&out, "  Code: %s\n", m.input)
-		out.WriteString(render.Dim.Render("  enter to confirm, esc to skip") + "\n")
+		out.WriteString(tui.Dim.Render("  enter to confirm, esc to skip") + "\n")
 
 	case stepSyncing:
 		fmt.Fprintf(&out, "  %s %s\n\n", m.spinner(), render.StatusLabel(m.status))
 		out.WriteString("  " + render.ProgressBar(m.status.TranscriptsDone, m.status.TranscriptsTotal, 28) + "\n")
 		fmt.Fprintf(&out, "  %d/%d transcripts\n", m.status.TranscriptsDone, m.status.TranscriptsTotal)
-		out.WriteString("\n" + render.Dim.Render("  enter to leave it running in the background") + "\n")
+		out.WriteString("\n" + tui.Dim.Render("  enter to leave it running in the background") + "\n")
 
 	case stepDone:
 		out.WriteString(m.summary())
@@ -397,27 +398,27 @@ func (m model) summary() string {
 	if m.signedIn {
 		fmt.Fprintf(&out, "  Sana account  signed in as %s\n", m.email)
 	} else {
-		out.WriteString("  Sana account  " + render.Warn.Render("not signed in") + "\n")
+		out.WriteString("  Sana account  " + tui.Warn.Render("not signed in") + "\n")
 	}
 	switch {
 	case m.status.Complete():
-		out.WriteString("  Meeting sync  " + render.On.Render("complete") + "\n")
+		out.WriteString("  Meeting sync  " + tui.On.Render("complete") + "\n")
 	case m.signedIn:
 		out.WriteString("  Meeting sync  continuing in the background\n")
 	default:
 		out.WriteString("  Meeting sync  waiting for sign-in\n")
 	}
 	for _, failure := range failures {
-		out.WriteString("  " + render.Failed.Render(failure) + "\n")
+		out.WriteString("  " + tui.Failed.Render(failure) + "\n")
 	}
 	if hints := m.reloadHints(); len(hints) > 0 {
 		fmt.Fprintf(&out, "  Reload        %s\n", strings.Join(hints, "; "))
 	}
 	if !m.signedIn {
-		out.WriteString("\n  Next: " + render.Title.Render("sana-mcp login") + "\n")
+		out.WriteString("\n  Next: " + tui.Title.Render("sana-mcp login") + "\n")
 		return out.String()
 	}
-	out.WriteString("\n  Next: " + render.Title.Render("sana-mcp") + "\n")
+	out.WriteString("\n  Next: " + tui.Title.Render("sana-mcp") + "\n")
 	return out.String()
 }
 

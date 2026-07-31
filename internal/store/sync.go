@@ -75,13 +75,13 @@ func (s *Store) Status() (Status, error) {
 	// they are the honest denominator: a meeting still processing upstream is
 	// not something this program is waiting on.
 	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM meetings WHERE status = 'ready'`,
+		`SELECT COUNT(*) FROM meetings WHERE status = ?`, StatusReady,
 	).Scan(&status.TranscriptsTotal); err != nil {
 		return Status{}, err
 	}
 	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM meetings WHERE status = 'ready' AND transcript_state = ?`,
-		TranscriptComplete,
+		`SELECT COUNT(*) FROM meetings WHERE status = ? AND transcript_state = ?`,
+		StatusReady, TranscriptComplete,
 	).Scan(&status.TranscriptsDone); err != nil {
 		return Status{}, err
 	}
@@ -115,9 +115,9 @@ func (s *Store) SetError(message string) error {
 func (s *Store) PendingTranscripts(limit int) ([]string, error) {
 	return s.meetingIDs(
 		`SELECT meeting_id FROM meetings
-		  WHERE status = 'ready' AND transcript_state != ?
+		  WHERE status = ? AND transcript_state != ?
 		  ORDER BY created_ms DESC
 		  LIMIT ?`,
-		TranscriptComplete, limit,
+		StatusReady, TranscriptComplete, limit,
 	)
 }
