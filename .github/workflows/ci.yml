@@ -27,23 +27,27 @@ jobs:
           go-version: '1.26.x'
           cache: true
       - run: go vet ./...
-      # The daemon multiplexes PTY readers, emulator writes, log writers,
-      # broadcasters, and socket handlers, so the race detector runs on every
-      # build rather than only on release.
+      # Only the raced run. It executes the same tests as a plain `go test`, so
+      # running both spent minutes to learn nothing the second time.
       #
-      # Only the raced run. It executes the same tests as a plain `go test`,
-      # and this suite starts real shells -- running it twice per commit spent
-      # minutes to learn nothing the second time.
+      # The live tests against the real Sana API are skipped here: they need a
+      # signed-in session, which CI does not have and should not. They are run
+      # locally with SANA_LIVE=1.
       - run: go test -race ./...
       - run: CGO_ENABLED=0 go build -trimpath .
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l . | grep -v '^prototypes/' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
 
   cross-build:
     # Pull requests only. A push to main that ships a release builds all six
     # targets in release.yml minutes later, and building them here as well
     # meant every deploy compiled the same commit twice for six platforms.
-    # Before a merge is where the answer is still useful, so that is where it
-    # runs; windows-vet below still compiles the platform-specific paths on
-    # every push, which is what actually rots.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
@@ -63,9 +67,9 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: go build -trimpath .
 
-  windows-vet:
-    # The Windows ConPTY and named-pipe paths cannot run on a Linux runner, but
-    # compiling them here stops them rotting silently between Windows releases.
+  platform-vet:
+    # The Windows process-stop path cannot run on a Linux runner, but compiling
+    # and vetting it here stops it rotting silently between Windows releases.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,6 +81,6 @@ jobs:
       - run: GOOS=darwin GOARCH=arm64 go vet ./...
       - name: Compile the Windows test binaries
         run: |
-          for package in ./internal/session ./internal/daemon ./internal/ipc ./internal/keys ./internal/vterm; do
+          for package in ./internal/daemon ./internal/store ./internal/mcpserver; do
             GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /dev/null "$package"
           done
