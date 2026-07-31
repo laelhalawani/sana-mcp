@@ -6,13 +6,18 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
-// ErrLineMismatch is returned when the text supplied with an edit is not what
-// the line currently holds. It is the compare-and-swap failing, and it means
-// the caller is working from a stale or misread copy.
-var ErrLineMismatch = errors.New("the supplied line text does not match the stored line")
+// ErrLineMismatch is returned when the fragment supplied with an edit does not
+// occur in the line exactly as many times as the caller said it would.
+//
+// It is the compare-and-swap failing. The count is deliberately not part of the
+// error: told "there were 3", a caller will simply retry with 3 and replace two
+// occurrences it has never looked at. The only safe next step is to read the
+// line, which is what the message asks for.
+var ErrLineMismatch = errors.New("the fragment does not occur in the line the number of times given")
 
 // Edit states.
 const (
@@ -45,10 +50,29 @@ func hashText(text string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// EditLine replaces the text of one line, addressed by meeting and 1-based line
-// number. expected must equal the line's current text; that check is what stops
-// an agent editing a line it misread. The original text is never overwritten.
-func (s *Store) EditLine(meetingID string, lineNo int, expected, replacement, author string) (Edit, error) {
+// EditLine replaces occurrences of a fragment within one line, addressed by
+// meeting and 1-based line number.
+//
+// fragment is matched against the line as it currently reads, and must occur
+// exactly occurrences times. That count is the whole safety mechanism: naming
+// how many matches are expected is how a caller says which text it has actually
+// looked at, so a fragment that turns out to appear somewhere else in the line
+// stops the edit instead of silently changing a second place.
+//
+// Passing the whole line as the fragment with a count of one is the
+// replace-the-line case, which is what the interactive editor does.
+//
+// The original text Sana delivered is never overwritten.
+func (s *Store) EditLine(
+	meetingID string, lineNo int, fragment, replacement string, occurrences int, author string,
+) (Edit, error) {
+	if fragment == "" {
+		return Edit{}, errors.New("a fragment to replace is required")
+	}
+	if occurrences < 1 {
+		return Edit{}, errors.New("occurrences must be at least 1")
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Edit{}, err
@@ -66,12 +90,14 @@ func (s *Store) EditLine(meetingID string, lineNo int, expected, replacement, au
 	if err != nil {
 		return Edit{}, err
 	}
-	if current != expected {
+	if strings.Count(current, fragment) != occurrences {
 		return Edit{}, fmt.Errorf("%w: %s line %d", ErrLineMismatch, meetingID, lineNo)
 	}
-	if replacement == current {
+	replaced := strings.Replace(current, fragment, replacement, occurrences)
+	if replaced == current {
 		return Edit{}, errors.New("the replacement is identical to the current line")
 	}
+	replacement = replaced
 
 	now := time.Now().UnixMilli()
 	if _, err := tx.Exec(

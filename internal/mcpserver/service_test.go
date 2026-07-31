@@ -141,10 +141,57 @@ func TestEditRequiresTheCurrentText(t *testing.T) {
 		"expected_text": "something the line does not say",
 		"new_text":      "anything",
 	})
-	if !strings.Contains(text, "does not read what you expected") {
+	if !strings.Contains(text, "does not contain that text") {
 		t.Fatalf("a mismatched edit must be refused, got %q", text)
 	}
 	// And the line must be untouched.
+	after := call(t, session, "read", map[string]any{"meeting_id": "m1", "lines": []int{1, 1}})
+	if !strings.Contains(after, "Fabrik") {
+		t.Fatalf("the line should be unchanged, got %q", after)
+	}
+}
+
+func TestEditReplacesAFragmentAndCountsIt(t *testing.T) {
+	session := newTestService(t)
+
+	// A fragment, not the whole line: the rest of the line is left alone and
+	// never has to be sent.
+	text := call(t, session, "edit_line", map[string]any{
+		"meeting_id": "m1", "line": 1,
+		"expected_text": "Fabrik", "new_text": "Fabrix",
+	})
+	if !strings.Contains(text, "corrected") {
+		t.Fatalf("a single-occurrence fragment edit should apply, got %q", text)
+	}
+	after := call(t, session, "read", map[string]any{"meeting_id": "m1", "lines": []int{1, 1}})
+	if !strings.Contains(after, "Fabrix") || strings.Contains(after, "Fabrik") {
+		t.Fatalf("the fragment was not replaced: %q", after)
+	}
+	// The rest of the line survived.
+	if !strings.Contains(after, "Northwind") {
+		t.Fatalf("the rest of the line was lost: %q", after)
+	}
+}
+
+func TestEditRefusesWhenTheCountIsWrong(t *testing.T) {
+	session := newTestService(t)
+
+	// "a" occurs many times in the seeded line. Claiming one is a claim to have
+	// looked at one, and the edit must not touch the others.
+	text := call(t, session, "edit_line", map[string]any{
+		"meeting_id": "m1", "line": 1,
+		"expected_text": "a", "new_text": "X", "occurrences": 1,
+	})
+	if !strings.Contains(text, "does not contain that text") {
+		t.Fatalf("a wrong count must be refused, got %q", text)
+	}
+	// The count found is withheld on purpose: given it, the obvious next move
+	// is to retry with that number and replace text nobody has read.
+	for _, leak := range []string{" 2 ", " 3 ", " 4 ", " 5 ", "found", "actually contains"} {
+		if strings.Contains(text, leak) {
+			t.Errorf("the message leaks the real count via %q: %s", leak, text)
+		}
+	}
 	after := call(t, session, "read", map[string]any{"meeting_id": "m1", "lines": []int{1, 1}})
 	if !strings.Contains(after, "Fabrik") {
 		t.Fatalf("the line should be unchanged, got %q", after)
