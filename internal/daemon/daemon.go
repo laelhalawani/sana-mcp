@@ -10,6 +10,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -168,6 +169,19 @@ func (s *Server) SyncOnce(ctx context.Context) error {
 		s.logf("fetched %d transcripts", fetched)
 	}
 
+	// Summaries and participants are stored too, so every tool except the
+	// recording link works without a network round trip.
+	documents, err := s.fetchMetadata(ctx, client)
+	if err != nil {
+		if errors.Is(err, sana.ErrUnauthorized) {
+			return s.store.SetPhase(store.PhaseNeedsLogin)
+		}
+		return err
+	}
+	if documents > 0 {
+		s.logf("fetched %d meeting documents", documents)
+	}
+
 	status, err := s.store.Status()
 	if err != nil {
 		return err
@@ -252,6 +266,57 @@ func (s *Server) fetchTranscripts(ctx context.Context, client *sana.Client) (int
 		fetched++
 	}
 	return fetched, nil
+}
+
+// fetchMetadata stores the summary document and participants for meetings that
+// do not have them yet. A failure here never fails the cycle: the transcript is
+// the thing people need, and the document is retried next time.
+func (s *Server) fetchMetadata(ctx context.Context, client *sana.Client) (int, error) {
+	pending, err := s.store.PendingMetadata(transcriptBatch)
+	if err != nil {
+		return 0, err
+	}
+	stored := 0
+	for _, meetingID := range pending {
+		if ctx.Err() != nil {
+			return stored, nil
+		}
+		metadata, err := client.Meeting(ctx, meetingID)
+		if err != nil {
+			if errors.Is(err, sana.ErrUnauthorized) {
+				return stored, err
+			}
+			s.logf("metadata %s failed: %v", meetingID, err)
+			continue
+		}
+		participants, err := client.Participants(ctx, meetingID)
+		if err != nil {
+			if errors.Is(err, sana.ErrUnauthorized) {
+				return stored, err
+			}
+			s.logf("participants %s failed: %v", meetingID, err)
+			continue
+		}
+		summaryJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return stored, err
+		}
+		participantsJSON, err := json.Marshal(participants)
+		if err != nil {
+			return stored, err
+		}
+		words, err := s.store.WordCount(meetingID)
+		if err != nil {
+			return stored, err
+		}
+		if err := s.store.PutMetadata(
+			meetingID, string(summaryJSON), string(participantsJSON), words,
+		); err != nil {
+			return stored, err
+		}
+		stored++
+	}
+	return stored, nil
 }
 
 // linesFrom turns speaker segments into numbered transcript lines. One segment
