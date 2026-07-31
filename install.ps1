@@ -47,6 +47,11 @@ Write-Host "  Downloading $Asset..."
 # the bytes are on disk; this does the same.
 $tempTarget = "$Target.new"
 
+# Sweep up binaries displaced by earlier installs, now that whatever had them
+# open has most likely exited.
+Get-ChildItem -Path $InstallDir -Filter "$Binary.exe.old-*" -ErrorAction SilentlyContinue |
+  ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+
 $request = $null
 $response = $null
 $stream = $null
@@ -116,17 +121,45 @@ if (-not (Test-Path $tempTarget) -or (Get-Item $tempTarget).Length -eq 0) {
   return
 }
 
-# The bytes are on disk, so the swap is the only step that can still lose the
-# working install, and it is a single move.
+# Swap the new binary into place by moving the old one aside first.
+#
+# Two Windows facts make this the only reliable order. Windows PowerShell's
+# Move-Item -Force does not overwrite an existing destination, so moving onto
+# the target fails with "Cannot create a file when that file already exists".
+# And the file being replaced is usually running - an MCP client holds
+# sana-mcp.exe open for as long as it is connected - so deleting it first fails
+# too. Windows refuses to delete a running image but does allow renaming one,
+# which is what this relies on.
+#
+# The displaced file gets a unique name, so a copy still held open by a running
+# client cannot block the next install. Whatever is left is swept up above on a
+# later run, once nothing has it open.
+$oldTarget = "$Target.old-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+$movedAside = $false
+if (Test-Path $Target) {
+  try {
+    Move-Item $Target $oldTarget
+    $movedAside = $true
+  } catch {
+    Write-Host ""
+    Write-Host "  Could not replace $Binary.exe: $_" -ForegroundColor Red
+    Write-Host "  Close any attached session and re-run the installer." -ForegroundColor Yellow
+    Remove-Item $tempTarget -ErrorAction SilentlyContinue
+    return
+  }
+}
 try {
-  Move-Item $tempTarget $Target -Force
+  Move-Item $tempTarget $Target
 } catch {
   Write-Host ""
   Write-Host "  Could not replace $Binary.exe: $_" -ForegroundColor Red
-  Write-Host "  Close any attached session and re-run the installer." -ForegroundColor Yellow
+  # Put the working binary back rather than leaving nothing installed.
+  if ($movedAside) { Move-Item $oldTarget $Target -ErrorAction SilentlyContinue }
   Remove-Item $tempTarget -ErrorAction SilentlyContinue
   return
 }
+# Fails while a client still has it open, which is expected and harmless.
+if ($movedAside) { Remove-Item $oldTarget -Force -ErrorAction SilentlyContinue }
 
 # Stop the daemon again, now that the new binary is the one on disk.
 #

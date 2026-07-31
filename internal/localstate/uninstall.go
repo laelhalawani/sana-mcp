@@ -288,6 +288,15 @@ func PathLeftBehind(paths config.Paths) string {
 	return directory
 }
 
+// displacedCopies are the older binaries an install moved aside.
+func displacedCopies(binary string) []string {
+	matches, err := filepath.Glob(binary + ".old-*")
+	if err != nil {
+		return nil
+	}
+	return matches
+}
+
 // StillOnPath reports a sana-mcp that is still reachable after an uninstall.
 //
 // It is a warning, not a removal: a binary somewhere this program did not
@@ -513,6 +522,13 @@ func remove(leftover Leftover) Removal {
 	case "profile":
 		return Removal{Leftover: leftover, Err: stripProfile(leftover.Path)}
 	case "binary":
+		// The Windows installer renames the running executable aside before
+		// putting the new one in place, because a running image cannot be
+		// deleted. Those displaced copies sit next to the binary and would
+		// otherwise survive an uninstall that reported success.
+		for _, displaced := range displacedCopies(leftover.Path) {
+			os.Remove(displaced)
+		}
 		err := os.Remove(leftover.Path)
 		if err != nil && leftover.Self && runtime.GOOS == "windows" {
 			// Windows will not unlink a running image, and nothing here runs
