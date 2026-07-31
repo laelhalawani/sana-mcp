@@ -68,7 +68,16 @@ func New(baseURL string, session *Session) *Client {
 		session:     session,
 		workspaceID: workspaceID,
 		http: &http.Client{
-			Jar:     jar,
+			Jar: jar,
+			// The default transport keeps two idle connections per host, which
+			// is fewer than the daemon fetches in parallel - so half of every
+			// batch would re-dial and re-handshake. This matches the fan-out.
+			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConns:        16,
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     90 * time.Second,
+			},
 			Timeout: 60 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// Credentials must never follow a redirect off the configured
@@ -268,8 +277,7 @@ func (c *Client) ListMeetings(ctx context.Context, cursor *float64) ([]MeetingSu
 }
 
 // WalkMeetings walks pages newest-first until onPage returns false or the
-// server runs out. The daemon uses the early stop once it reaches meetings it
-// already holds.
+// server runs out.
 func (c *Client) WalkMeetings(ctx context.Context, onPage func([]MeetingSummary) bool) error {
 	var cursor *float64
 	seen := map[float64]bool{}

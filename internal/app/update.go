@@ -100,7 +100,7 @@ func (m model) menuKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if target == screenQuit {
 			return m, tea.Quit
 		}
-		m.open(target)
+		return m, m.open(target)
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	}

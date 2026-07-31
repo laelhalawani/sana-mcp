@@ -16,7 +16,7 @@ type ListOptions struct {
 	Limit  int
 	Query  string // substring match on the title
 	Sort   string // newest (default) | oldest
-	Status string // ready | downloading | processing | retrying
+	Status string // one of store.MeetingStatuses; empty means no filter
 	FromMS int64
 	ToMS   int64
 }
@@ -209,22 +209,9 @@ func (s *Store) Metadata(meetingID string) (sana.Metadata, []sana.Participant, e
 
 // PendingMetadata returns ready meetings whose metadata has not been fetched.
 func (s *Store) PendingMetadata(limit int) ([]string, error) {
-	rows, err := s.db.Query(
+	return s.meetingIDs(
 		`SELECT m.meeting_id FROM meetings m
 		   LEFT JOIN meeting_metadata d ON d.meeting_id = m.meeting_id
 		  WHERE m.status = 'ready' AND d.meeting_id IS NULL
 		  ORDER BY m.created_ms DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
 }
