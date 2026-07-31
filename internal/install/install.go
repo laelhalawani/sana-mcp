@@ -8,7 +8,6 @@ package install
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -20,9 +19,6 @@ import (
 // ServerName is the entry name written into every harness configuration.
 const ServerName = "sana-mcp"
 
-// ErrCancelled is returned when the user aborts an interactive flow.
-var ErrCancelled = errors.New("cancelled")
-
 // Harness is one detected AI client, in the shape the UI needs.
 type Harness struct {
 	ID   detectharness.ID
@@ -31,7 +27,6 @@ type Harness struct {
 	// absent so a permission error is never reported as "not installed".
 	State       detectharness.DetectionState
 	Configured  bool
-	ConfigPath  string
 	ConfigError string
 	ReloadHint  string
 }
@@ -111,7 +106,6 @@ func (i *Installer) Detect(ctx context.Context) []Harness {
 			Name:        detection.Name,
 			State:       detection.State,
 			Configured:  registered[detection.ID],
-			ConfigPath:  detection.ConfigPath,
 			ConfigError: detection.ConfigError,
 			ReloadHint:  detection.ReloadHint,
 		})

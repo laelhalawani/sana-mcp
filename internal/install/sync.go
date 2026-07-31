@@ -25,13 +25,8 @@ func syncNow(runtime *bootstrap.Runtime) {
 	}
 	defer server.Close()
 
-	for {
-		if err := server.SyncOnce(ctx); err != nil {
-			return
-		}
-		status, err := server.Status()
-		if err != nil || status.Complete() || ctx.Err() != nil {
-			return
-		}
-	}
+	// SyncUntilIdle carries the daemon's own stall guard. Looping here on
+	// "not complete" instead would spin without delay whenever the remaining
+	// transcripts cannot be fetched.
+	server.SyncUntilIdle(ctx)
 }

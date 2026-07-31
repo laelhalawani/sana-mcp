@@ -31,6 +31,8 @@ const (
 	screenConfig
 	screenEdit
 	screenHistory
+	// screenQuit is not a screen; it is the menu entry that ends the program.
+	screenQuit
 )
 
 // Run opens the interactive application.

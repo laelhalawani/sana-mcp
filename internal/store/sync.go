@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"time"
 )
@@ -59,10 +60,16 @@ func (s Status) Complete() bool {
 
 // Status reads one consistent snapshot of sync progress.
 func (s *Store) Status() (Status, error) {
-	// One transaction, so the counts below cannot disagree with each other.
-	// Begin carries context.Background(); BeginTx with a nil context blocks
-	// forever rather than failing, which is how this was first found.
-	tx, err := s.db.Begin()
+	// One transaction, so the counts below cannot disagree with each other, and
+	// explicitly read-only: the DSN sets _txlock=immediate, which makes a plain
+	// Begin take the write lock even for a pure read. Status is the most
+	// frequently called query in the program - once a second from the
+	// application, more from the installer - so it must not contend with the
+	// sync it is reporting on.
+	//
+	// BeginTx with a nil context blocks forever rather than failing, which is
+	// how that was first found; context.Background() is explicit here.
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return Status{}, err
 	}

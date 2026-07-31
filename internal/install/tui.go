@@ -3,26 +3,16 @@ package install
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
 	"github.com/laelhalawani/sana-mcp/internal/cli"
+	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 	detectharness "github.com/sairaph/detect-harness"
-)
-
-var (
-	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
-	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	styleCursor = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
-	styleOn     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	styleError  = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	styleHint   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 // step is one screen of the installer.
@@ -53,8 +43,7 @@ type model struct {
 	selected  map[detectharness.ID]bool
 	cursor    int
 
-	results     []detectharness.Result
-	reloadHints []string
+	results []detectharness.Result
 
 	signedIn bool
 	email    string
@@ -98,7 +87,10 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tickMsg:
 		m.frame++
-		if m.step == stepSyncing {
+		// The spinner wants 120 ms; the progress numbers change at most once a
+		// second. Polling on every frame reopened the database eight times a
+		// second for the same answer.
+		if m.step == stepSyncing && m.frame%8 == 0 {
 			return m, tea.Batch(tick(), m.readStatus())
 		}
 		return m, tick()
@@ -119,13 +111,6 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case appliedMsg:
 		m.results = msg
-		for _, result := range msg {
-			for _, harness := range m.harnesses {
-				if harness.ID == result.HarnessID && result.State == detectharness.Applied && harness.ReloadHint != "" {
-					m.reloadHints = append(m.reloadHints, harness.ReloadHint)
-				}
-			}
-		}
 		if m.signedIn {
 			m.step = stepSyncing
 			return m, tea.Batch(m.startSync(), m.readStatus())
@@ -286,7 +271,7 @@ func (m model) apply() tea.Cmd {
 
 func (m model) requestCode(email string) tea.Cmd {
 	return func() tea.Msg {
-		client := sana.New(os.Getenv("SANA_BASE_URL"), nil)
+		client := sana.New("", nil)
 		pending, err := client.RequestSignInCode(m.ctx, email)
 		return signInRequestedMsg{pending: pending, err: err}
 	}
@@ -296,7 +281,7 @@ func (m model) submitCode(code string) tea.Cmd {
 	pending := m.pending
 	paths := m.runtime.Paths
 	return func() tea.Msg {
-		client := sana.New(os.Getenv("SANA_BASE_URL"), nil)
+		client := sana.New("", nil)
 		user, err := client.SubmitSignInCode(m.ctx, pending, code)
 		if err != nil {
 			return signedInMsg{err: err}
@@ -336,7 +321,7 @@ func (m model) readStatus() tea.Cmd {
 
 func (m model) View() string {
 	var out strings.Builder
-	out.WriteString(styleTitle.Render("sana-mcp setup") + "\n\n")
+	out.WriteString(render.Title.Render("sana-mcp setup") + "\n\n")
 
 	switch m.step {
 	case stepDetecting:
@@ -356,20 +341,20 @@ func (m model) View() string {
 				// user knows it was considered, but reads as "not detected":
 				// they want to know whether it is there, not why the library
 				// could not reach it.
-				out.WriteString(styleDim.Render(
+				out.WriteString(render.Dim.Render(
 					fmt.Sprintf("    ( ) %s%s", name, harness.StatusText())) + "\n")
 				continue
 			case m.selected[harness.ID]:
-				box = styleOn.Render("(x)")
+				box = render.On.Render("(x)")
 			}
 			if index == m.cursor {
-				pointer = styleCursor.Render(">")
-				name = styleCursor.Render(name)
+				pointer = render.Cursor.Render(">")
+				name = render.Cursor.Render(name)
 			}
 			fmt.Fprintf(&out, "  %s %s %s%s\n",
-				pointer, box, name, styleDim.Render(harness.StatusText()))
+				pointer, box, name, render.Dim.Render(harness.StatusText()))
 		}
-		out.WriteString("\n" + styleDim.Render(
+		out.WriteString("\n" + render.Dim.Render(
 			"  up/down move  space toggle  a all  enter confirm  esc cancel") + "\n")
 
 	case stepApplying:
@@ -377,28 +362,28 @@ func (m model) View() string {
 
 	case stepSignInAsk:
 		out.WriteString("  Sign in to Sana now? [Y/n]\n")
-		out.WriteString(styleDim.Render("  You can also sign in later with: sana-mcp login") + "\n")
+		out.WriteString(render.Dim.Render("  You can also sign in later with: sana-mcp login") + "\n")
 
 	case stepSignInEmail:
 		if m.failure != "" {
-			out.WriteString("  " + styleError.Render(m.failure) + "\n\n")
+			out.WriteString("  " + render.Failed.Render(m.failure) + "\n\n")
 		}
 		fmt.Fprintf(&out, "  Email: %s\n", m.input)
-		out.WriteString(styleDim.Render("  enter to send a sign-in code, esc to skip") + "\n")
+		out.WriteString(render.Dim.Render("  enter to send a sign-in code, esc to skip") + "\n")
 
 	case stepSignInCode:
 		if m.failure != "" {
-			out.WriteString("  " + styleError.Render(m.failure) + "\n\n")
+			out.WriteString("  " + render.Failed.Render(m.failure) + "\n\n")
 		}
 		fmt.Fprintf(&out, "  A code was emailed to %s\n\n", m.email)
 		fmt.Fprintf(&out, "  Code: %s\n", m.input)
-		out.WriteString(styleDim.Render("  enter to confirm, esc to skip") + "\n")
+		out.WriteString(render.Dim.Render("  enter to confirm, esc to skip") + "\n")
 
 	case stepSyncing:
 		fmt.Fprintf(&out, "  %s %s\n\n", m.spinner(), m.status.Label())
-		out.WriteString("  " + progressBar(m.status.TranscriptsDone, m.status.TranscriptsTotal, 28) + "\n")
+		out.WriteString("  " + render.ProgressBar(m.status.TranscriptsDone, m.status.TranscriptsTotal, 28) + "\n")
 		fmt.Fprintf(&out, "  %d/%d transcripts\n", m.status.TranscriptsDone, m.status.TranscriptsTotal)
-		out.WriteString("\n" + styleDim.Render("  enter to leave it running in the background") + "\n")
+		out.WriteString("\n" + render.Dim.Render("  enter to leave it running in the background") + "\n")
 
 	case stepDone:
 		out.WriteString(m.summary())
@@ -422,55 +407,51 @@ func (m model) summary() string {
 	if m.signedIn {
 		fmt.Fprintf(&out, "  Sana account  signed in as %s\n", m.email)
 	} else {
-		out.WriteString("  Sana account  " + styleHint.Render("not signed in") + "\n")
+		out.WriteString("  Sana account  " + render.Warn.Render("not signed in") + "\n")
 	}
 	switch {
 	case m.status.Complete():
-		out.WriteString("  Meeting sync  " + styleOn.Render("complete") + "\n")
+		out.WriteString("  Meeting sync  " + render.On.Render("complete") + "\n")
 	case m.signedIn:
 		out.WriteString("  Meeting sync  continuing in the background\n")
 	default:
 		out.WriteString("  Meeting sync  waiting for sign-in\n")
 	}
 	for _, failure := range failures {
-		out.WriteString("  " + styleError.Render(failure) + "\n")
+		out.WriteString("  " + render.Failed.Render(failure) + "\n")
 	}
-	if len(m.reloadHints) > 0 {
-		fmt.Fprintf(&out, "  Reload        %s\n", strings.Join(dedupe(m.reloadHints), "; "))
+	if hints := m.reloadHints(); len(hints) > 0 {
+		fmt.Fprintf(&out, "  Reload        %s\n", strings.Join(hints, "; "))
 	}
 	if !m.signedIn {
-		out.WriteString("\n  Next: " + styleTitle.Render("sana-mcp login") + "\n")
+		out.WriteString("\n  Next: " + render.Title.Render("sana-mcp login") + "\n")
 		return out.String()
 	}
-	out.WriteString("\n  Next: " + styleTitle.Render("sana-mcp") + "\n")
+	out.WriteString("\n  Next: " + render.Title.Render("sana-mcp") + "\n")
 	return out.String()
 }
 
-func progressBar(done, total, width int) string {
-	if total <= 0 {
-		return strings.Repeat("-", width)
+// reloadHints derives the reload advice from what was actually applied, rather
+// than accumulating it as state that has to be kept in step.
+func (m model) reloadHints() []string {
+	byID := make(map[detectharness.ID]string, len(m.harnesses))
+	for _, harness := range m.harnesses {
+		byID[harness.ID] = harness.ReloadHint
 	}
-	filled := done * width / total
-	if filled > width {
-		filled = width
-	}
-	if filled < 0 {
-		filled = 0
-	}
-	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
-}
-
-func dedupe(values []string) []string {
+	var hints []string
 	seen := map[string]bool{}
-	var unique []string
-	for _, value := range values {
-		if seen[value] {
+	for _, result := range m.results {
+		if result.Desired != detectharness.Present || result.State != detectharness.Applied {
 			continue
 		}
-		seen[value] = true
-		unique = append(unique, value)
+		hint := byID[result.HarnessID]
+		if hint == "" || seen[hint] {
+			continue
+		}
+		seen[hint] = true
+		hints = append(hints, hint)
 	}
-	return unique
+	return hints
 }
 
 // Run executes configure, install, or uninstall.
@@ -490,7 +471,7 @@ func Run(ctx context.Context, runtime *bootstrap.Runtime, command cli.Command, o
 		ctx:       ctx,
 		runtime:   runtime,
 		installer: installer,
-		signedIn:  session != nil && session.Cookies[sana.SessionCookie] != "",
+		signedIn:  session.SignedIn(),
 	}
 	if initial.signedIn {
 		initial.email = session.Email

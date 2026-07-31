@@ -229,3 +229,58 @@ func TestRelistingPreservesWordCountAndTranscript(t *testing.T) {
 		t.Fatalf("transcript state was downgraded to %q on a re-list", after.TranscriptState)
 	}
 }
+
+// A database written before the rowid alignment has arbitrary line_search
+// rowids. Updating those by rowid would rewrite a different line's index entry,
+// so the migration must rebuild the index - and must not touch corrections.
+func TestMigrationRebuildsMisalignedSearchIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sana.db")
+
+	// Build a v1-shaped database: index rows inserted with their own rowids,
+	// deliberately offset from the transcript rowids.
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	seed(t, first)
+	if _, err := first.db.Exec(`DELETE FROM line_search`); err != nil {
+		t.Fatalf("clear index: %v", err)
+	}
+	if _, err := first.db.Exec(
+		`INSERT INTO line_search (rowid, meeting_id, line_no, text, original_text)
+		 SELECT rowid + 1000, meeting_id, line_no, text, original_text FROM transcript_lines`,
+	); err != nil {
+		t.Fatalf("misalign index: %v", err)
+	}
+	if _, err := first.db.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatalf("set v1: %v", err)
+	}
+	first.Close()
+
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer migrated.Close()
+
+	// Editing must now change the right line's index entry.
+	original := "do zestawienia miedzy Fabrik, a Northwind, a Lumen"
+	if _, err := migrated.EditLine("m1", 1, original, "corrected Fabrix line", AuthorUser); err != nil {
+		t.Fatalf("edit after migration: %v", err)
+	}
+	hits, err := migrated.Search("Fabrix", 10, 0, SortBest)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 || hits[0].LineNo != 1 {
+		t.Fatalf("the correction should be searchable on line 1, got %+v", hits)
+	}
+	// The other line must be untouched by the rebuild.
+	other, err := migrated.Search("crawler", 10, 0, SortBest)
+	if err != nil {
+		t.Fatalf("search other: %v", err)
+	}
+	if len(other) != 1 || other[0].LineNo != 2 {
+		t.Fatalf("line 2 should still be indexed, got %+v", other)
+	}
+}

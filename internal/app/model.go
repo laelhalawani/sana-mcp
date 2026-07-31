@@ -2,35 +2,27 @@ package app
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
+	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
 
-var (
-	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
-	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	styleCursor = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
-	styleOn     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	styleError  = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	styleWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-)
-
-var menuItems = []string{
-	"Meetings",
-	"Search transcripts",
-	"Sync status",
-	"Sana account",
-	"Configuration",
-	"Quit",
+// menuItems pairs each label with the screen it opens, so the two cannot drift
+// out of step the way a label list and an index switch did.
+var menuItems = []struct {
+	label  string
+	target screen
+}{
+	{"Meetings", screenMeetings},
+	{"Search transcripts", screenSearch},
+	{"Sync status", screenStatus},
+	{"Sana account", screenAccount},
+	{"Configuration", screenConfig},
+	{"Quit", screenQuit},
 }
 
 type model struct {
@@ -150,26 +142,16 @@ func (m *model) loadHistory() {
 }
 
 func (m *model) loadDetail(kind screen) {
-	summaryJSON, participantsJSON, err := m.store.Metadata(m.current.MeetingID)
+	metadata, participants, err := m.store.Metadata(m.current.MeetingID)
 	if err != nil {
 		m.detail = "Nothing stored for this meeting yet. It arrives with the next sync."
 		return
 	}
 	switch kind {
 	case screenSummary:
-		var metadata sana.Metadata
-		if err := json.Unmarshal([]byte(summaryJSON), &metadata); err != nil {
-			m.detail = err.Error()
-			return
-		}
-		m.detail = renderSummary(metadata)
+		m.detail = render.Summary(metadata, m.styles())
 	case screenParticipants:
-		var participants []sana.Participant
-		if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
-			m.detail = err.Error()
-			return
-		}
-		m.detail = renderParticipants(participants)
+		m.detail = render.Participants(participants, m.styles())
 	}
 }
 
@@ -178,22 +160,21 @@ func (m model) loadRecording() tea.Cmd {
 	meetingID := m.current.MeetingID
 	session := m.session
 	return func() tea.Msg {
-		if session == nil || session.Cookies[sana.SessionCookie] == "" {
+		if !session.SignedIn() {
 			return detailMsg("Sign in first: sana-mcp login")
 		}
-		client := sana.New(os.Getenv("SANA_BASE_URL"), session)
+		client := sana.New("", session)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		metadata, err := client.Meeting(ctx, meetingID)
 		if err != nil {
 			return detailMsg("Could not fetch the recording link: " + err.Error())
 		}
-		for _, candidate := range []*string{metadata.RecordingURL, metadata.FallbackRecordingURL} {
-			if candidate != nil && *candidate != "" {
-				return detailMsg(*candidate + "\n\nThis link expires after a few hours.")
-			}
+		link := metadata.Recording()
+		if link == "" {
+			return detailMsg("This meeting has no recording.")
 		}
-		return detailMsg("This meeting has no recording.")
+		return detailMsg(link + "\n\nThis link expires after a few hours.")
 	}
 }
 
@@ -226,72 +207,11 @@ func (m model) pageSize() int {
 	return size
 }
 
-func renderSummary(metadata sana.Metadata) string {
-	var out strings.Builder
-	if metadata.Summary != nil && strings.TrimSpace(*metadata.Summary) != "" {
-		out.WriteString(strings.TrimSpace(*metadata.Summary) + "\n\n")
+// styles gives the shared renderer this application's colours.
+func (m model) styles() render.Styles {
+	return render.Styles{
+		Heading: func(text string) string { return render.Title.Render(text) },
+		Dim:     func(text string) string { return render.Dim.Render(text) },
+		Accent:  func(text string) string { return render.On.Render(text) },
 	}
-	for _, group := range metadata.Notes {
-		out.WriteString(styleTitle.Render(group.Topic) + "\n")
-		for _, note := range group.Notes {
-			out.WriteString("  - " + note + "\n")
-		}
-		out.WriteString("\n")
-	}
-	if len(metadata.ActionItems) > 0 {
-		out.WriteString(styleTitle.Render("Action items") + "\n")
-		for _, item := range metadata.ActionItems {
-			assignee := ""
-			if item.AssignedTo != nil && *item.AssignedTo != "" {
-				assignee = *item.AssignedTo + ": "
-			}
-			due := ""
-			if item.DueDate != nil && *item.DueDate != "" {
-				due = " (due " + *item.DueDate + ")"
-			}
-			fmt.Fprintf(&out, "  - %s%s%s\n", assignee, item.Action, due)
-		}
-	}
-	if out.Len() == 0 {
-		return "This meeting has no summary yet."
-	}
-	return out.String()
-}
-
-func renderParticipants(participants []sana.Participant) string {
-	if len(participants) == 0 {
-		return "No participants are recorded for this meeting."
-	}
-	var out strings.Builder
-	for _, participant := range participants {
-		email := ""
-		if participant.Email != nil && *participant.Email != "" {
-			email = "  " + styleDim.Render(*participant.Email)
-		}
-		host := ""
-		if participant.IsHost {
-			host = "  " + styleOn.Render("(host)")
-		}
-		fmt.Fprintf(&out, "%s%s%s\n", participant.DisplayName, email, host)
-	}
-	return out.String()
-}
-
-func clock(ms int64) string {
-	seconds := ms / 1000
-	return fmt.Sprintf("%d:%02d", seconds/60, seconds%60)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

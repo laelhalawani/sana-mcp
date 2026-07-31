@@ -2,9 +2,12 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/laelhalawani/sana-mcp/internal/sana"
 )
 
 // ListOptions filters and pages the meeting list.
@@ -18,14 +21,24 @@ type ListOptions struct {
 	ToMS   int64
 }
 
+// DefaultPageSize is how many meetings a page holds when the caller does not say.
+const DefaultPageSize = 25
+
+// Normalize fills in the paging defaults and reports them back, so a caller
+// rendering "page X of Y" uses the same numbers the query did rather than
+// restating the rules.
+func (o *ListOptions) Normalize() {
+	if o.Page < 1 {
+		o.Page = 1
+	}
+	if o.Limit < 1 {
+		o.Limit = DefaultPageSize
+	}
+}
+
 // ListMeetings returns one page of meetings and the total matching count.
 func (s *Store) ListMeetings(options ListOptions) ([]Meeting, int, error) {
-	if options.Page < 1 {
-		options.Page = 1
-	}
-	if options.Limit < 1 {
-		options.Limit = 25
-	}
+	options.Normalize()
 	where := []string{"1 = 1"}
 	var args []any
 	if options.Query != "" {
@@ -139,47 +152,59 @@ func (s *Store) LineCount(meetingID string) (int, error) {
 	return count, err
 }
 
-// PutMetadata stores a meeting's summary document and participants as the JSON
-// the API returned. Storing the raw documents keeps sync simple and means a new
-// field Sana adds is not lost before this program learns to render it.
-func (s *Store) PutMetadata(meetingID, summaryJSON, participantsJSON string, wordCount int) error {
-	_, err := s.db.Exec(
+// PutMetadata stores a meeting's summary document and participants.
+//
+// They are persisted as the JSON Sana returned, so a field Sana adds is not
+// lost before this program learns to render it - but that is a fact about the
+// column, not something a caller should handle. Marshalling happens here so
+// three surfaces do not each unmarshal and each fail differently on an empty
+// document.
+func (s *Store) PutMetadata(meetingID string, metadata sana.Metadata, participants []sana.Participant) error {
+	summaryJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	participantsJSON, err := json.Marshal(participants)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
 		`INSERT INTO meeting_metadata (meeting_id, summary_json, participants_json)
 		 VALUES (?, ?, ?)
 		 ON CONFLICT(meeting_id) DO UPDATE SET
 		   summary_json = excluded.summary_json,
 		   participants_json = excluded.participants_json`,
-		meetingID, summaryJSON, participantsJSON,
+		meetingID, string(summaryJSON), string(participantsJSON),
 	)
-	if err != nil {
-		return err
-	}
-	if wordCount > 0 {
-		_, err = s.db.Exec(
-			`UPDATE meetings SET word_count = ? WHERE meeting_id = ?`, wordCount, meetingID)
-	}
 	return err
 }
 
-// Metadata returns the stored summary and participant documents.
-func (s *Store) Metadata(meetingID string) (summaryJSON, participantsJSON string, err error) {
-	err = s.db.QueryRow(
+// Metadata returns a meeting's stored summary document and participants.
+func (s *Store) Metadata(meetingID string) (sana.Metadata, []sana.Participant, error) {
+	var summaryJSON, participantsJSON string
+	err := s.db.QueryRow(
 		`SELECT COALESCE(summary_json, ''), COALESCE(participants_json, '')
 		   FROM meeting_metadata WHERE meeting_id = ?`, meetingID,
 	).Scan(&summaryJSON, &participantsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", fmt.Errorf("%w: metadata for %s", ErrNotFound, meetingID)
+		return sana.Metadata{}, nil, fmt.Errorf("%w: metadata for %s", ErrNotFound, meetingID)
 	}
-	return summaryJSON, participantsJSON, err
-}
-
-// NeedsMetadata reports whether a meeting's summary document is still missing.
-func (s *Store) NeedsMetadata(meetingID string) (bool, error) {
-	var count int
-	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM meeting_metadata WHERE meeting_id = ?`, meetingID,
-	).Scan(&count)
-	return count == 0, err
+	if err != nil {
+		return sana.Metadata{}, nil, err
+	}
+	var metadata sana.Metadata
+	if summaryJSON != "" {
+		if err := json.Unmarshal([]byte(summaryJSON), &metadata); err != nil {
+			return sana.Metadata{}, nil, fmt.Errorf("stored summary for %s: %w", meetingID, err)
+		}
+	}
+	var participants []sana.Participant
+	if participantsJSON != "" {
+		if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
+			return sana.Metadata{}, nil, fmt.Errorf("stored participants for %s: %w", meetingID, err)
+		}
+	}
+	return metadata, participants, nil
 }
 
 // PendingMetadata returns ready meetings whose metadata has not been fetched.
@@ -202,19 +227,4 @@ func (s *Store) PendingMetadata(limit int) ([]string, error) {
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
-}
-
-// WordCount counts the words across a meeting's stored transcript. It is what
-// the meeting list reports, so it follows corrections: an edited line counts as
-// it now reads.
-func (s *Store) WordCount(meetingID string) (int, error) {
-	lines, err := s.Lines(meetingID, 0, 0)
-	if err != nil {
-		return 0, err
-	}
-	words := 0
-	for _, line := range lines {
-		words += len(strings.Fields(line.Text))
-	}
-	return words, nil
 }

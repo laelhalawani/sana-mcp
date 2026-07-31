@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/laelhalawani/sana-mcp/internal/fsx"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
@@ -19,7 +20,7 @@ import (
 // expected_text must equal the line as it currently reads. That is not
 // ceremony: it is what stops a model editing a line it misread, or one whose
 // number shifted since it last looked.
-func handleEditLine(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleEditLine(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID    string `json:"meeting_id"`
 		Line         int    `json:"line"`
@@ -41,12 +42,6 @@ func handleEditLine(_ context.Context, service *Service, raw json.RawMessage) (s
 		return "", errors.New("new_text is required; to undo a correction use restore_line")
 	}
 
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
 	edit, err := database.EditLine(
 		args.MeetingID, args.Line, args.ExpectedText, args.NewText, store.AuthorAgent)
 	if err != nil {
@@ -64,7 +59,7 @@ func handleEditLine(_ context.Context, service *Service, raw json.RawMessage) (s
 		edit.LineNo, edit.OriginalText, edit.EditedText, edit.LineNo), nil
 }
 
-func handleLineHistory(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleLineHistory(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID string `json:"meeting_id"`
 		Line      int    `json:"line"`
@@ -75,12 +70,6 @@ func handleLineHistory(_ context.Context, service *Service, raw json.RawMessage)
 	if args.MeetingID == "" {
 		return "", errors.New("meeting_id is required")
 	}
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
 	edits, err := database.LineHistory(args.MeetingID, args.Line)
 	if err != nil {
 		return "", err
@@ -105,7 +94,7 @@ func handleLineHistory(_ context.Context, service *Service, raw json.RawMessage)
 	return out.String(), nil
 }
 
-func handleRestoreLine(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleRestoreLine(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID string `json:"meeting_id"`
 		Line      int    `json:"line"`
@@ -116,12 +105,6 @@ func handleRestoreLine(_ context.Context, service *Service, raw json.RawMessage)
 	if args.MeetingID == "" || args.Line < 1 {
 		return "", errors.New("meeting_id and a 1-based line are required")
 	}
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
 	if err := database.RestoreLine(args.MeetingID, args.Line); err != nil {
 		return "", notFoundHint(err, args.MeetingID)
 	}
@@ -142,14 +125,11 @@ func handleRestoreLine(_ context.Context, service *Service, raw json.RawMessage)
 func pendingPath(root string) string { return filepath.Join(root, "pending-login.json") }
 
 func savePending(root string, pending sana.PendingSignIn) error {
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return err
-	}
 	payload, err := json.Marshal(pending)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(pendingPath(root), payload, 0o600)
+	return fsx.WriteAtomic(pendingPath(root), payload, 0o600)
 }
 
 func loadPending(root string) (sana.PendingSignIn, error) {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/laelhalawani/sana-mcp/internal/fsx"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -94,21 +95,10 @@ func Load(paths Paths) (Config, error) {
 // Save writes the settings atomically, so an interrupted write cannot leave a
 // half-written file that then fails to parse.
 func Save(paths Paths, settings Config) error {
-	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
-		return err
-	}
 	settings.Version = currentVersion
 	payload, err := toml.Marshal(settings)
 	if err != nil {
 		return err
 	}
-	temporary := File(paths) + ".new"
-	if err := os.WriteFile(temporary, payload, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, File(paths)); err != nil {
-		os.Remove(temporary)
-		return err
-	}
-	return nil
+	return fsx.WriteAtomic(File(paths), payload, 0o600)
 }

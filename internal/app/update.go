@@ -71,27 +71,48 @@ func (m model) menuKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.menuCursor = (m.menuCursor + 1) % len(menuItems)
 	case "enter":
-		switch m.menuCursor {
-		case 0:
-			m.screen = screenMeetings
-			m.loadMeetings()
-		case 1:
-			m.screen = screenSearch
-			m.searchTyped = true
-			m.queryInput = ""
-		case 2:
-			m.screen = screenStatus
-		case 3:
-			m.screen = screenAccount
-		case 4:
-			m.screen = screenConfig
-		case 5:
+		target := menuItems[m.menuCursor].target
+		if target == screenQuit {
 			return m, tea.Quit
 		}
+		m.open(target)
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+// open switches to a screen and loads whatever it needs. Every entry point -
+// the menu, the meetings list, the detail views - goes through here so the
+// "set screen then call its loader" pairing exists once.
+func (m *model) open(target screen) tea.Cmd {
+	m.screen = target
+	switch target {
+	case screenMeetings:
+		m.loadMeetings()
+	case screenTranscript:
+		m.loadLines()
+	case screenSummary, screenParticipants:
+		m.loadDetail(target)
+	case screenSearch:
+		m.searchTyped = true
+		m.queryInput = ""
+	case screenHistory:
+		m.loadHistory()
+	case screenRecording:
+		m.detail = "Fetching the recording link..."
+		return m.loadRecording()
+	}
+	return nil
+}
+
+// meetingViews maps the per-meeting keys shared by the meetings list, the
+// transcript, and the detail screens.
+var meetingViews = map[string]screen{
+	"t": screenTranscript,
+	"s": screenSummary,
+	"p": screenParticipants,
+	"o": screenRecording,
 }
 
 func (m model) meetingsKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -141,36 +162,23 @@ func (m model) meetingsKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterInput = m.nameFilter
 	case "f":
 		// Cycle the status filter rather than opening another prompt: there are
-		// only five states and cycling is one key.
-		states := []string{"", "ready", "processing", "downloading", "retrying"}
-		for index, state := range states {
+		// only a few states and cycling is one key. The list comes from the
+		// store so the filter cannot offer a status nothing ever writes.
+		for index, state := range store.MeetingStatuses {
 			if state == m.statusFilter {
-				m.statusFilter = states[(index+1)%len(states)]
+				m.statusFilter = store.MeetingStatuses[(index+1)%len(store.MeetingStatuses)]
 				break
 			}
 		}
 		m.meetingPage = 1
 		m.loadMeetings()
-	case "t", "enter":
-		if m.selectMeeting() {
-			m.screen = screenTranscript
-			m.loadLines()
+	case "t", "enter", "s", "p", "o":
+		name := key.String()
+		if name == "enter" {
+			name = "t"
 		}
-	case "s":
 		if m.selectMeeting() {
-			m.screen = screenSummary
-			m.loadDetail(screenSummary)
-		}
-	case "p":
-		if m.selectMeeting() {
-			m.screen = screenParticipants
-			m.loadDetail(screenParticipants)
-		}
-	case "o":
-		if m.selectMeeting() {
-			m.screen = screenRecording
-			m.detail = "Fetching the recording link..."
-			return m, m.loadRecording()
+			return m, m.open(meetingViews[name])
 		}
 	case "esc":
 		m.screen = screenMenu
@@ -219,18 +227,9 @@ func (m model) transcriptKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen = screenEdit
 		}
 	case "h":
-		m.screen = screenHistory
-		m.loadHistory()
-	case "s":
-		m.screen = screenSummary
-		m.loadDetail(screenSummary)
-	case "p":
-		m.screen = screenParticipants
-		m.loadDetail(screenParticipants)
-	case "o":
-		m.screen = screenRecording
-		m.detail = "Fetching the recording link..."
-		return m, m.loadRecording()
+		return m, m.open(screenHistory)
+	case "s", "p", "o":
+		return m, m.open(meetingViews[key.String()])
 	case "esc":
 		m.screen = screenMeetings
 		m.message = ""
@@ -242,19 +241,8 @@ func (m model) transcriptKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) detailKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
-	case "t":
-		m.screen = screenTranscript
-		m.loadLines()
-	case "s":
-		m.screen = screenSummary
-		m.loadDetail(screenSummary)
-	case "p":
-		m.screen = screenParticipants
-		m.loadDetail(screenParticipants)
-	case "o":
-		m.screen = screenRecording
-		m.detail = "Fetching the recording link..."
-		return m, m.loadRecording()
+	case "t", "s", "p", "o":
+		return m, m.open(meetingViews[key.String()])
 	case "esc":
 		m.screen = screenMeetings
 	case "q", "ctrl+c":

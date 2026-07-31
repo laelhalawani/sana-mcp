@@ -32,7 +32,7 @@ func TestLiveAgainstStoredSession(t *testing.T) {
 	}
 
 	client := New(os.Getenv("SANA_BASE_URL"), &session)
-	if !client.HasCookie() {
+	if !session.SignedIn() {
 		t.Skip("stored session carries no cookie")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

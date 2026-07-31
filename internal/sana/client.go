@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -45,6 +46,12 @@ type Client struct {
 // New builds a client for a session. A nil session is allowed: sign-in starts
 // without one.
 func New(baseURL string, session *Session) *Client {
+	// The override is read here rather than at each call site: it is this
+	// package's variable, and eight callers spelling out os.Getenv meant every
+	// one of them had to remember it.
+	if baseURL == "" {
+		baseURL = os.Getenv("SANA_BASE_URL")
+	}
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
@@ -119,11 +126,6 @@ type Session struct {
 	UserID      string            `json:"userId"`
 	WorkspaceID string            `json:"workspaceId"`
 	Email       string            `json:"email"`
-}
-
-// HasCookie reports whether a session cookie is present.
-func (c *Client) HasCookie() bool {
-	return c.session != nil && c.session.Cookies[SessionCookie] != ""
 }
 
 func (c *Client) request(ctx context.Context, method, endpoint string, body io.Reader) (*http.Request, error) {
@@ -336,6 +338,18 @@ type Metadata struct {
 	ActionItems          []ActionItem `json:"actionItems"`
 	RecordingURL         *string      `json:"recordingUrl"`
 	FallbackRecordingURL *string      `json:"fallbackRecordingUrl"`
+}
+
+// Recording returns the usable recording link, preferring the primary over the
+// fallback, or "" when the meeting has none. Which of the two fields wins is
+// Sana's rule, so it lives here rather than in each surface.
+func (m Metadata) Recording() string {
+	for _, candidate := range []*string{m.RecordingURL, m.FallbackRecordingURL} {
+		if candidate != nil && *candidate != "" {
+			return *candidate
+		}
+	}
+	return ""
 }
 
 // Meeting returns a meeting's metadata.

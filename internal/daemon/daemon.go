@@ -10,7 +10,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -163,26 +162,57 @@ func backfilling(before, after store.Status) bool {
 	return after.TranscriptsDone > before.TranscriptsDone
 }
 
+// SyncUntilIdle runs cycles until there is nothing left to fetch, no progress
+// is being made, or the context ends.
+//
+// The installer needs this to show real progress while it waits. It exists here
+// rather than in the installer so that the backfilling guard - the thing that
+// keeps a stalled sync from becoming a hot loop against the API - is applied by
+// whoever drives a sync, not reimplemented per caller.
+func (s *Server) SyncUntilIdle(ctx context.Context) error {
+	for {
+		before, _ := s.store.Status()
+		if err := s.SyncOnce(ctx); err != nil {
+			return err
+		}
+		after, err := s.store.Status()
+		if err != nil {
+			return err
+		}
+		if !backfilling(before, after) || ctx.Err() != nil {
+			return nil
+		}
+	}
+}
+
 // SyncOnce runs one full cycle: discover meetings, then fetch the transcripts
 // that are still missing.
+//
+// An expired session is translated here, once, rather than after each step:
+// every step can raise it, and a fourth step added later cannot forget to.
 func (s *Server) SyncOnce(ctx context.Context) error {
+	err := s.syncCycle(ctx)
+	if errors.Is(err, sana.ErrUnauthorized) {
+		return s.store.SetPhase(store.PhaseNeedsLogin)
+	}
+	return err
+}
+
+func (s *Server) syncCycle(ctx context.Context) error {
 	session, err := sana.LoadSession(s.runtime.Paths.Session)
 	if err != nil {
 		return fmt.Errorf("read session: %w", err)
 	}
-	if session == nil || session.Cookies[sana.SessionCookie] == "" {
+	if !session.SignedIn() {
 		return s.store.SetPhase(store.PhaseNeedsLogin)
 	}
-	client := sana.New(os.Getenv("SANA_BASE_URL"), session)
+	client := sana.New("", session)
 
 	if err := s.store.SetPhase(store.PhaseListing); err != nil {
 		return err
 	}
 	discovered, err := s.discover(ctx, client)
 	if err != nil {
-		if errors.Is(err, sana.ErrUnauthorized) {
-			return s.store.SetPhase(store.PhaseNeedsLogin)
-		}
 		return err
 	}
 	s.logf("listed %d meetings", discovered)
@@ -192,9 +222,6 @@ func (s *Server) SyncOnce(ctx context.Context) error {
 	}
 	fetched, err := s.fetchTranscripts(ctx, client)
 	if err != nil {
-		if errors.Is(err, sana.ErrUnauthorized) {
-			return s.store.SetPhase(store.PhaseNeedsLogin)
-		}
 		return err
 	}
 	if fetched > 0 {
@@ -205,9 +232,6 @@ func (s *Server) SyncOnce(ctx context.Context) error {
 	// recording link works without a network round trip.
 	documents, err := s.fetchMetadata(ctx, client)
 	if err != nil {
-		if errors.Is(err, sana.ErrUnauthorized) {
-			return s.store.SetPhase(store.PhaseNeedsLogin)
-		}
 		return err
 	}
 	if documents > 0 {
@@ -231,19 +255,20 @@ func (s *Server) discover(ctx context.Context, client *sana.Client) (int, error)
 	count := 0
 	var walkErr error
 	err := client.WalkMeetings(ctx, func(page []sana.MeetingSummary) bool {
+		meetings := make([]store.Meeting, 0, len(page))
 		for _, summary := range page {
-			meeting := store.Meeting{
+			meetings = append(meetings, store.Meeting{
 				MeetingID: summary.ID,
 				Title:     summary.Name,
 				CreatedMS: int64(summary.CreatedAtMS),
 				Status:    meetingStatus(summary),
-			}
-			if err := s.store.PutMeeting(meeting); err != nil {
-				walkErr = err
-				return false
-			}
-			count++
+			})
 		}
+		if err := s.store.PutMeetings(meetings); err != nil {
+			walkErr = err
+			return false
+		}
+		count += len(meetings)
 		return ctx.Err() == nil
 	})
 	if walkErr != nil {
@@ -262,11 +287,11 @@ func meetingStatus(summary sana.MeetingSummary) string {
 	}
 	switch phase {
 	case "done", "completed", "complete", "ready", "":
-		return "ready"
+		return store.StatusReady
 	case "failed", "error":
-		return "retrying"
+		return store.StatusRetrying
 	default:
-		return "processing"
+		return store.StatusProcessing
 	}
 }
 
@@ -329,21 +354,10 @@ func (s *Server) fetchMetadata(ctx context.Context, client *sana.Client) (int, e
 			s.logf("participants %s failed: %v", meetingID, err)
 			continue
 		}
-		summaryJSON, err := json.Marshal(metadata)
-		if err != nil {
-			return stored, err
-		}
-		participantsJSON, err := json.Marshal(participants)
-		if err != nil {
-			return stored, err
-		}
-		words, err := s.store.WordCount(meetingID)
-		if err != nil {
-			return stored, err
-		}
-		if err := s.store.PutMetadata(
-			meetingID, string(summaryJSON), string(participantsJSON), words,
-		); err != nil {
+		// The word count is not recomputed here: PutTranscript already stored
+		// it from the same lines, and reloading the whole transcript to arrive
+		// at the same number cost a full read per meeting.
+		if err := s.store.PutMetadata(meetingID, metadata, participants); err != nil {
 			return stored, err
 		}
 		stored++
