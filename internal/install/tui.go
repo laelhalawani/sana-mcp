@@ -161,13 +161,9 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case stepHarnesses:
 		switch key.String() {
 		case "up", "k":
-			if len(m.harnesses) > 0 {
-				m.cursor = (m.cursor - 1 + len(m.harnesses)) % len(m.harnesses)
-			}
+			m.cursor = render.Wrap(m.cursor, -1, len(m.harnesses))
 		case "down", "j":
-			if len(m.harnesses) > 0 {
-				m.cursor = (m.cursor + 1) % len(m.harnesses)
-			}
+			m.cursor = render.Wrap(m.cursor, 1, len(m.harnesses))
 		case " ":
 			if m.cursor < len(m.harnesses) {
 				harness := m.harnesses[m.cursor]
@@ -220,18 +216,14 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.input = ""
 			return m, m.submitCode(value)
-		case tea.KeyBackspace:
-			if len(m.input) > 0 {
-				m.input = m.input[:len(m.input)-1]
-			}
 		case tea.KeyEsc:
 			m.step = stepDone
 			return m, tea.Quit
 		case tea.KeyCtrlC:
 			m.quit = true
 			return m, tea.Quit
-		case tea.KeyRunes, tea.KeySpace:
-			m.input += string(key.Runes)
+		default:
+			m.input, _ = render.Typed(m.input, key)
 		}
 	case stepSyncing:
 		switch key.String() {

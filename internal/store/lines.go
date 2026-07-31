@@ -42,7 +42,6 @@ var MeetingStatuses = []string{StatusReady, StatusProcessing, StatusRetrying}
 
 // Transcript states.
 const (
-	TranscriptAbsent   = "absent"
 	TranscriptComplete = "complete"
 )
 

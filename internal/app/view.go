@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/laelhalawani/sana-mcp/internal/render"
+	"github.com/laelhalawani/sana-mcp/internal/store"
 	"strings"
 )
 
@@ -92,11 +93,8 @@ func (m model) viewMeetings() string {
 			meeting.WordCount,
 			render.Dim.Render(meeting.Status))
 	}
-	pages := 1
-	if m.pageSize() > 0 {
-		pages = (m.meetingTotal + m.pageSize() - 1) / m.pageSize()
-	}
-	fmt.Fprintf(&out, "\n  %s", render.Dim.Render(fmt.Sprintf("page %d of %d", m.meetingPage, max(pages, 1))))
+	pages := store.ListOptions{Limit: m.pageSize()}.Pages(m.meetingTotal)
+	fmt.Fprintf(&out, "\n  %s", render.Dim.Render(fmt.Sprintf("page %d of %d", m.meetingPage, pages)))
 	return out.String() + footer(
 		"enter/t transcript  s summary  p participants  o recording  / name  f status  PgUp/PgDn page  esc menu")
 }
