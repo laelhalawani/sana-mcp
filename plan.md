@@ -1,0 +1,811 @@
+# sana-mcp: Go rewrite plan
+
+Branch: `go-rewrite`. Living document, updated as investigation proceeds.
+
+## Why we are doing this
+
+The TypeScript/Bun implementation was never a deliberate choice. There was an
+existing TS prototype, so it got wrapped in Bun. In hindsight that is not
+carrying its weight. The tool itself is not complicated: **auth, sync, and
+local operations**. What we pay for the Bun approach:
+
+- 115 MB single-file binary per platform, ~90 s to download on a normal
+  connection before the installer can even start.
+- Runaway memory in the sync daemon: measured 1.5 GB -> 2.7 GB -> 3.7 GB ->
+  4.26 GB RSS over ~14 minutes of indexing, still climbing. Effectively
+  unbounded; it will OOM on a long backfill.
+- The install path has accumulated fixes and abstractions to the point of being
+  a mess (33 k lines of TS across src/, a 1840-line install.sh and a 2778-line
+  install.ps1).
+
+## What must be preserved
+
+1. **The tool formats and the entire contract with the LLM.** The MCP tool
+   surface, argument shapes, and response formats stay as they are.
+2. **The UX of the interactive app.** The TUI flows (meetings list, transcript /
+   summary / participants / recording views, search, sync status, account,
+   configuration) keep their current shape and feel.
+
+## Reference repos to investigate
+
+Both are the user's own Go projects and represent the target architecture.
+
+- `../interactive-terminal-mcp` (4.5 MB) - **the layout we want**: installer,
+  MCP server, CLI, and TUI in one Go project. Closest model for sana-mcp.
+- `../apis-mcp` (128 MB) - nice installer and build configuration.
+
+What to look for in both:
+- Installer design and the one-liner UX (how it detects clients, writes MCP
+  configs, handles updates).
+- Build configuration: cross-compilation, per-platform dependency-free static
+  binaries, release automation.
+- How CLI / MCP / TUI modes share one binary and one entrypoint.
+- Binary size and startup characteristics.
+
+## The contract to preserve, exactly
+
+### MCP tool surface
+
+One tool, `meeting_transcripts`, dispatching on a `tool` name plus optional
+`args` - this shape is deliberate (the user wants the agent-facing tool
+unbranded and singular) and must not change.
+
+| tool | args | returns |
+|---|---|---|
+| `help` | `{tool?}` | all tools, or the argument schema for one |
+| `login` | `{email}`, then `{email, confirmation_code}` | passwordless sign-in via email code |
+| `status` | (none) | sync progress and coverage |
+| `list` | `{page?, limit?, query?, sort?, filter?}` | meetings: id, timestamp, title, status |
+| `read` | `{meeting_id, full?, lines?, timestamps?}` | transcript lines (all, or a `[start,end]` range) |
+| `search` | `{query, page?, limit?, sort?, filter?}` | matching lines with meeting id + line number |
+| `summary` | `{meeting_id}` | summary, notes by topic, and action items |
+| `participants` | `{meeting_id}` | attendees (name, email, host) |
+| `recording` | `{meeting_id}` | a temporary recording link, fetched live |
+
+Semantics that go with it: `list.sort` = `newest|oldest`; `list.filter` =
+`{status: ready|downloading|processing|retrying, date: {from, to}}` accepting ISO
+`YYYY-MM-DD` or epoch ms; `read.lines` is a 1-based `[start, end]` range, and with
+no selection it reports the line count and the options rather than dumping;
+`search.sort` = `best|newest|oldest`; `recording` fetches a live URL that expires.
+
+### TUI screens
+
+Main menu: Meetings, Search transcripts, Sync status, Sana account,
+Configuration, Quit. Meetings list shows `N ready` with date, word count and
+status per row, and per-row actions `t` transcript, `s` summary, `p`
+participants, `o` recording, `/` name filter, `f` status filter, PgUp/PgDn.
+Transcript view is numbered `N [m:ss] Speaker: text` with scroll and `t/s/p/o`
+switching. Search shows the index state (`semantic index 32/240`), the mode
+(`hybrid`), sort (`best`) and paging.
+
+Fix while porting: ESC is not advertised as "back" in the meetings footer, and
+two rapid ESC presses get swallowed.
+
+## Search architecture - FINAL
+
+> Read this section. Everything below it is the investigation trail, in the order
+> it happened, including conclusions that later proved wrong.
+
+### The founding premise was false
+
+The brief for this work said: *searching "Fabrics PIM" picks up "Fabrik", but
+semantic embeddings still find the results.* **On the real corpus they do not.**
+
+A gold set of 11 chunks where "Fabrik" unambiguously means the Fabrix product was
+built **by reading them** (`#11218` "do porównania między Fabrik, a Northwind, a
+Lumen"; `#11720` "co już mamy dostępne w Fabrik, jest po prostu za słabe"). Rank of
+the best gold chunk:
+
+| Query | BM25 | potion | **all-MiniLM (production)** |
+|---|---|---|---|
+| `fabrics vs lumen testing` | 156 | 1152 | **451** |
+| `Fabrics PIM` | 169 | 61 | **296** |
+| `comparison of lumen and fabrics for copywriting` | 288 | 2327 | **1317** |
+| `fabrics limitations` | 3421 | 298 | **99** |
+
+**Zero of 11 gold chunks appear in the top 50 for any method, including the model
+in production today.** The semantic search never found these. It *looked* like it
+worked because ~40 other chunks spell "Fabrics"/"Fabrix" correctly, so the queries
+return plausible results while the Fabrik chunks are silently missing.
+
+Searched using the transcript's own spelling - `porownanie Lumen i Fabrik
+copywriting` - **BM25 returns the gold chunk at rank 1**, while potion is at 75
+and MiniLM at 166.
+
+### What actually works: an alias map
+
+A ~10-line glossary (`fabrics -> fabrics|fabrix|akineo|fabrik`) applied as query
+expansion:
+
+| Query | BM25 plain | **BM25 + alias** |
+|---|---|---|
+| `fabrics vs lumen testing` | 156 | **4** |
+| `Fabrics PIM` | 173 | **5** |
+| `comparison of lumen and fabrics for copywriting` | 288 | **9** |
+| `fabrics limitations` | 3421 | **3** |
+| `what is weak in fabrics` | 565 | **2** |
+
+A hand-written table beats every embedding model by two orders of magnitude on
+the case that motivated this entire investigation.
+
+### Why every model failed: the general law
+
+Measured IDF over the real corpus:
+
+| Term | chunks | % of corpus | IDF | |
+|---|---|---|---|---|
+| **lumen** | 478 | 3.70 % | 3.30 | near-stopword |
+| **northwind** | 189 | 1.46 % | 4.22 | near-stopword |
+| lumen | 409 | 3.17 % | 3.45 | near-stopword |
+| pim | 179 | 1.39 % | 4.28 | low |
+| **fabrics** | 25 | 0.19 % | **6.23** | high signal |
+| **fabrix** | 15 | 0.12 % | **6.73** | high signal |
+| **zenolith** | 6 | 0.05 % | **7.59** | high signal |
+| vantik | 46 | 0.36 % | 5.63 | high signal |
+
+**ASR garbles rare proper nouns, and rare proper nouns are exactly the high-IDF
+tokens retrieval depends on.** In "comparison of lumen and fabrics", the only
+discriminative token is `fabrics` - the garbled one. Lumen (own company) and
+Northwind (main client) appear in 3.7 % and 1.5 % of all chunks and carry almost no
+discriminative power, so the correctly-spelled entities in a query cannot carry
+it. This is why *every* method failed: it is not a model-quality problem.
+
+Word-order/structure was tested separately: all-MiniLM (a transformer) does beat
+mean-pooled potion on comparison-shaped queries (451 vs 1152; 1317 vs 2327), so
+structure helps measurably - but moving gold from rank 2327 to 1317 is
+practically irrelevant. **Structure is not the bottleneck; the missing high-IDF
+token is.**
+
+### potion-multilingual-128M: rejected
+
+| | int8 size | encode 12,914 chunks | peak RSS |
+|---|---|---|---|
+| potion-retrieval-32M (Go) | **31 MB** | **19.2 s** | **119 MB** |
+| potion-multilingual-128M | 122 MB | 21.5 s | ~150-200 MB in Go |
+| all-MiniLM-L6-v2 ONNX q8 | 22 MB | **> 16 min** | - |
+
+Rank of best gold chunk:
+
+| Query | BM25 | potion-32M | all-MiniLM | potion-ml-128M | **BM25+alias** |
+|---|---|---|---|---|---|
+| `fabrics vs lumen testing` | 156 | 1152 | 451 | 184 | **4** |
+| `Fabrics PIM` | 169 | 61 | 296 | 235 | **5** |
+| `comparison of lumen and fabrics for copywriting` | 288 | 2327 | 1317 | 465 | **9** |
+| `fabrics limitations` | 3421 | 298 | 99 | 4337 | **3** |
+| `what is weak in fabrics` | 565 | - | - | 951 | **2** |
+| `porownanie Lumen i Fabrik copywriting` (Polish, correct term) | **1** | 75 | 166 | 244 | - |
+
+On the **Polish** query using the transcript's own spelling, plain BM25 ranks gold
+**1st** while the multilingual model manages **244**. Being multilingual did not
+rescue the Polish chunks. **122 MB not justified.**
+
+### Automatic alias discovery: measured, and it fails
+
+- **Distributional similarity** (PPMI context vectors, 7,780 candidates): `fabrik`
+  ranks **713 / 7780** among `fabrics`'s neighbours (cos 0.139). It fails because
+  the context vector encodes **language, not topic** - `fabrik` occurs
+  overwhelmingly in Polish chunks so its neighbours are Polish function words -
+  and because `fabrik` has df=101 split across two senses (a person named Antoni,
+  and the product).
+- **Pseudo-relevance feedback (RM3)**: exactly **one** chunk in 12,914 contains
+  both an Fabrics variant and `fabrik`. RM3 never surfaces it; two queries improved
+  marginally, two got worse (`what is weak in fabrics` 562 -> 1858).
+- **One genuine win:** distributional mining *does* find spelling near-misses for
+  free - `fabriks` is the top neighbour of `fabrics` (cos 0.48), `kineo` of
+  `fabrix` (0.51). Combined with edit distance and double metaphone it harvests
+  `fabrix`/`akineo`/`fabriks`/`crawlery` with no LLM at all. It simply cannot
+  bridge to `fabrik`.
+
+**No unsupervised statistical method recovers `Fabrik`. The signal is not in the
+corpus statistics.**
+
+### The upstream fix is closed, permanently
+
+`src/sana/types.ts` defines `TranscriptWord` as `{text, start_timestamp,
+end_timestamp}`: no confidence, no alternatives, no n-best, no lattice. The
+literature's correct answer for this problem class is lattice / n-best retrieval
+(Saraclar & Sproat), and it is unavailable. **Sana has no API to request it
+from.** Treat 1-best text as a hard constraint, not something to negotiate.
+
+### Prior art, scored against our actual case
+
+| Approach | Retrieves the Fabrik chunks? | Pure Go, no cgo? |
+|---|---|---|
+| ASR lattice / n-best | **Yes** - the literature's answer | N/A, API does not expose it |
+| Phonetic embeddings / phone indexing | **No** (`AKN` vs `ANTK`, measured) | Yes |
+| fastText-style subword n-grams | **No** (zero trigram overlap, measured) | Yes |
+| SPLADE / doc2query expansion | **No** - cannot invent `Fabrics` from `Fabrik` | No, needs a transformer |
+| Distributional alias mining | **No** (rank 713, measured) | Yes |
+| PRF / RM3 | **No** (measured) | Yes |
+| Index-time LLM alias mining | n/a - **not possible** | **No LLM exists at index time** |
+
+**REJECTED - index-time LLM mining.** There is no LLM in the loop during sync or
+indexing. The LLM is a *user* of this tool via MCP, never an indexer. Any design
+that assumes a model available at index time is invalid. (Apple's
+retrieval-augmented ASR entity correction is the published analogue and is
+structurally unavailable to us for the same reason.)
+
+### What is actually left
+
+With 1-best text, no index-time model, and every unsupervised method measured as
+failing, **automatic recovery of the `Fabrik` class is not achievable.** State that
+plainly rather than shipping a mechanism that measures worse than the problem.
+
+What remains, and is worth building:
+
+1. **FTS5 BM25 as primary search.** It wins on proper nouns and returns the gold
+   chunk at **rank 1** whenever the query spelling matches the transcript.
+2. **Free, fully automatic alias harvesting for spelling near-misses**: edit
+   distance + double metaphone (**both** codes) + distributional neighbours
+   cluster `fabrics`/`fabrix`/`akineo`/`fabriks` and `zenolith`/`crawlery` with no
+   model and no curation. This is a real win and costs nothing. It cannot bridge
+   to `fabrik`, and nothing can.
+3. **Optional dense channel** (potion-retrieval-32M in Go, 31 MB) as a secondary
+   signal for conceptual queries. Not required for v1.
+4. **User- and agent-driven transcript correction** - see the section below. This
+   is the only mechanism that fixes the `Fabrik` class, and it fixes it durably,
+   because once the line reads "Fabrix" BM25 ranks it 1st.
+
+### Transcript correction (current design direction)
+
+Aliasing was considered and **rejected on correctness**: aliases are global and
+unscoped, so aliasing `Fabrics` <-> `Fabrik` means a legitimate search for the
+person `Fabrik` returns product results. Measured: `Fabrik` is a person in ~90 of
+its 101 chunks, so a global alias corrupts 90 lines to fix 11. Once an alias has
+to be scoped per line, it is simply a worse spelling of an edit.
+
+**Editing the local transcript is the right primitive.** Design under discussion:
+
+- Edits are **per line**, non-destructive: the original is always retained
+  alongside the current version.
+- The MCP edit tool takes **the full existing line** plus the replacement, and
+  applies the change only if the existing text matches exactly - a
+  compare-and-swap, so an agent cannot edit a line it misread or that has shifted.
+- **Never edit without explicit user permission**, stated in the tool
+  description. Transcripts are full of real names that only *look* misspelled -
+  `Zenolith` is a real product, and both the investigating agent and the assistant
+  wrongly "corrected" it during this very investigation. That failure mode is
+  demonstrated, not hypothetical.
+- TUI: open transcript or summary, free-form edit, `ctrl+s` to save with y/n
+  confirm, `esc` with unsaved changes prompts y/n.
+- History: `h` in the transcript/summary view lists each changed line as original
+  plus latest version; select and press `r` to restore, y/n confirm.
+- Tool: line history by meeting id (list of changed lines), by meeting id + line
+  number (detail of the change), and with a restore flag to revert to original.
+
+**Open questions on this design - see the assessment in the conversation:**
+re-sync conflict handling (edits must survive re-download, keyed by original-text
+hash), whether the original text stays searchable alongside the edited text,
+summary editing being a structured document rather than lines, and a
+meeting-scoped "apply to all occurrences" affordance so 11 identical corrections
+are not 11 manual edits.
+
+**The honest limitation:** this makes a miss *fixable*, not *findable*. You can
+only correct an error you have already noticed by some other route. Since every
+automatic detection method measured failed, that discovery gap is permanent.
+
+### SUPERSEDED framing (kept for the trail)
+
+- `modernc.org/sqlite` **alone** covers the core need: pure Go, no cgo, FTS5 and
+  trigram verified, **6.0 MB binary**. **v1 can ship with no embedding model at
+  all.**
+- Keep a dense channel only as a supplement for conceptual queries where it
+  demonstrably helped (`data import issues`, `what did we decide about the
+  crawler`). If kept, use potion in Go: **19.2 s / 119 MB peak RSS** for 12,914
+  chunks, versus MiniLM ONNX at **over 16 minutes** on the same corpus, versus the
+  Bun daemon's 4,260 MB. `modernc.org/sqlite/vec` runs sqlite-vec v0.1.9 with no
+  cgo on all six platforms.
+
+**The real design question is no longer which model - it is how to build the
+alias map.** The entity set is small and stable (Lumen, Fabrics, Northwind, Vantik,
+Zenolith, Storyblok, Marketly, Electrolux). A curated glossary of 20-50 entries,
+user-editable, is cheap and highly effective. Automatic mining will not find it -
+"Fabrik" is edit distance 4 from "Fabrics" and phonetically unrelated - but the MCP
+already has an LLM in the loop that could propose candidates from context for
+human approval.
+
+### Open
+
+- **Dense models collapsed on this corpus:** the same generic chunks (`#5600`,
+  `#230`, `#11390`) surfaced for nearly every query, suggesting 96-word chunks of
+  conversational ASR speech embed to mush. Chunk-size sweep needed if dense is kept.
+- `potion-multilingual-128M` untested. 8.2 % of chunks are Polish/Swedish/
+  Norwegian and **the key gold chunks are Polish**, so it matters. Note the size:
+  489 MB f32, ~122 MB int8 - a meaningful download.
+- Fusion weights must be retested on real data.
+
+---
+
+## Investigation trail (superseded conclusions kept deliberately)
+
+**Settled and fully verified - the storage and runtime half:**
+`modernc.org/sqlite` + `modernc.org/sqlite/vec` (sqlite-vec v0.1.9), pure Go, no
+cgo, all six cross-compile targets, 9.6 MB binary. Nothing below changes this.
+
+**Settled - a genuine hybrid of dense + FTS5 BM25.** Both channels are
+load-bearing on the real corpus: BM25 wins on proper nouns that appear spelled
+correctly somewhere, dense wins on ASR garblings ("Crawliera", "lumen"). Fusion
+weights must be tuned on real data - see the correction section.
+
+**Open - which embedding model.** potion is 36x lighter on RAM (119 MB vs
+4,260 MB, measured on the real corpus) and far faster, but it lost to BM25 on
+proper nouns and is English-only against a corpus with an 8.2 % non-English tail.
+Deciding this needs the pending MiniLM like-for-like run and a
+`potion-multilingual-128M` comparison.
+
+> The two sections that follow were written from a **24-chunk synthetic corpus**
+> and are partly superseded. Read the real-corpus correction further down before
+> acting on either.
+
+### The "Fabrics PIM" -> "Fabrik" case is not phonetic
+
+Measured, not assumed. Every string-similarity technique fails on this pair:
+
+| Pair | Double metaphone | Soundex | Levenshtein | Trigram Jaccard |
+|---|---|---|---|---|
+| Fabrics / Fabrik | `AKN` vs `ANTK` no match | `A250` vs `A532` no match | 4 (of 6 chars) | **0.000** |
+
+FTS5 trigram `MATCH 'fabrics'` against a document containing "Fabrik" returns zero
+rows. This is an ASR *language-model substitution* - the recognizer replaced an
+unknown foreign brand with a familiar Polish given name that fits the context -
+not a phonetic confusion. **No spellfix1, SymSpell, BK-tree or metaphone design
+recovers it.** What retrieves the chunk is topical similarity from the
+surrounding words (PIM, catalog, attributes, migration), so **the dense channel
+is load-bearing and cannot be dropped.**
+
+Phonetics *do* fix a different real class, worth having as a cheap third channel
+via `fts5vocab` + an in-memory double-metaphone map (all measured matching):
+Kubernetes/"Cooper Netties", Postgres/"Post grass", Grafana/"Graphana",
+Datadog/"Data dog", and the Fabrix/Fabrics user typo.
+
+### Real query shapes are the easy case (measured on the SYNTHETIC corpus)
+
+> Superseded in part - see the real-corpus correction below. The BM25 "MISS" in
+> the table did not reproduce on the real data, where BM25 found correctly-spelled
+> "Fabrix" chunks at rank 3.
+
+
+The garbled proper noun gets **outvoted** by the surrounding content words. Rank
+of the correct chunk:
+
+| Query | potion | MiniLM | BM25 |
+|---|---|---|---|
+| `northwind issues with proofreading` | #1 | #1 | #1 |
+| `vantik planned release date for hockey environment` | #1 | #1 | #1 |
+| `lumen problems with the copy review` | #1 | #1 | #1 |
+| `Alex notes on the release schedule` | #1 | #1 | #1 |
+| `vantik hiring plan` | #1 | #1 | #1 |
+| `fabrics vs lumen testing` | **#2** | #1 | **MISS** |
+
+In "vantik planned release date for hockey environment", `planned release date
+environment` carry the meaning and one junk token cannot drag the mean-pooled
+vector away from them. **The last row is the entire justification for keeping
+embeddings**: every content-bearing word is garbled and only the generic
+"testing" survives, so BM25 misses completely and only the dense channel finds it.
+
+### Phonetic channel: two rules from measurement
+
+| Pair | Double metaphone | Levenshtein | Verdict |
+|---|---|---|---|
+| `Alex` / `Jazmin` | `ASMN` vs `JSMN`+**`ASMN`** | 2 | caught, **via the secondary code** |
+| `lumen` / `lumen` | `ATLS` vs `A0S`+`ATS` | 2 | missed by exact code, **caught by edit distance on codes** |
+| `northwind` / `northwind` | `PRS` = `PRS` | 2 | caught |
+| `vantik` / `spot big` | `SPPK` vs `SPTPK` | 3 | missed |
+| `Fabrics` / `Fabrik` | `AKN` vs `ANTK` | 4 | missed |
+
+1. **Index both double-metaphone codes**, not just the primary - that alone is
+   what catches Alex/Jazmin, and it is why double metaphone beats soundex.
+2. **Allow edit distance 1 on the codes**, not exact lookup - `lumen`/`lumen` are
+   1 apart phonetically but 2 apart as strings.
+
+Build this channel **last**, and only if users complain about name lookups.
+
+### Do not build (measured as unhelpful or harmful)
+
+- **Dropping unknown query tokens** as an ASR mitigation: no improvement
+  (MRR 0.917 either way) and it sometimes strips useful words.
+- **Unconditional RRF**: drops MRR 0.958 -> 0.847.
+- **spellfix1**: unavailable in modernc, and would not help the hard case anyway.
+
+### sqlite-vec runs on pure-Go SQLite
+
+Verified end to end, not taken from docs:
+
+```
+sqlite 3.53.3, vec_version v0.1.9, create virtual table vec0: OK
+inserted 20000 x 512d vectors in 8.205s
+KNN k=10 over 20000 vectors: 10 rows in 26.415ms
+```
+
+`vec0` accepts `float[512]`, `int8[512]`, `bit[512]`, `distance_metric=cosine`,
+partition keys and auxiliary columns. All six cross-compile targets build with
+`CGO_ENABLED=0`. modernc also ships FTS5, trigram, porter, soundex, JSON1,
+fts5vocab, rtree. **Absent: spellfix1, editdist3, fts4, runtime
+`load_extension`** - none of which we need given the finding above.
+
+### The embedding model: potion-retrieval-32M, reimplemented in Go
+
+model2vec inference is not neural: tokenize (BERT WordPiece, no special tokens),
+one embedding-table row per token, mean, L2-normalize. A ~250-line Go encoder
+(only dependency `golang.org/x/text` for NFD) was validated against the Python
+reference: **worst cosine agreement 1.00000000 across 42 texts** including Polish
+diacritics and `C++ / .NET 8.0`; 11,024 docs/sec, 90.7 us/doc.
+
+Retrieval on a 24-chunk / 12-query ASR-corrupted corpus:
+
+| Model | Size | R@1 | R@3 | MRR |
+|---|---|---|---|---|
+| BM25 only | 0 | 0.667 | 0.833 | 0.775 |
+| **potion-retrieval-32M int8 512d** | **31 MB** | **0.917** | 1.000 | **0.958** |
+| potion-retrieval-32M int8 256d | 15 MB | 0.917 | 1.000 | 0.944 |
+| all-MiniLM-L6-v2 q8 ONNX (current) | 22 MB | 0.917 | 1.000 | 0.958 |
+
+int8 quantization is free (identical to f32, 123 MB -> 31 MB). **Ship 512d int8.**
+256d is a legitimate operating point only because this model was trained with
+`MatryoshkaLoss([32,64,128,256,512])`, but the 16 MB saving is not worth the risk.
+
+**This is what removes the memory problem.** No daemon, no ONNX, no worker
+process, no arena: nothing to leak. Compare 20k chunks indexed in under 2 seconds
+against a daemon that reached 6.79 GB and had to be SIGKILLed.
+
+### CORRECTION: validated against the real corpus (12,914 chunks)
+
+Everything above this point came from a 24-chunk synthetic corpus. The
+investigation was then re-run against **12,914 chunks rebuilt from
+`~/.sana-mcp/sana.db`** (240 meetings, 1.24M words). Two synthetic conclusions
+**did not survive**, and the sections above are kept only to show the reasoning.
+
+**1. Memory and speed - confirmed, on real data:**
+
+| | Time | Peak RSS |
+|---|---|---|
+| **Go + potion** | **19.2 s** | **119 MB** |
+| Current Bun daemon | - | **4,260 MB** |
+
+~36x less memory for the same work, with a flat allocation profile: no worker
+process, no ONNX arena, no cross-process serialization, nothing to leak. Also
+confirmed: `embedMeeting` is called from the sync daemon
+(`src/sync/daemon.ts:464`), so this runs **during normal usage on every sync**,
+not at build time. That is exactly where the leak lives.
+
+**2. BM25 is much stronger on the real corpus than the synthetic test showed.**
+For `fabrics vs lumen testing`, BM25 did **not** miss: it returned "I will be
+testing the products, I think, both in Fabrix and..." at rank 3 and "data
+structure in Fabrics" at rank 5. The real transcripts contain "Fabrix"/"Fabrics"
+spelled **correctly in many places** - something a 24-chunk corpus could not
+show. potion did not surface those chunks at all. **On proper-noun queries BM25
+beat potion.**
+
+Consequences:
+- "Dense-first, BM25 as a gated booster" is **wrong for this corpus**.
+- The "RRF hurts" result **does not transfer** - it was an artifact of a corpus
+  where BM25 had no real signal.
+- A **genuine hybrid** is needed, with fusion weights retested on real data.
+
+**3. Dense earns its place, but on thinner real-data evidence than first claimed.**
+
+The `lumen` -> `lumen` error appears literally in the data and potion retrieved
+it: its top hit contained "create a custom, **lumen** only property". That case
+stands.
+
+**RETRACTED:** the "Crawliera"/"zenolith" example was originally offered as an
+ASR garbling of "crawler" that only dense could reach. It is not. **Zenolith is
+one of our own product names**, confirmed in chunk `#11218`: *"nie potrzebujemy
+nawet tej crawlery... Jak Zenolith będzie g[otowa]"*. A correctly-spelled product
+name is exactly the case BM25 handles well, so this example demonstrates nothing
+about dense retrieval and has been withdrawn.
+
+Net position: both channels still look load-bearing - BM25 for proper nouns
+spelled correctly somewhere, dense for genuine ASR substitutions - but the
+real-corpus evidence for the dense side currently rests on the `lumen` case plus
+the original `fabrics`/`Fabrik` observation, not on a broad set of examples. Treat
+the hybrid design as sound and the *relative weighting* as unmeasured.
+
+This is also a caution about method: two of the "garbled name" examples that
+motivated this whole investigation turned out, on inspection, to be real product
+names (Zenolith) or correctly spelled elsewhere in the corpus (Fabrix). Before
+tuning anything, **establish gold labels by reading the actual chunks**, rather
+than assuming a rare token is an ASR error.
+
+**4. Language tail is real:** the corpus is **8.2 % non-English** - 694 Polish,
+306 Swedish, 61 Norwegian chunks. Both potion-retrieval-32M and the current
+MiniLM are English-only, so this is not a regression, but
+`potion-multilingual-128M` (distilled from bge-m3) would be a genuine upgrade.
+
+**Still open:** a like-for-like MiniLM quality/cost run on the real corpus, and
+the same queries against `potion-multilingual-128M`. Those decide between
+"potion + real hybrid" and "keep MiniLM and pay the cgo cost". The storage and
+runtime half is unchanged and fully verified.
+
+### SUPERSEDED (synthetic corpus): dense-first, lexical gated
+
+| Method | R@1 | R@3 | MRR |
+|---|---|---|---|
+| dense only | **0.917** | **1.000** | **0.958** |
+| BM25 only | 0.667 | 0.833 | 0.775 |
+| RRF k=60 | 0.750 | 0.917 | 0.847 |
+| RRF, BM25 only when it has hits | 0.833 | 1.000 | 0.903 |
+
+RRF *degrades* results because BM25 always emits a confident full ranking even
+when the transcript is garbled and it has no real signal. Fuse only documents
+FTS5 actually matched, and only for rare or quoted terms.
+
+### Projected shipping size
+
+Go binary 2.2 MB stripped, 9.6 MB with SQLite + sqlite-vec; model 30.8 MB int8
+(22.2 MB gzipped); vocab 0.5 MB. So **~10 MB binary + ~22 MB first-run download**,
+against 115 MB today.
+
+### Risks and what to prototype first
+
+1. The benchmark is 24 chunks / 12 queries - directional only. MTEB Retrieval puts
+   potion at 81.7 % of MiniLM (35.06 vs 42.92); that gap did not appear here
+   because this workload is topical bag-of-words matching, where static
+   embeddings are strongest.
+2. **Static embeddings ignore word order.** "Did we pick A over B" and "did we
+   pick B over A" embed identically. Meeting queries are often exactly that
+   shape, and the test set does not probe it. This is the main quality risk.
+3. Both potion-retrieval-32M and all-MiniLM-L6-v2 are **English-only**. If
+   transcripts are substantially Polish, use `minishlab/potion-multilingual-128M`.
+   Pre-existing limitation, not a new one.
+4. sqlite-vec v0.1.9 is pre-1.0 - pin it.
+5. Nothing here recovers Fabrics/Fabrik at the *token* level. If the only matching
+   chunk lacked topical context, no design finds it. The real fix for that class
+   is an alias/glossary of product names mapped to observed ASR variants, applied
+   as query expansion.
+6. ONNX/bleve comparison rows were not verified (those research agents stopped).
+
+**Tests to run next, in priority order:**
+
+1. **Replay real queries against the real corpus.** The only test that settles the
+   decision. Dump existing chunks + MiniLM vectors, encode the same chunks with
+   potion, compare top-10 overlap and human judgement on 30-50 real queries.
+2. **Word-order sensitivity.** The real weakness of static embeddings, and the
+   benchmark corpus does not probe it. Test "did we pick A over B" vs "B over A",
+   "client rejected our proposal" vs "we rejected the client proposal".
+   **If potion cannot separate these and users ask such questions, that is the one
+   finding that flips the recommendation to ONNX.**
+3. **Hard negatives at real scale.** The 24-chunk corpus is topically distinct, so
+   almost everything ranks #1. Real meetings have hundreds of near-duplicate
+   chunks (weekly standups on the same project). Re-measure at ~20k chunks and
+   expect ranks to spread.
+4. **Language check.** `Fabrik`, `Alex`, `Jazmin` suggest Polish context. Both
+   potion-retrieval-32M and the current MiniLM are English-only - if meetings are
+   substantially Polish this is a pre-existing problem, fixed by
+   `potion-multilingual-128M`.
+5. **Chunk-size sweep.** Static embeddings dilute with length, since every token
+   gets equal weight in the mean. The current 96-word "large" chunks may be past
+   the useful point for potion specifically. Sweep 32/64/96/128 words on real data.
+
+Then: port the encoder, wire it to `modernc.org/sqlite/vec`, and only afterwards
+tune the gated BM25 booster.
+
+Fallback: keep all-MiniLM-L6-v2 via `github.com/yalue/onnxruntime_go`, accepting
+a per-platform shared library and the loss of trivial cross-compilation - i.e.
+reintroducing the packaging problem we are leaving Bun to escape. Prefer this
+only if a larger honest evaluation shows potion losing meaningfully on
+word-order-sensitive queries.
+
+### Modules
+
+- `modernc.org/sqlite` v1.55.0 (SQLite 3.53.3) + blank import `modernc.org/sqlite/vec` (sqlite-vec v0.1.9)
+- `golang.org/x/text` v0.40.0 (only for `unicode/norm` NFD)
+- Model `minishlab/potion-retrieval-32M` (MIT); port from `MinishLab/model2vec` and `model2vec-rs`
+
+Working prototypes live in the session scratchpad: `goproto/main.go` (Go encoder),
+`sqltest/main.go` (sqlite-vec probe), `bench.py` / `hybrid.py` (evaluations).
+**Copy these into the repo before the scratchpad is lost.**
+
+## Superseded: the original open problem
+
+This is the one genuinely unresolved question and the reason the rewrite is not
+a mechanical port.
+
+**Requirement:** a lightweight semantic embedding model that can be bundled into
+the binary or lazy-downloaded, without dragging in a heavy runtime.
+
+**Why semantic search matters here (concrete case):** transcripts contain ASR
+errors. Searching for "Fabrics PIM" must find passages where the transcript says
+"Fabrik". Keyword search misses this; the current embedding-based search finds it.
+
+So the alternative framing is also open: **is there a better non-semantic search
+than what we have** that survives transcription errors? (fuzzy / trigram /
+phonetic / typo-tolerant approaches.)
+
+## Findings
+
+### Reference repo: `../interactive-terminal-mcp` (the target architecture)
+
+This is the layout to copy. Go 1.26, `main.go` + `internal/{app,bootstrap,budget,
+cli,config,daemon,fsx,install,ipc,keys,mcpserver,render,session,vterm}`.
+
+**Size comparison, same class of tool:**
+
+| | sana-mcp (TS/Bun) | interactive-terminal-mcp (Go) |
+|---|---|---|
+| source | 33,493 lines `src/` (+42k tests) | 18,684 lines total incl. tests |
+| `install.sh` | 1,840 lines | 265 lines |
+| `install.ps1` | 2,778 lines | 193 lines |
+| CI/release workflows | 1 file, 53,292 bytes | 3 files, 211 lines total |
+| install logic | ~8,500 lines across `install.ts` (2,605), `legacy-posix-recovery.ts` (3,072), `config-transaction.ts` (1,443), `config-formats.ts` (980), `atomic-config.ts` (482) | `install.go` (378) + `tui.go` (656) |
+| shipped binary | 115 MB (120,854,656 B installed) | **16 MB** (16,015,522 B) |
+
+**Key mechanisms worth taking wholesale:**
+
+- **`github.com/sairaph/detect-harness`** - client/harness detection extracted as
+  its own module. It already encodes the exact distinction I fixed in the TS code
+  today: *"State is present, absent, or unavailable. Unavailable is kept distinct
+  from absent so a permission error is never shown as 'not installed'."* and
+  *"A client that cannot be used is still just 'not detected' as far as the list
+  is concerned: the user wants to know whether it is there, not why the library
+  could not reach it."* This is ~8,500 lines of our install mess, solved as a
+  dependency.
+- **One binary, mode by context** (`main.go`): a bare invocation runs the TUI when
+  stdin+stdout are terminals, and the MCP server when they are not - so an AI
+  client that execs the binary with no arguments still gets a server. Subcommands:
+  `mcp`, `daemon`, `configure|install|uninstall`, `attach`. Exactly the shape
+  sana-mcp needs.
+- Help and version run *before* any state is loaded, so they work with an
+  unwritable home directory.
+- The installer is **one Bubbletea program with explicit steps**
+  (`detecting -> harnesses -> retention -> summary -> settings -> applying ->
+  done`) so the screen evolves in place instead of appending a block per
+  question. Notably `stepDetecting` exists *because* scanning for thirteen
+  clients takes a visible moment and the installer previously "showed nothing at
+  all until it finished" - which is exactly the dead-air gap I hit in our v0.4.22
+  run between the download finishing and the wizard appearing. Already solved
+  there; port the solution rather than rediscovering it.
+- **Release workflow**: `CGO_ENABLED=0`, 6-way matrix (linux/darwin/windows x
+  amd64/arm64), `-trimpath -ldflags="-s -w -X main.version=$version"`, sha256sums,
+  `softprops/action-gh-release`. 78 lines. Tests run `go vet`, `go test`,
+  `go test -race`, plus a `GOOS=windows go vet` cross-check.
+- `docs/{app-design.md, implementation-plan.md, tool-contract.md}` - the
+  `tool-contract.md` pattern is exactly where our "keep the LLM contract"
+  requirement should live.
+- The installer draws its own progress bar rather than using curl's, deliberately,
+  so the POSIX and Windows installers show a person the same thing. It stops a
+  running daemon before replacing the binary, and downloads to `TARGET.new` so a
+  failure never leaves a half-written binary in place.
+- **Release = bump `VERSION` and merge to main.** `autorelease.yml` (70 lines)
+  checks whether `VERSION` has a published release; if not it force-points the tag
+  at the built commit and calls `release.yml` as a reusable workflow. It keys off
+  *the absence of a published release*, not the absence of a tag, so a failed
+  build does not permanently poison that version number. This replaces our
+  53 KB `release.yml` and the whole hand-rolled `scripts/release.ts` (33 KB).
+- The entrypoint model is shared with `favro-mcp` and `apis-mcp`, so sana-mcp
+  should join that family rather than invent a fourth convention.
+
+**Release ceremony, measured by doing it.** Cutting v0.4.23 on the TS repo
+required hand-editing the same version number in **six files, seven locations**:
+
+1. `package.json` (`version`)
+2. `tests/fixtures/manifest/valid-all-targets.json` (`packageVersion`, `releaseTag`)
+3. `tests/fixtures/manifest/invalid-unknown-field.json` (same two)
+4. `README.md` (the `SANA_MCP_VERSION` pin example)
+5. `install.sh` (two comment lines: the pinned one-liner and the tag URL)
+6. `docs/dev/cli-specs.md` (the "current release candidate" line)
+7. `.github/workflows/release.yml` (the `workflow_dispatch` input description)
+
+Two separate tests enforce this - `tests/install/manifest.test.ts` and
+`tests/release/version-projection.test.ts` - and they fail one at a time, so you
+discover the list by running the suite repeatedly. Note that item 7 means the
+release workflow's own *help text* is version-pinned and test-enforced.
+
+In the Go design this is one file (`VERSION`); the workflow derives the tag and
+`-ldflags` injects it into the binary. This is the clearest small example of the
+repo turning routine operations into rituals.
+
+**Measured binary sizes on this machine:** interactive-terminal-mcp 16.0 MB,
+apis-mcp 34.0 MB, sana-mcp **120.9 MB**. A Go sana-mcp should land ~16-25 MB
+before any bundled model, i.e. the 90-second download becomes roughly 10 seconds.
+Even bundling a small static embedding model should keep it well under half the
+current size, with no runtime at all.
+
+**`CGO_ENABLED=0` is a hard constraint** inherited from this design. It decides the
+search question below: anything requiring cgo (onnxruntime_go, mattn/go-sqlite3)
+breaks the cross-compilation story.
+
+**State and process model.** `bootstrap.Open()` resolves paths + config once, for
+every entrypoint, and deliberately does *not* contact the daemon, so the installer
+and help work when no daemon can run. Atomic file replacement is
+`internal/fsx/replace_{unix,windows}.go` - two small files against our
+`atomic-config.ts` (482) + `private-json.ts` (320) + `secure-files.ts` (569) +
+`windows-acl.ts` (328) = 1,699 lines.
+
+Their daemon owns PTYs, so every client talks to it over a socket with a JSON-line
+IPC protocol (`internal/ipc`, ~700 lines). **sana-mcp probably does not need that
+layer at all**: our shared state is the SQLite database, not a live kernel object.
+Readers (MCP, CLI, TUI) can open the DB directly; the sync daemon only needs
+single-writer coordination, which `gofrs/flock` plus SQLite WAL gives us. That
+would delete our `control.ts` (1,200), `lifecycle.ts` (549), `lock.ts` (127) and
+`spawn.ts` (117) lease/heartbeat machinery rather than port it. Worth confirming
+before committing to it, but it is the single biggest simplification available.
+
+### Reference repo: `../apis-mcp` (proves the SQLite + search path)
+
+38,007 lines of Go. `install.sh` 130 lines, `install.ps1` 220 lines. Same
+Bubbletea/lipgloss + `modelcontextprotocol/go-sdk v1.6.1` stack.
+
+**The decisive finding:** apis-mcp already runs **SQLite FTS5 with `bm25()`
+ranking on `modernc.org/sqlite v1.54.0`** - the pure-Go driver, no cgo
+(`internal/library/index.go:378`, `internal/library/search.go:49`). It uses
+per-column BM25 weights (`bm25(page_search, 0.0, 12.0, 12.0, 6.0, 4.0, 1.0,
+12.0, 12.0)`) with `tokenize = 'unicode61'`.
+
+So the **BM25 half of our hybrid search ports to Go with zero cgo and a proven
+in-house precedent**. What remains genuinely open is only the semantic/ASR-error
+half.
+
+### Memory investigation on the TS implementation (completed)
+
+Empirically narrowed down before the pivot decision:
+
+- Uniform batch shapes (128 items, constant length): RSS plateaus flat at
+  ~430 MB across 20 rounds. No growth.
+- **Varied** batch shapes (batch 5-128, 3-96 words, mirroring real transcript
+  chunks): RSS ratchets 583 MB -> 1041 MB over 24 rounds, and kept climbing on a
+  second pass over the *same* shape sequence. This is the real workload.
+- Daemon memory is ~98 % anonymous private dirty heap (4.19 GB of 4.26 GB), with
+  ~70 GB of virtual data address space reserved and dozens of mid-sized arenas.
+- Disabling the onnxruntime CPU arena (`session_options.enable_cpu_mem_arena =
+  false`) changed **nothing**: 1037 MB vs 1042 MB over the same 24 rounds.
+
+Conclusion: the growth is not the ONNX arena allocator. It is deeper in the
+transformers.js / Bun stack, and is not fixable from our side by configuration.
+This is direct evidence for leaving the stack rather than patching it.
+
+### Install UX issues found in the end-to-end v0.4.22 run
+
+- Claude Desktop reported two stacked failures on Linux for a non-issue (it has
+  no Linux build), each duplicating its reason in brackets, one styled as a hard
+  error. **Fixed** on this branch: platform support is now a property of the
+  client (`platforms: ["darwin", "win32"]`) and unsupported clients are dropped
+  before detection, so they never reach the wizard or the output. Carry this
+  concept into the Go rewrite: *a client that cannot exist on this platform is
+  not a failure, it is simply not there.*
+- Wizard selection state (`◉` = currently configured, `(will enable)` only after
+  toggling) is legible only once you know the convention.
+- Two ESC presses in quick succession get swallowed; the meetings list footer
+  never mentions that ESC returns to the main menu.
+
+### Uncommitted TS work carried onto this branch
+
+The working tree still has, from before the pivot:
+- the Claude Desktop / platform-support fix (`src/install/*`),
+- an in-flight out-of-process embedding worker refactor
+  (`src/semantic/embedding-worker*.ts`, `src/sync/daemon.ts`), which isolates the
+  daemon from the leak but does not remove it.
+
+Decide whether any of this is worth landing on `main` before the rewrite takes
+over.
+
+## Status
+
+- [x] Create `go-rewrite` branch and this plan
+- [x] Investigate `../interactive-terminal-mcp` layout and installer
+- [x] Investigate `../apis-mcp` installer and build config
+- [x] Investigation: Go options for search + semantic search
+- [x] Decide search architecture (pending real-corpus validation)
+- [x] Preserve investigation prototypes in `prototypes/`
+- [ ] **Validate potion vs MiniLM on the real corpus** - the one open question
+- [ ] Port plan: auth, sync, local ops, MCP contract, TUI
+
+## Also worth fixing, found while testing v0.4.22
+
+- The sync daemon **ignores SIGTERM for 28+ seconds while embedding** and needs
+  SIGKILL; it does not yield during native inference. Reproduced directly: the
+  daemon at 6.79 GB survived `kill -TERM` for 28 s. The uncommitted heartbeat /
+  abort work on this branch was aimed at this. In the Go design, embedding is a
+  cheap in-process table lookup, so the whole class of problem disappears.
+- The installer test suite has 5-second subprocess timeouts and goes flaky under
+  machine load (a *different* set of 2-4 tests failed per run while the leaking
+  daemon held 6.8 GB and 114 % CPU; all 54 pass unloaded). Whatever replaces it
+  should not encode wall-clock assumptions that turn load into false failures.
+
+## Constraints the rewrite inherits (decided, not open)
+
+- `CGO_ENABLED=0`, cross-compiled 6 ways. No cgo dependencies, anywhere.
+- `modernc.org/sqlite` as the driver; FTS5 + BM25 confirmed working on it.
+- `modelcontextprotocol/go-sdk` for MCP; Bubbletea + lipgloss for the TUI.
+- `detect-harness` for client detection and MCP config writing.
+- One binary: TUI when interactive, MCP server when not, plus subcommands.
