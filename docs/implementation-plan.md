@@ -267,13 +267,43 @@ fix is durable and shared by every later search of that transcript.
 ```
 main.go                  entrypoint and mode dispatch
 internal/bootstrap       paths + config, shared by every entrypoint
-internal/config          persisted settings
+internal/config          persisted settings and every path under the data root
+internal/fsx             atomic file writes
 internal/cli             argument parsing and one-shot commands
 internal/store           SQLite: schema, migrations, meetings, lines, edits, search
 internal/sana            Sana client: auth, meetings, transcripts, recordings
-internal/daemon          background sync, single writer under flock
+internal/daemon          background sync, single writer under flock, autostart
 internal/mcpserver       the meeting_transcripts tool surface
+internal/render          layout shared by every surface; no terminal dependency
+internal/tui             what only the two terminal surfaces share: palette, keys
 internal/app             the interactive application
 internal/install         detect-harness wiring and the installer TUI
-internal/search          BM25 query building, variant harvesting, optional dense
 ```
+
+`render` and `tui` are separate on purpose. `render` turns domain values into
+text for all four surfaces, including a stdio MCP server and a one-shot CLI;
+putting keystroke handling or lipgloss there made both of those link a TUI
+framework. Anything a terminal needs and a pipe does not belongs in `tui`.
+
+## 10. Sync starts itself
+
+Every surface calls `daemon.EnsureRunning` on the way up. It starts a detached
+daemon when one is not already running and the machine is signed in; losing that
+race to another process is the expected outcome, not an error, and the winner
+syncs for both.
+
+This is not optional polish. Before it existed, the `--detach` flag, the
+already-running branch, and two comments about autostart were all machinery for
+a caller nobody had written, so sync ran during an install and never again.
+
+## 11. Schema versions
+
+`schemaVersion` is 2. Version 2 aligns each `line_search` rowid with its
+`transcript_lines` rowid so a correction updates the index by rowid instead of
+scanning every indexed line - 33 ms against 13 microseconds on a real corpus.
+A database written by version 1 has arbitrary index rowids, so the migration
+rebuilds the index rather than trusting it; updating a misaligned rowid would
+rewrite a different line's entry.
+
+Every migration must preserve `line_edits`. Corrections are user-owned data that
+no re-sync can recover, and no migration may treat the database as a cache.
