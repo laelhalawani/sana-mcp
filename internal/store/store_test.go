@@ -44,7 +44,7 @@ func TestEditAppliesAndIsSearchable(t *testing.T) {
 
 	original := "do porownania miedzy Fabrik, a Northwind, a Lumen"
 	corrected := "do porownania miedzy Fabrix, a Northwind, a Lumen"
-	if _, err := store.EditLine("m1", 1, original, corrected, AuthorUser); err != nil {
+	if _, err := store.EditLine("m1", 1, original, corrected, 1, AuthorUser); err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 
@@ -74,7 +74,7 @@ func TestEditRejectsMismatchedText(t *testing.T) {
 	store := openTest(t)
 	seed(t, store)
 
-	_, err := store.EditLine("m1", 1, "a line that was never there", "anything", AuthorAgent)
+	_, err := store.EditLine("m1", 1, "a line that was never there", "anything", 1, AuthorAgent)
 	if !errors.Is(err, ErrLineMismatch) {
 		t.Fatalf("expected ErrLineMismatch, got %v", err)
 	}
@@ -90,7 +90,7 @@ func TestRestoreReturnsTheOriginal(t *testing.T) {
 	seed(t, store)
 
 	original := "do porownania miedzy Fabrik, a Northwind, a Lumen"
-	if _, err := store.EditLine("m1", 1, original, "corrected", AuthorUser); err != nil {
+	if _, err := store.EditLine("m1", 1, original, "corrected", 1, AuthorUser); err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 	if err := store.RestoreLine("m1", 1); err != nil {
@@ -142,7 +142,7 @@ func TestEditsSurviveRedownloadWhenLinesShift(t *testing.T) {
 
 	original := "do porownania miedzy Fabrik, a Northwind, a Lumen"
 	corrected := "do porownania miedzy Fabrix, a Northwind, a Lumen"
-	if _, err := store.EditLine("m1", 1, original, corrected, AuthorUser); err != nil {
+	if _, err := store.EditLine("m1", 1, original, corrected, 1, AuthorUser); err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 
@@ -170,7 +170,7 @@ func TestVanishedLineLeavesEditStaleNotApplied(t *testing.T) {
 	seed(t, store)
 
 	original := "do porownania miedzy Fabrik, a Northwind, a Lumen"
-	if _, err := store.EditLine("m1", 1, original, "corrected", AuthorUser); err != nil {
+	if _, err := store.EditLine("m1", 1, original, "corrected", 1, AuthorUser); err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 
@@ -268,7 +268,7 @@ func TestMigrationRebuildsMisalignedSearchIndex(t *testing.T) {
 
 	// Editing must now change the right line's index entry.
 	original := "do porownania miedzy Fabrik, a Northwind, a Lumen"
-	if _, err := migrated.EditLine("m1", 1, original, "corrected Fabrix line", AuthorUser); err != nil {
+	if _, err := migrated.EditLine("m1", 1, original, "corrected Fabrix line", 1, AuthorUser); err != nil {
 		t.Fatalf("edit after migration: %v", err)
 	}
 	hits, err := migrated.Search("Fabrix", 10, 0, SortBest)
@@ -385,5 +385,68 @@ func TestPagesNeverReportsZero(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("limit %d total %d: pages %d, want %d", tc.limit, tc.total, got, tc.want)
 		}
+	}
+}
+
+// TestEditReplacesEveryOccurrenceItWasToldAbout is the point of the count: a
+// caller that has read the line and seen three says three, and gets all three.
+func TestEditReplacesEveryOccurrenceItWasToldAbout(t *testing.T) {
+	store := openTest(t)
+	seed(t, store)
+
+	line := "Fabrik said Fabrik would ask Fabrik"
+	if _, err := store.EditLine("m1", 1,
+		"do porownania miedzy Fabrik, a Northwind, a Lumen", line, 1, AuthorUser); err != nil {
+		t.Fatalf("seed the line: %v", err)
+	}
+
+	if _, err := store.EditLine("m1", 1, "Fabrik", "Fabrix", 3, AuthorAgent); err != nil {
+		t.Fatalf("three occurrences, three replacements: %v", err)
+	}
+	lines, err := store.Lines("m1", 1, 1)
+	if err != nil || len(lines) != 1 {
+		t.Fatalf("read back: %v", err)
+	}
+	if lines[0].Text != "Fabrix said Fabrix would ask Fabrix" {
+		t.Fatalf("text = %q", lines[0].Text)
+	}
+	// What Sana delivered is still what Sana delivered, however many edits ran.
+	if !strings.Contains(lines[0].OriginalText, "do porownania") {
+		t.Fatalf("the original was overwritten: %q", lines[0].OriginalText)
+	}
+}
+
+// TestEditRefusesAFragmentThatOccursMoreOftenThanClaimed is the safety
+// interlock: naming a count is how a caller says which text it has looked at.
+func TestEditRefusesAFragmentThatOccursMoreOftenThanClaimed(t *testing.T) {
+	store := openTest(t)
+	seed(t, store)
+
+	line := "Fabrik said Fabrik would ask Fabrik"
+	if _, err := store.EditLine("m1", 1,
+		"do porownania miedzy Fabrik, a Northwind, a Lumen", line, 1, AuthorUser); err != nil {
+		t.Fatalf("seed the line: %v", err)
+	}
+
+	// Claiming one when there are three must change nothing at all - not even
+	// the first.
+	_, err := store.EditLine("m1", 1, "Fabrik", "Fabrix", 1, AuthorAgent)
+	if !errors.Is(err, ErrLineMismatch) {
+		t.Fatalf("expected ErrLineMismatch, got %v", err)
+	}
+	lines, err := store.Lines("m1", 1, 1)
+	if err != nil || len(lines) != 1 {
+		t.Fatalf("read back: %v", err)
+	}
+	if lines[0].Text != line {
+		t.Fatalf("a refused edit changed the line: %q", lines[0].Text)
+	}
+
+	// And an empty fragment is refused rather than matching everywhere.
+	if _, err := store.EditLine("m1", 1, "", "x", 1, AuthorAgent); err == nil {
+		t.Fatal("an empty fragment must be refused")
+	}
+	if _, err := store.EditLine("m1", 1, "Fabrik", "x", 0, AuthorAgent); err == nil {
+		t.Fatal("a count of zero must be refused")
 	}
 }

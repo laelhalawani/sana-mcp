@@ -16,15 +16,17 @@ import (
 
 // handleEditLine corrects one transcript line.
 //
-// expected_text must equal the line as it currently reads. That is not
-// ceremony: it is what stops a model editing a line it misread, or one whose
-// number shifted since it last looked.
+// expected_text is the fragment to replace, not the whole line, and occurrences
+// says how many times it is expected to appear. That count is what stops a
+// model editing text it has not looked at: a fragment that occurs somewhere
+// else in the line fails the edit rather than quietly changing both places.
 func handleEditLine(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID    string `json:"meeting_id"`
 		Line         int    `json:"line"`
 		ExpectedText string `json:"expected_text"`
 		NewText      string `json:"new_text"`
+		Occurrences  *int   `json:"occurrences"`
 	}
 	if err := decode(raw, &args); err != nil {
 		return "", err
@@ -34,21 +36,30 @@ func handleEditLine(_ context.Context, database *store.Store, raw json.RawMessag
 	}
 	if args.ExpectedText == "" {
 		return "", errors.New(
-			"expected_text is required: pass the line exactly as it currently reads, " +
+			"expected_text is required: the text to replace, exactly as it currently reads, " +
 				"which read {meeting_id, lines: [n, n]} will show you")
 	}
 	if args.NewText == "" {
 		return "", errors.New("new_text is required; to undo a correction use restore_line")
 	}
+	occurrences := 1
+	if args.Occurrences != nil {
+		occurrences = *args.Occurrences
+	}
 
 	edit, err := database.EditLine(
-		args.MeetingID, args.Line, args.ExpectedText, args.NewText, store.AuthorAgent)
+		args.MeetingID, args.Line, args.ExpectedText, args.NewText, occurrences, store.AuthorAgent)
 	if err != nil {
 		if errors.Is(err, store.ErrLineMismatch) {
+			// The number found is deliberately withheld. Told what it was, the
+			// obvious next move is to retry with that number - which replaces
+			// occurrences nobody has looked at, and is exactly what this check
+			// exists to prevent.
 			return "", fmt.Errorf(
-				"line %d does not read what you expected, so nothing was changed. "+
-					"Read it with read {meeting_id: %q, lines: [%d, %d]} and try again",
-				args.Line, args.MeetingID, args.Line, args.Line)
+				"line %d does not contain that text %d time(s), so nothing was changed. "+
+					"Read it with read {meeting_id: %q, lines: [%d, %d]} and decide from what it "+
+					"actually says before editing again",
+				args.Line, occurrences, args.MeetingID, args.Line, args.Line)
 		}
 		return "", notFoundHint(err, args.MeetingID)
 	}

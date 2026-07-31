@@ -41,7 +41,7 @@ func init() {
 		{"summary", `{meeting_id}`, "summary, notes by topic, action items", withStore(handleSummary), false},
 		{"participants", `{meeting_id}`, "attendees", withStore(handleParticipants), false},
 		{"recording", `{meeting_id}`, "a temporary recording link, fetched live", handleRecording, false},
-		{"edit_line", `{meeting_id, line, expected_text, new_text}`, "replace one line", withStore(handleEditLine), true},
+		{"edit_line", `{meeting_id, line, expected_text, new_text, occurrences?}`, "replace text within one line", withStore(handleEditLine), true},
 		{"line_history", `{meeting_id, line?}`, "what was changed, original and current", withStore(handleLineHistory), true},
 		{"restore_line", `{meeting_id, line}`, "put a line back to what Sana delivered", withStore(handleRestoreLine), true},
 	}
@@ -78,6 +78,12 @@ func buildDescription() string {
 		"These correct them:\n\n")
 	out.WriteString(toolTable(true))
 	out.WriteString(`
+edit_line replaces a fragment, not the whole line. expected_text is the text to
+replace exactly as it currently reads; occurrences is how many times you expect
+it to appear in that line, and defaults to 1. The edit only runs if the count
+matches, so a fragment that also appears somewhere you have not looked fails
+rather than changing both. Read the line first and count.
+
 NEVER edit a transcript unless the user has explicitly asked for that specific
 correction. Meetings are full of product names, company names and personal names
 that look like misspellings and are not: "Zenolith", "Fabrix", "Vantik" are real.

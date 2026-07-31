@@ -158,12 +158,13 @@ func (b *browser) confirmKey(name string) tea.Cmd {
 
 	switch pending {
 	case "save":
-		// The store's compare-and-swap is against the line as it stands now,
-		// not as Sana delivered it. Passing the original meant a line could be
-		// corrected exactly once: every later correction was rejected as a
-		// mismatch, on the very line the message named.
+		// The editor replaces the whole line, so the fragment is the line as it
+		// stands now and it occurs once. The compare-and-swap is against the
+		// current text, not the original: passing the original meant a line
+		// could be corrected exactly once, every later correction rejected as a
+		// mismatch on the very line the message named.
 		_, err := b.app.store.EditLine(
-			b.detailID, b.editLine, b.currentText(b.editLine), b.editBuffer, store.AuthorUser)
+			b.detailID, b.editLine, b.currentText(b.editLine), b.editBuffer, 1, store.AuthorUser)
 		if err != nil {
 			b.failure = err.Error()
 			return nil
