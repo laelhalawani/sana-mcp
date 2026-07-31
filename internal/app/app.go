@@ -146,6 +146,10 @@ func (a *application) dispatch(action string) bool {
 		result, err := statusview.Run(a.ctx, a.terminal, statusview.ModeStatus,
 			func() statusview.Info { return statusview.Read(a.runtime.Paths) }, nil)
 		return err == nil && result == statusview.ActionQuit
+	case "login":
+		// Straight into the code flow: with no session there is nothing for the
+		// account screen to show, and its first option would be Back.
+		a.signIn()
 	case "account":
 		return a.account()
 	case "configure":
