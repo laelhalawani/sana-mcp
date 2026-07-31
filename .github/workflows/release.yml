@@ -67,12 +67,20 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: Checksums
+        # Checksums cover the binaries only, and are computed before the
+        # installers are added: an installer cannot be listed in a file it
+        # would then have to verify against itself.
         run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Publish the installers alongside the binaries
+        # The documented one-liners fetch these from the release, so they have
+        # to be assets of it rather than only files in the repository.
+        run: cp install.sh install.ps1 dist/
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
