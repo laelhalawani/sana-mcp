@@ -194,3 +194,38 @@ func TestVanishedLineLeavesEditStaleNotApplied(t *testing.T) {
 		t.Fatalf("a stale edit must not be applied to another line, got %+v", hits)
 	}
 }
+
+// Re-listing a meeting must not reset what a transcript fetch established.
+// The meeting list carries neither a word count nor a transcript state, so
+// writing them from a list would empty every meeting on each sync cycle.
+func TestRelistingPreservesWordCountAndTranscript(t *testing.T) {
+	store := openTest(t)
+	seed(t, store)
+
+	before, err := store.GetMeeting("m1")
+	if err != nil {
+		t.Fatalf("get meeting: %v", err)
+	}
+	if before.WordCount == 0 {
+		t.Fatal("storing a transcript should record its word count")
+	}
+	if before.TranscriptState != TranscriptComplete {
+		t.Fatalf("transcript should be complete, got %q", before.TranscriptState)
+	}
+
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "m1", Title: "Platform review", CreatedMS: 1000, Status: "ready",
+	}); err != nil {
+		t.Fatalf("re-list: %v", err)
+	}
+	after, err := store.GetMeeting("m1")
+	if err != nil {
+		t.Fatalf("get meeting: %v", err)
+	}
+	if after.WordCount != before.WordCount {
+		t.Fatalf("word count went %d -> %d on a re-list", before.WordCount, after.WordCount)
+	}
+	if after.TranscriptState != TranscriptComplete {
+		t.Fatalf("transcript state was downgraded to %q on a re-list", after.TranscriptState)
+	}
+}
