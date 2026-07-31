@@ -97,6 +97,9 @@ func Run(ctx context.Context, runtime *bootstrap.Runtime, command Command, optio
 		fmt.Fprintln(options.Stdout, options.Version)
 		return 0
 	}
-	fmt.Fprintf(options.Stderr, "sana-mcp: %s is not implemented yet\n", command.Name)
-	return 1
+	if runtime == nil {
+		fmt.Fprintf(options.Stderr, "sana-mcp: %s needs local state\n", command.Name)
+		return 1
+	}
+	return run(ctx, runtime, command, options)
 }
