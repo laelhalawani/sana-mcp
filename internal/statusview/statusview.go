@@ -67,17 +67,28 @@ func Read(paths config.Paths) Info {
 	}
 	info.Status = status
 
+	// A stored cookie only means a file exists; when Sana rejects it the daemon
+	// records needs_login, and that is the only evidence there is.
+	//
+	// Expired is reported alongside the session rather than instead of it. The
+	// meetings already downloaded are still readable, so having a lapsed
+	// session is not the same as having none - and guessing which of the two
+	// facts is fresher, by comparing a file's timestamp against a phase, got
+	// that wrong in both directions.
+	info.Expired = info.SignedIn && status.Phase == store.PhaseNeedsLogin
+
 	if stat, err := os.Stat(paths.PID); err == nil {
 		info.HeartbeatMS = stat.ModTime().UnixMilli()
 	}
 	return info
 }
 
-// authProblem reports whether the sync numbers are meaningless because there is
-// no session to sync with. When it is true the counts are suppressed: a stale
-// "12 of 300" beside "sign in required" reads as progress that is still
-// happening.
-func (i Info) authProblem() bool { return !i.SignedIn }
+// authProblem reports whether the sync numbers are meaningless: nothing Sana
+// will accept, or nothing readable to count. When it is true the counts are
+// suppressed - a stale "12 of 300" beside "sign in required" reads as progress
+// that is still happening, and a zero from a database that could not be opened
+// tells someone with two hundred meetings that they have none.
+func (i Info) authProblem() bool { return !i.SignedIn || i.Expired || i.Unavailable != "" }
 
 // Preparing reports that there is not yet a meeting list to browse.
 //
@@ -96,11 +107,17 @@ func (i Info) attention() bool {
 // phaseLabel names what is happening now, in the words the previous
 // implementation used.
 func (i Info) phaseLabel() string {
+	if i.Expired {
+		return "Sana session expired"
+	}
 	if !i.SignedIn {
-		if i.Expired {
-			return "Sana session expired"
-		}
 		return "Sign in required"
+	}
+	if i.Unavailable != "" {
+		// There are no cycles to be part-way through. The phase here is the
+		// zero value, which would otherwise read as "Syncing meetings" beside
+		// a red cross and a message saying sync cannot run.
+		return "Sync unavailable"
 	}
 	if i.Status.Phase == store.PhaseSynced && i.Status.Remaining == 0 {
 		return "Up to date"
@@ -256,7 +273,7 @@ func (m *model) View() string {
 
 	if m.mode == ModeStatus {
 		switch {
-		case !info.SignedIn && info.Expired:
+		case info.Expired:
 			body = append(body, "", "Your Sana session has expired. Sign in again.")
 		case !info.SignedIn:
 			body = append(body, "", "You are not signed in to Sana.")

@@ -217,11 +217,29 @@ func (s *Server) SyncUntilIdle(ctx context.Context) error {
 // An expired session is translated here, once, rather than after each step:
 // every step can raise it, and a fourth step added later cannot forget to.
 func (s *Server) SyncOnce(ctx context.Context) error {
+	before := s.sessionCookie()
 	err := s.syncCycle(ctx)
 	if errors.Is(err, sana.ErrUnauthorized) {
+		// Rejected - but rejected with the cookie this cycle started with. If
+		// somebody signed in while it was running, recording the verdict would
+		// mark the new session expired, and every screen would say so until the
+		// next cycle came round.
+		if s.sessionCookie() != before {
+			return nil
+		}
 		return s.store.SetPhase(store.PhaseNeedsLogin)
 	}
 	return err
+}
+
+// sessionCookie identifies the stored sign-in, so a cycle can tell whether the
+// one it used is still the current one.
+func (s *Server) sessionCookie() string {
+	session, err := sana.LoadSession(s.runtime.Paths.Session)
+	if err != nil || session == nil {
+		return ""
+	}
+	return session.Cookies[sana.SessionCookie]
 }
 
 func (s *Server) syncCycle(ctx context.Context) error {

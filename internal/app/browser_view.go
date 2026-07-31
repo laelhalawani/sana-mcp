@@ -139,15 +139,15 @@ func (b *browser) View() string {
 			body, "up/down choose  enter apply  esc cancel")
 
 	case b.view == viewEdit:
-		return b.viewEdit()
+		return b.viewEdit(capacity)
 
 	case b.view == viewHistory:
-		return b.viewHistory()
+		return b.viewHistory(capacity)
 
 	case b.view == viewStatus:
 		body := b.window(b.statusLines(), capacity)
 		if b.failure != "" {
-			body = append(body, ui.Red("Refresh failed: "+b.failure))
+			body = append(body, ui.Red(ui.Truncate("Refresh failed: "+b.failure, width)))
 		}
 		return ui.Screen("Sync status", body, ui.AdaptiveFooter(width,
 			"auto-refreshing  r refresh  esc meetings  q quit",
@@ -228,24 +228,70 @@ func (b *browser) View() string {
 	return b.viewList()
 }
 
-// window is the visible slice of a scrolling body, clamped to what exists.
+// window is the visible slice of a scrolling body, wrapped to the width.
+//
+// Wrapping rather than cutting is the difference between reading a summary and
+// seeing its first eighty characters: these are paragraphs, and the terminal is
+// the only place they are shown at all.
+//
+// The clamp is written back. Clamping a copy left the stored position past the
+// end after a resize, so the first arrow key only brought it back in range and
+// the screen did not move.
 func (b *browser) window(lines []string, capacity int) []tui.Text {
-	maximum := max(0, len(lines)-capacity)
-	scroll := max(0, min(maximum, b.scroll))
-	end := min(len(lines), scroll+capacity)
+	wrapped := b.wrapped(lines)
+	b.scroll = max(0, min(max(0, len(wrapped)-capacity), b.scroll))
+	end := min(len(wrapped), b.scroll+capacity)
 
-	visible := make([]tui.Text, 0, max(0, end-scroll))
-	for index := scroll; index < end; index++ {
-		visible = append(visible, b.ui.Plain(lines[index]))
+	visible := make([]tui.Text, 0, max(0, end-b.scroll))
+	for index := b.scroll; index < end; index++ {
+		visible = append(visible, b.ui.Plain(wrapped[index]))
 	}
 	return visible
+}
+
+// wrapped is the body laid out for this width. Scrolling counts these rows, so
+// end of document means the end of what is actually drawn.
+//
+// The result is kept until the width or the document changes: laying out a
+// three-thousand-line transcript takes tens of milliseconds, and it was being
+// done on every frame and again on every keypress.
+func (b *browser) wrapped(lines []string) []string {
+	width := b.ui.Policy.Width()
+	// The view is part of the key. Screens share the revision counter, so a
+	// cache keyed on that alone handed the keyboard help's rows to the meeting
+	// list, which drew them under its own title.
+	if b.wrapWidth == width && b.wrapSource == b.revision &&
+		b.wrapView == b.view && b.wrapCache != nil {
+		return b.wrapCache
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		out = append(out, b.ui.Wrap(line, width)...)
+	}
+	b.wrapCache, b.wrapWidth, b.wrapSource, b.wrapView = out, width, b.revision, b.view
+	return out
+}
+
+// tail keeps the last rows of a body that is not scrollable, so a prompt or an
+// error appended to the end is never the part that gets clipped away.
+func tail(body []tui.Text, capacity int) []tui.Text {
+	if capacity <= 0 || len(body) <= capacity {
+		return body
+	}
+	return body[len(body)-capacity:]
 }
 
 func (b *browser) viewList() string {
 	ui := b.ui
 	width := ui.Policy.Width()
 	capacity := b.bodyRows()
-	cards := max(0, capacity/cardHeight)
+	// At least one card whenever there is room for any body at all: a terminal
+	// too short for three rows would otherwise draw an empty list under a
+	// header that says how many meetings there are.
+	cards := 0
+	if capacity > 0 {
+		cards = max(1, capacity/cardHeight)
+	}
 
 	// Before the first listing there is nothing to draw a list of, and an empty
 	// list would read as "you have no meetings".

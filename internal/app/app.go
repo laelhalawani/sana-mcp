@@ -107,8 +107,15 @@ func Run(ctx context.Context, runtime *bootstrap.Runtime, version string) int {
 func (a *application) loop() int {
 	for {
 		info := statusview.Read(a.runtime.Paths)
-		items := signedOutChoices(info.Expired)
-		if info.SignedIn {
+		// A lapsed session still has meetings behind it, so the full menu stays:
+		// what was downloaded is readable, and Sana account is how to sign in
+		// again. Only the total absence of a session takes it away.
+		items := signedOutChoices(false)
+		switch {
+		case info.Expired:
+			items = signedInChoices(info.Preparing())
+			items[len(items)-3] = choice{"Sana account (session expired)", "account"}
+		case info.SignedIn:
 			items = signedInChoices(info.Preparing())
 		}
 		labels := make([]string, 0, len(items))
@@ -155,7 +162,7 @@ func (a *application) account() bool {
 	state := "not signed in"
 	signIn := "Sign in"
 	if session.SignedIn() {
-		state = "signed in as " + session.Email
+		state = "signed in as " + session.Address()
 		signIn = "Sign in again"
 	}
 	index, err := a.terminal.Select(a.ctx, "Sana account - "+state,
@@ -196,6 +203,13 @@ func (a *application) signIn() {
 	if err := sana.SaveSession(a.runtime.Paths.Session, sana.SessionFrom(client, user)); err != nil {
 		a.terminal.Print(ui.Red("Signed in, but the session could not be saved: "), err.Error())
 		return
+	}
+	// The daemon reads the session at the start of each cycle, so a new one is
+	// picked up on its own - but a needs_login it recorded against the old
+	// session stays until then, and that is what the screens read.
+	if err := a.store.ResumeAfterSignIn(); err != nil {
+		a.terminal.Print(ui.Yellow("Signed in, but the sync state could not be cleared: "),
+			err.Error())
 	}
 	a.terminal.Print("Signed in as ", user.Email, ".")
 	a.terminal.Print("Your meetings are syncing in the background.")

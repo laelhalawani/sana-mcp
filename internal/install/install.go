@@ -39,12 +39,19 @@ func (h Harness) Selectable() bool {
 }
 
 // StatusText renders the harness state for a person, in at most two words.
+//
+// "cannot inspect" is its own answer. Reporting an environment that could not
+// be read as "not detected" states the one thing the detection did not
+// establish, and contradicted the message the same row gives when it is
+// selected.
 func (h Harness) StatusText() string {
 	switch {
 	case h.Configured:
 		return "configured"
 	case h.State == detectharness.Detected:
 		return "detected"
+	case !h.Selectable():
+		return "cannot inspect"
 	default:
 		return "not detected"
 	}
@@ -93,7 +100,7 @@ func (i *Installer) Detect(ctx context.Context) []Harness {
 		ids = append(ids, detection.ID)
 	}
 	registered := map[detectharness.ID]bool{}
-	if plan := i.installer.Plan(ctx, ids, detectharness.Present, detectharness.PlanOptions{}); plan != nil {
+	if plan := i.installer.Plan(ctx, ids, detectharness.Present, planOptions()); plan != nil {
 		for _, change := range plan.Changes() {
 			registered[change.HarnessID] = change.State == detectharness.ChangeNoop
 		}
@@ -120,10 +127,23 @@ func (i *Installer) Detect(ctx context.Context) []Harness {
 	return harnesses
 }
 
+// planOptions replaces an existing entry of the same name rather than refusing.
+//
+// The entry is called "sana-mcp". A same-name entry pointing at a different
+// path is this program's own earlier registration - the previous version
+// installed to ~/.local/bin, and upgrading from it is the case the whole
+// migration exists to serve. Refusing meant the upgrade reported "another
+// server is registered under this name", exited non-zero, could never succeed
+// however many times it was run, and then deleted the binary that entry pointed
+// at, leaving the client configured to run a file that no longer exists.
+func planOptions() detectharness.PlanOptions {
+	return detectharness.PlanOptions{ConflictPolicy: detectharness.ConflictReplace}
+}
+
 // Apply registers or removes the server for the given harnesses.
 func (i *Installer) Apply(ctx context.Context, ids []detectharness.ID, desired detectharness.DesiredState) []detectharness.Result {
 	if len(ids) == 0 {
 		return nil
 	}
-	return i.installer.Ensure(ctx, ids, desired, detectharness.PlanOptions{})
+	return i.installer.Ensure(ctx, ids, desired, planOptions())
 }

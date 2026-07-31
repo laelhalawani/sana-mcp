@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/laelhalawani/sana-mcp/internal/config"
+	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
 
@@ -124,6 +125,28 @@ type Reset struct {
 // Quarantine is where the replaced state was put, so the caller can say so.
 func (r *Reset) Quarantine() string { return r.journal.Quarantine }
 
+// quarantinePrefix is what Begin names the directory it moves the old data to.
+func quarantinePrefix(paths config.Paths) string {
+	return "." + filepath.Base(paths.Root) + "-incompatible-"
+}
+
+// quarantines lists directories left by a replacement that never finished.
+func quarantines(paths config.Paths) []string {
+	parent := filepath.Dir(paths.Root)
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return nil
+	}
+	prefix := quarantinePrefix(paths)
+	var found []string
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
+			found = append(found, filepath.Join(parent, entry.Name()))
+		}
+	}
+	return found
+}
+
 func token() (string, error) {
 	buffer := make([]byte, 8)
 	if _, err := rand.Read(buffer); err != nil {
@@ -144,8 +167,7 @@ func Begin(paths config.Paths) (*Reset, error) {
 	if err != nil {
 		return nil, err
 	}
-	quarantine := filepath.Join(filepath.Dir(paths.Root),
-		"."+filepath.Base(paths.Root)+"-incompatible-"+suffix)
+	quarantine := filepath.Join(filepath.Dir(paths.Root), quarantinePrefix(paths)+suffix)
 	if _, err := os.Stat(quarantine); err == nil {
 		return nil, fmt.Errorf("%s already exists", quarantine)
 	}
@@ -182,15 +204,41 @@ func Begin(paths config.Paths) (*Reset, error) {
 		if name == "bin" || name == journalName {
 			continue
 		}
-		if err := os.Rename(filepath.Join(paths.Root, name), filepath.Join(quarantine, name)); err != nil {
-			return nil, reset.abort(err)
-		}
+		// The intent is recorded before the move, not after. A crash in the
+		// other order leaves a file sitting in the quarantine that the journal
+		// does not mention, so the recovery neither restores it nor knows to
+		// keep it - and then deletes the quarantine with the only copy in it.
 		reset.journal.Moved = append(reset.journal.Moved, name)
 		if err := reset.write(); err != nil {
 			return nil, reset.abort(err)
 		}
+		if err := os.Rename(filepath.Join(paths.Root, name), filepath.Join(quarantine, name)); err != nil {
+			return nil, reset.abort(err)
+		}
 	}
+	reset.keepSession()
 	return reset, nil
+}
+
+// keepSession copies a still-readable sign-in back into the fresh root.
+//
+// The meetings are a cache and can be fetched again; the session cannot, and
+// Commit deletes the quarantine for good. Without this a replacement silently
+// signed the user out - and worse, the caller still believed it was signed in,
+// so it never offered to sign in again.
+//
+// A session this build cannot parse is left behind, which is the case the
+// warning covers when it says a new sign-in may be needed.
+func (r *Reset) keepSession() {
+	stored := filepath.Join(r.journal.Quarantine, filepath.Base(r.paths.Session))
+	session, err := sana.LoadSession(stored)
+	if err != nil || !session.SignedIn() {
+		return
+	}
+	if err := sana.SaveSession(r.paths.Session, session); err != nil {
+		// Not fatal: the setup can still ask for a new sign-in.
+		return
+	}
 }
 
 func (r *Reset) write() error {
@@ -211,11 +259,26 @@ func (r *Reset) abort(cause error) error {
 }
 
 // Commit accepts the replacement and deletes what was moved aside.
+//
+// The decision is written down before any of it is carried out. Deleting first
+// meant a commit interrupted part-way looked exactly like a replacement that
+// never finished, so the next run rolled it back - restoring whatever survived
+// of the old state on top of the new one.
 func (r *Reset) Commit() error {
-	if err := os.RemoveAll(r.journal.Quarantine); err != nil {
+	if r.journal.State != "committed" {
+		r.journal.State = "committed"
+		// Best effort. A journal that cannot be updated must not stop the
+		// commit, or the setup finishes while the file on disk still says
+		// "quarantined" and the next run rolls the whole thing back.
+		_ = r.write()
+	}
+	// The journal goes before the data. With no journal there is nothing a
+	// later run can mistake for a replacement to undo, and a quarantine left
+	// behind by a crash here is listed by the uninstall under its own name.
+	if err := os.Remove(r.file); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return os.Remove(r.file)
+	return os.RemoveAll(r.journal.Quarantine)
 }
 
 // Rollback puts the original state back.
@@ -256,11 +319,22 @@ func Recover(paths config.Paths) error {
 		return err
 	}
 	var stored journal
-	if err := json.Unmarshal(payload, &stored); err != nil {
-		return fmt.Errorf("read %s: %w", file, err)
-	}
-	if stored.Root != paths.Root || !strings.Contains(stored.Quarantine, "-incompatible-") {
-		return fmt.Errorf("%s does not describe this installation", file)
+	unusable := json.Unmarshal(payload, &stored) != nil ||
+		stored.Root != paths.Root ||
+		!strings.Contains(stored.Quarantine, "-incompatible-")
+	if unusable {
+		// A journal that cannot be read describes nothing that can be undone.
+		// Refusing to continue wedged every later run of the installer with a
+		// message about a file it never mentioned by name; the data it might
+		// have described is still on disk under its own name, and the uninstall
+		// lists it.
+		if left := quarantines(paths); len(left) > 0 {
+			return fmt.Errorf(
+				"a previous setup left data in %s and %s cannot be read; "+
+					"move that data somewhere safe and delete %s to continue",
+				left[0], file, file)
+		}
+		return os.Remove(file)
 	}
 	reset := &Reset{paths: paths, file: file, journal: stored}
 	if stored.State == "committed" {

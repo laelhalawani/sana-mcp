@@ -40,12 +40,30 @@ func (b *browser) beginEdit() tea.Cmd {
 // lineAtScroll is the transcript line the top of the visible body is showing.
 // The document view scrolls rather than carrying a cursor, so the line being
 // read is the one being offered for editing.
+//
+// The scroll position counts drawn rows, and one long transcript line occupies
+// several of them, so the rows have to be walked rather than indexed - or the
+// editor opens on a line the reader is nowhere near.
 func (b *browser) lineAtScroll() (store.Line, bool) {
 	if len(b.transcript) == 0 {
 		return store.Line{}, false
 	}
-	index := max(0, min(len(b.transcript)-1, b.scroll))
-	return b.transcript[index], true
+	width := b.ui.Policy.Width()
+	row := 0
+	for index := range b.transcript {
+		// b.lines is what is on screen, marker and all. Re-rendering the line
+		// here instead missed the marker a corrected line carries, so one extra
+		// wrapped row put every line after it out by one.
+		drawn := 1
+		if index < len(b.lines) {
+			drawn = max(1, len(b.ui.Wrap(b.lines[index], width)))
+		}
+		if b.scroll < row+drawn {
+			return b.transcript[index], true
+		}
+		row += drawn
+	}
+	return b.transcript[len(b.transcript)-1], true
 }
 
 func (b *browser) originalText(lineNo int) string {
@@ -71,6 +89,12 @@ func (b *browser) editKey(key tea.KeyMsg, name string) tea.Cmd {
 	case "ctrl+s":
 		if strings.TrimSpace(b.editBuffer) == "" {
 			b.failure = "A line cannot be emptied. Press esc to leave it unchanged."
+			return nil
+		}
+		// Saving what is already stored is not a correction. Asking, and then
+		// reporting the store's refusal in red, made a no-op look like a fault.
+		if b.editBuffer == b.currentText(b.editLine) {
+			b.view = viewDetail
 			return nil
 		}
 		b.confirm = "save"
@@ -114,6 +138,7 @@ func (b *browser) historyKey(name string) tea.Cmd {
 		b.historyRow = tui.Wrap(b.historyRow, 1, len(b.history))
 	case "r":
 		if b.historyRow < len(b.history) {
+			b.failure = ""
 			b.confirm = "restore"
 		}
 	}
@@ -133,8 +158,12 @@ func (b *browser) confirmKey(name string) tea.Cmd {
 
 	switch pending {
 	case "save":
+		// The store's compare-and-swap is against the line as it stands now,
+		// not as Sana delivered it. Passing the original meant a line could be
+		// corrected exactly once: every later correction was rejected as a
+		// mismatch, on the very line the message named.
 		_, err := b.app.store.EditLine(
-			b.detailID, b.editLine, b.originalText(b.editLine), b.editBuffer, store.AuthorUser)
+			b.detailID, b.editLine, b.currentText(b.editLine), b.editBuffer, store.AuthorUser)
 		if err != nil {
 			b.failure = err.Error()
 			return nil
@@ -165,13 +194,23 @@ func (b *browser) reloadTranscript() {
 	}
 	b.transcript = lines
 	b.lines = transcriptLines(lines)
+	// The body changed, so the wrapped layout kept for it is stale. Without
+	// this a saved correction was not drawn until the next refresh a second
+	// later, which reads as the save having done nothing.
+	b.revision++
 }
 
-func (b *browser) viewEdit() string {
+func (b *browser) viewEdit(capacity int) string {
 	ui := b.ui
 	width := ui.Policy.Width()
 
-	body := []tui.Text{ui.Dim("As transcribed: " + b.originalText(b.editLine))}
+	// The original is wrapped like everything else. It was the one line left
+	// unwrapped, and being styled it escaped clipping too, so the row that
+	// exists to compare against was the only one running off the screen.
+	var body []tui.Text
+	for _, line := range ui.Wrap("As transcribed: "+b.originalText(b.editLine), width) {
+		body = append(body, ui.Dim(line))
+	}
 	body = append(body, "")
 	for _, line := range ui.Wrap(b.editBuffer, width) {
 		body = append(body, ui.Cyan(line))
@@ -186,10 +225,17 @@ func (b *browser) viewEdit() string {
 	if b.confirm != "" {
 		body = append(body, "", ui.Yellow(b.confirmQuestion()))
 	}
-	return ui.Screen(fmt.Sprintf("Edit line %d", b.editLine), body, "ctrl+s save  esc cancel")
+	// The question is the last thing added and the first thing a short terminal
+	// would drop. Keeping the end means the app never waits for an answer to
+	// something it did not show.
+	return ui.Screen(fmt.Sprintf("Edit line %d", b.editLine), tail(body, capacity),
+		"ctrl+s save  esc cancel")
 }
 
-func (b *browser) viewHistory() string {
+// historyEntry is how many rows one edit occupies.
+const historyEntry = 4
+
+func (b *browser) viewHistory(capacity int) string {
 	ui := b.ui
 	width := ui.Policy.Width()
 
@@ -197,7 +243,26 @@ func (b *browser) viewHistory() string {
 	if len(b.history) == 0 {
 		body = append(body, ui.Dim("Nothing in this meeting has been changed."))
 	}
-	for index, edit := range b.history {
+
+	// Reserve the rows the prompt and any error need, then show the entries
+	// around the cursor. Building the whole list and letting it be clipped put
+	// the selected entry and the confirmation off the bottom of the screen, so
+	// y reverted a line the user could not see.
+	reserved := 0
+	if b.failure != "" {
+		reserved++
+	}
+	if b.confirm != "" {
+		reserved++
+	}
+	entries := max(1, (max(0, capacity-reserved))/historyEntry)
+	top := max(0, min(b.historyRow-entries+1, max(0, len(b.history)-entries)))
+	if b.historyRow < top {
+		top = b.historyRow
+	}
+
+	for index := top; index < min(len(b.history), top+entries); index++ {
+		edit := b.history[index]
 		pointer := " "
 		if index == b.historyRow {
 			pointer = ui.Glyphs.Pointer
@@ -212,10 +277,13 @@ func (b *browser) viewHistory() string {
 			"",
 		)
 	}
+	if b.failure != "" {
+		body = append(body, ui.Red(ui.Truncate(b.failure, width)))
+	}
 	if b.confirm != "" {
 		body = append(body, ui.Yellow(b.confirmQuestion()))
 	}
-	return ui.Screen("Edits in "+b.title, body,
+	return ui.Screen("Edits in "+b.title, tail(body, capacity),
 		"up/down navigate  r restore what Sana delivered  esc transcript")
 }
 

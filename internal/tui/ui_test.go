@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/laelhalawani/sana-mcp/internal/render"
 )
 
 func colourPolicy() Policy {
@@ -128,16 +130,17 @@ func TestScreenClipsBodyToWhatFits(t *testing.T) {
 	}
 }
 
-func TestScreenLeavesStyledLinesUncut(t *testing.T) {
+func TestScreenCutsStyledLinesWithoutBreakingThem(t *testing.T) {
 	policy := colourPolicy()
 	policy.Columns = 12
 	policy.Rows = 5
 	ui := New(policy)
 
-	styled := ui.Green(ui.Truncate("a very long styled line", policy.Width()))
-	lines := strings.Split(ui.Screen("T", []Text{styled}, "f"), "\n")
-	// Truncating an already-styled line again would cut through its escape
-	// bytes and leave the rest of the screen coloured.
+	lines := strings.Split(ui.Screen("T", []Text{ui.Green("a very long styled line")}, "f"), "\n")
+	if render.StyledWidth(lines[1]) > policy.Width() {
+		t.Fatalf("a styled line overflowed: %q", lines[1])
+	}
+	// Cut through the escape bytes and the colour runs on down the screen.
 	if !strings.HasSuffix(lines[1], "\x1b[0m") {
 		t.Fatalf("a styled line lost its reset: %q", lines[1])
 	}
@@ -175,5 +178,49 @@ func TestWrapMovesTheCursorAndSurvivesAnEmptyList(t *testing.T) {
 	}
 	if got := Wrap(0, 1, 0); got != 0 {
 		t.Fatalf("an empty list must not divide by zero, got %d", got)
+	}
+}
+
+func TestScreenNeverExceedsTheWidth(t *testing.T) {
+	// Styled rows used to escape clipping entirely, so a coloured prompt or a
+	// long error overflowed, the terminal soft-wrapped it into an extra row,
+	// and the footer scrolled off the bottom. Each new styled row was a fresh
+	// chance to do it, so the rule is enforced here rather than per caller.
+	for _, columns := range []int{2, 4, 8, 12, 24, 40, 80} {
+		policy := colourPolicy()
+		policy.Columns = columns
+		policy.Rows = 8
+		ui := New(policy)
+
+		body := []Text{
+			ui.Yellow("Restore line 1 to what Sana delivered? [y/n]"),
+			ui.Dim("Nothing in this meeting has been changed."),
+			ui.Red("some very long failure message that will not fit at all"),
+			ui.Line("    ", ui.Dim("as transcribed:"), " ", "a fairly long original line"),
+			"plain text that is also much too long for a narrow terminal",
+		}
+		rendered := ui.Screen("A title that is itself too long to fit", body,
+			"up/down navigate  r restore what Sana delivered  esc transcript")
+
+		for index, line := range strings.Split(rendered, "\n") {
+			if got := render.StyledWidth(line); got > ui.Policy.Width() {
+				t.Errorf("columns=%d row %d is %d wide, limit %d: %q",
+					columns, index, got, ui.Policy.Width(), line)
+			}
+		}
+	}
+}
+
+func TestTruncatedStyledTextClosesItsStyle(t *testing.T) {
+	ui := New(colourPolicy())
+	cut := render.TruncateStyled(string(ui.Red("a long red sentence")), 8, "…")
+	if !strings.HasSuffix(cut, "\x1b[0m") {
+		t.Fatalf("a cut style must be closed, or it bleeds down the screen: %q", cut)
+	}
+	if render.StyledWidth(cut) > 8 {
+		t.Fatalf("cut to %d columns, limit 8: %q", render.StyledWidth(cut), cut)
+	}
+	if !strings.Contains(cut, "\x1b[31m") {
+		t.Fatalf("the style itself was lost: %q", cut)
 	}
 }

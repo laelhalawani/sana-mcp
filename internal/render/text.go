@@ -278,6 +278,96 @@ func Truncate(value string, width int, marker string) string {
 	return takeWidth(text, width-markerWidth) + safeMarker
 }
 
+// TruncateStyled cuts text to a display width, passing escape sequences through
+// without counting them and closing any style it leaves open.
+//
+// Truncation used to be skipped for styled text, because cutting it naively
+// severs an escape sequence and bleeds colour across the rest of the screen.
+// Skipping meant every styled row was free to overflow the terminal, which
+// soft-wraps it, pushes the layout down a line and scrolls the footer off - and
+// each new styled row was a fresh chance to do it. Counting only what is drawn
+// removes the whole class.
+func TruncateStyled(value string, width int, marker string) string {
+	if width <= 0 {
+		return ""
+	}
+	if !strings.Contains(value, "\x1b[") {
+		return Truncate(value, width, marker)
+	}
+	if StyledWidth(value) <= width {
+		return value
+	}
+	safeMarker := Sanitize(marker)
+	markerWidth := safeDisplayWidth(safeMarker)
+	if markerWidth >= width {
+		// No room for both, so the marker is what gets cut - the same rule
+		// Truncate follows. Appending it whole made the row wider than the
+		// width it had just been cut to.
+		return takeWidth(safeMarker, width)
+	}
+	budget := max(0, width-markerWidth)
+
+	var out strings.Builder
+	used := 0
+	styled := false
+	runes := []rune(value)
+	for index := 0; index < len(runes); {
+		if runes[index] == 0x1b {
+			end := consumeCSI(runes, index+2)
+			if index+1 < len(runes) && runes[index+1] != 0x5b {
+				end = min(len(runes), index+2)
+			}
+			out.WriteString(string(runes[index:end]))
+			styled = true
+			index = end
+			continue
+		}
+		// A whole cluster at a time. Measuring rune by rune counted each part
+		// of a ZWJ sequence as its own character, and cut the sequence in half.
+		cluster := nextCluster(runes, index)
+		next := graphemeWidth(cluster)
+		if used+next > budget {
+			break
+		}
+		out.WriteString(cluster)
+		used += next
+		index += len([]rune(cluster))
+	}
+	out.WriteString(safeMarker)
+	if styled {
+		// Whatever was open when the cut happened is closed here, or the colour
+		// runs on into the rest of the screen.
+		out.WriteString("\x1b[0m")
+	}
+	return out.String()
+}
+
+// nextCluster is the grapheme cluster starting at index, stopping before any
+// escape sequence so styling never lands inside one.
+func nextCluster(runes []rune, index int) string {
+	end := index + 1
+	for end < len(runes) && runes[end] != 0x1b {
+		next := runes[end]
+		if unicode.Is(unicode.M, next) || next == 0xfe0e || next == 0xfe0f || isSkinTone(next) {
+			end++
+			continue
+		}
+		if next == 0x200d && end+1 < len(runes) && runes[end+1] != 0x1b {
+			end += 2
+			continue
+		}
+		if isRegionalIndicator(runes[index]) && isRegionalIndicator(next) && end == index+1 {
+			end++
+			continue
+		}
+		break
+	}
+	return string(runes[index:end])
+}
+
+// StyledWidth is the display width of text that may carry escape sequences.
+func StyledWidth(value string) int { return safeDisplayWidth(Sanitize(StripSequences(value))) }
+
 // hardWrapToken breaks a single token that is wider than the line. A grapheme
 // too wide to ever fit becomes the overflow marker rather than being dropped.
 func hardWrapToken(token string, width int, overflow string) []string {
@@ -374,7 +464,13 @@ func Wrap(value string, width int, overflow string) []string {
 			current = pieces[len(pieces)-1]
 			currentWidth = safeDisplayWidth(current)
 		}
-		output = append(output, strings.TrimRight(current, " \t"))
+		// A trailing space run flushes the line and leaves current empty, so
+		// appending unconditionally invents a blank row - which also inflates
+		// the row count a scroll limit is computed from.
+		if trimmed := strings.TrimRight(current, " \t"); trimmed != "" || len(output) == 0 ||
+			currentWidth > 0 {
+			output = append(output, trimmed)
+		}
 	}
 	return output
 }

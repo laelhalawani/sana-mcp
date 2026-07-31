@@ -11,13 +11,19 @@ the Go code is wrong.
 
 ## Status
 
-The port described here has been carried out. `internal/tui` holds the
+The port described here has been carried out, with one correction to its own
+premise: the **installer** follows interactive-terminal-mcp - one program whose
+screen evolves in place, a bold blue header, short section lines, ` · ` footers
+- while the **application's** screens follow the TypeScript original described
+below. Building the installer as scrolling prints, as the original did, left
+each finished question stranded above the current one.
+
+`internal/tui` holds the
 primitives (policy, both glyph sets, both spinner sets, raw SGR colour, the
 composition helpers and the screen layout), `internal/render/text.go` the text
 primitives, `internal/statusview` the one sync-status screen in its two modes,
 and `internal/app` the menu, browser, documents, filters, help and search. The
-installer prints as it goes and owns only the wizard and the final progress
-screen. The alternate screen is gone.
+alternate screen is gone.
 
 Two things here are new rather than restored, both of them fixes for what the
 port going wrong actually cost:
