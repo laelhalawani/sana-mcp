@@ -43,6 +43,8 @@ type model struct {
 	harnesses []Harness
 	selected  map[detectharness.ID]bool
 	cursor    int
+	showAll   bool
+	message   string
 
 	results []detectharness.Result
 
@@ -106,6 +108,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected[harness.ID] = true
 			}
 		}
+		m.cursor = m.firstVisible()
 		m.step = stepHarnesses
 		return m, nil
 
@@ -162,28 +165,16 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case stepHarnesses:
 		switch key.String() {
 		case "up", "k":
-			m.cursor = tui.Wrap(m.cursor, -1, len(m.harnesses))
+			m.moveCursor(-1)
 		case "down", "j":
-			m.cursor = tui.Wrap(m.cursor, 1, len(m.harnesses))
+			m.moveCursor(1)
+		case "v":
+			m.showAll = !m.showAll
+			m.cursor = m.firstVisible()
 		case " ":
-			if m.cursor < len(m.harnesses) {
-				harness := m.harnesses[m.cursor]
-				if harness.Selectable() {
-					m.selected[harness.ID] = !m.selected[harness.ID]
-				}
-			}
+			m.toggle()
 		case "a":
-			allOn := true
-			for _, harness := range m.harnesses {
-				if harness.Selectable() && !m.selected[harness.ID] {
-					allOn = false
-				}
-			}
-			for _, harness := range m.harnesses {
-				if harness.Selectable() {
-					m.selected[harness.ID] = !allOn
-				}
-			}
+			m.toggleAll()
 		case "enter":
 			m.step = stepApplying
 			return m, m.apply()
@@ -239,6 +230,134 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// visible is which harnesses earn a line.
+//
+// A client is worth showing if it is here, or if this tool is already
+// registered with it. Everything else is behind v: a list of thirteen clients,
+// eleven of them "not detected", tells the user nothing they asked for.
+func (m model) visible() []int {
+	var indices []int
+	for index, harness := range m.harnesses {
+		if harness.State == detectharness.Detected || harness.Configured || m.showAll {
+			indices = append(indices, index)
+		}
+	}
+	return indices
+}
+
+func (m model) firstVisible() int {
+	if indices := m.visible(); len(indices) > 0 {
+		return indices[0]
+	}
+	return 0
+}
+
+// moveCursor walks the visible rows, so hidden clients are skipped rather than
+// silently landed on.
+func (m *model) moveCursor(direction int) {
+	indices := m.visible()
+	if len(indices) == 0 {
+		return
+	}
+	position := 0
+	for index, value := range indices {
+		if value == m.cursor {
+			position = index
+		}
+	}
+	position += direction
+	if position < 0 {
+		position = len(indices) - 1
+	}
+	if position >= len(indices) {
+		position = 0
+	}
+	m.cursor = indices[position]
+}
+
+func (m *model) toggle() {
+	if m.cursor >= len(m.harnesses) {
+		return
+	}
+	harness := m.harnesses[m.cursor]
+	if !harness.Selectable() {
+		m.message = harness.Name + " could not be inspected, so it cannot be changed."
+		return
+	}
+	m.selected[harness.ID] = !m.selected[harness.ID]
+	m.message = ""
+}
+
+func (m *model) toggleAll() {
+	anyUnselected := false
+	for _, harness := range m.harnesses {
+		if harness.Selectable() && !m.selected[harness.ID] {
+			anyUnselected = true
+			break
+		}
+	}
+	for _, harness := range m.harnesses {
+		if harness.Selectable() {
+			m.selected[harness.ID] = anyUnselected
+		}
+	}
+	if anyUnselected {
+		m.message = "Selected every detected client."
+	} else {
+		m.message = "Cleared every client."
+	}
+}
+
+// header matches the installer script's own output: a leading blank line and a
+// two-space indent, so the download and the setup read as one thing rather than
+// two programs taking turns.
+func header() string {
+	return "\n" + tui.Title.Render("  sana-mcp setup") + "\n"
+}
+
+func (m model) viewHarnesses() string {
+	var out strings.Builder
+	out.WriteString("\n  AI clients — which should be able to read your meetings?\n\n")
+
+	indices := m.visible()
+	if len(indices) == 0 {
+		out.WriteString(tui.Dim.Render(
+			"  No AI clients detected. Install one, then run\n  `sana-mcp configure`.\n"))
+	}
+	for _, index := range indices {
+		harness := m.harnesses[index]
+		cursor := " "
+		if index == m.cursor && harness.Selectable() {
+			cursor = tui.Cursor.Render(">")
+		}
+		mark := tui.Off.Render("○")
+		if !harness.Selectable() {
+			mark = tui.Dim.Render("·")
+		} else if m.selected[harness.ID] {
+			mark = tui.On.Render("●")
+		}
+		line := fmt.Sprintf("%-22s %s", harness.Name, tui.Dim.Render(harness.StatusText()))
+		if !harness.Selectable() {
+			line = tui.Dim.Render(fmt.Sprintf("%-22s ", harness.Name)) + tui.Warn.Render(harness.StatusText())
+		}
+		fmt.Fprintf(&out, " %s %s %s\n", cursor, mark, line)
+	}
+
+	hidden := len(m.harnesses) - len(indices)
+	if hidden > 0 && !m.showAll {
+		out.WriteString("\n" + tui.Dim.Render(
+			fmt.Sprintf("  press v to show %d client(s) that are not installed", hidden)))
+	} else if m.showAll {
+		out.WriteString("\n" + tui.Dim.Render("  press v to hide clients that are not installed"))
+	}
+	if m.message != "" {
+		out.WriteString("\n\n  " + m.message)
+	}
+	out.WriteString("\n\n" + tui.Footer.Render(
+		"  ↑↓ move · space toggle · a all/none · v show all · enter continue · q cancel"))
+	return out.String()
 }
 
 func (m model) apply() tea.Cmd {
@@ -312,42 +431,14 @@ func (m model) readStatus() tea.Cmd {
 
 func (m model) View() string {
 	var out strings.Builder
-	out.WriteString(tui.Title.Render("sana-mcp setup") + "\n\n")
+	out.WriteString(header())
 
 	switch m.step {
 	case stepDetecting:
 		fmt.Fprintf(&out, "  %s Looking for AI clients...\n", m.spinner())
 
 	case stepHarnesses:
-		out.WriteString("  Configure sana-mcp for your AI clients\n\n")
-		for index, harness := range m.harnesses {
-			// Padding is applied to the plain name before any styling: colour
-			// codes count toward a %-24s width and would ragged the column.
-			name := fmt.Sprintf("%-26s", harness.Name)
-			pointer := " "
-			box := "( )"
-			switch {
-			case !harness.Selectable():
-				// A harness that cannot be inspected or written is shown so the
-				// user knows it was considered, but reads as "not detected":
-				// they want to know whether it is there, not why the library
-				// could not reach it.
-				out.WriteString(tui.Dim.Render(
-					fmt.Sprintf("    ( ) %s%s", name, harness.StatusText())) + "\n")
-				continue
-			case m.selected[harness.ID]:
-				box = tui.On.Render("(x)")
-			}
-			if index == m.cursor {
-				pointer = tui.Cursor.Render(">")
-				name = tui.Cursor.Render(name)
-			}
-			fmt.Fprintf(&out, "  %s %s %s%s\n",
-				pointer, box, name, tui.Dim.Render(harness.StatusText()))
-		}
-		out.WriteString("\n" + tui.Dim.Render(
-			"  up/down move  space toggle  a all  enter confirm  esc cancel") + "\n")
-
+		out.WriteString(m.viewHarnesses())
 	case stepApplying:
 		fmt.Fprintf(&out, "  %s Writing client configuration...\n", m.spinner())
 
