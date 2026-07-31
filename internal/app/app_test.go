@@ -545,3 +545,42 @@ func TestUnreadableStateIsNotReportedAsZeroMeetings(t *testing.T) {
 		t.Fatalf("the reason must be shown:\n%s", lines)
 	}
 }
+
+func TestEveryMenuActionIsDispatched(t *testing.T) {
+	// "Sign in to Sana" emitted an action dispatch had no case for, so choosing
+	// it fell through the switch and redrew the menu: navigation worked and
+	// nothing happened. Menus and the switch are written in different places,
+	// so the two are tied together here rather than by eye.
+	handled := map[string]bool{}
+	source, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(source)
+	start := strings.Index(body, "func (a *application) dispatch(")
+	if start < 0 {
+		t.Fatal("dispatch is gone; this test needs rewriting")
+	}
+	for _, line := range strings.Split(body[start:], "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "case \"") {
+			continue
+		}
+		for _, part := range strings.Split(strings.TrimSuffix(
+			strings.TrimPrefix(trimmed, "case "), ":"), ",") {
+			handled[strings.Trim(strings.TrimSpace(part), "\"")] = true
+		}
+	}
+
+	var menus [][]choice
+	menus = append(menus, signedOutChoices(false), signedOutChoices(true),
+		signedInChoices(false), signedInChoices(true))
+	for _, menu := range menus {
+		for _, item := range menu {
+			if !handled[item.action] {
+				t.Errorf("menu entry %q emits %q, which dispatch ignores",
+					item.label, item.action)
+			}
+		}
+	}
+}
