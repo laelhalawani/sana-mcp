@@ -96,12 +96,22 @@ CREATE VIRTUAL TABLE line_search USING fts5(
 );
 ```
 
-**Both texts are indexed on purpose.** Searching "Fabrix" must find a corrected
-line; searching "Fabrik" must still find what was actually said. Both are true
-statements about that line. Keeping the two spellings attached to one line is
-what an alias table could not do - an alias equates the terms *globally*, which
-is wrong, because `Fabrik` denotes a person in ~90 of its 101 occurrences in a
-real corpus. BM25 weights `text` above `original_text`.
+**Both texts are indexed, but not equally.** Searching "Fabrix" must find a
+corrected line; searching "Fabrik" should still reach what was actually said.
+Keeping both spellings on one row is what an alias table could not do - an alias
+equates the terms *globally*, which is wrong, because `Fabrik` denotes a person in
+~90 of its 101 occurrences in a real corpus.
+
+The current text is **strongly** preferred. Almost nobody searches for how a word
+was mispronounced, so the original must never obscure correct results:
+
+```sql
+bm25(line_search, 0.0, 0.0, 10.0, 0.5)
+--                 ^id  ^line ^text ^original_text
+```
+
+A 20:1 weighting. An original-only match still ranks, but below every current-text
+match, so it acts as a last resort rather than competing with real hits.
 
 ## 5. Correction model
 
@@ -112,10 +122,13 @@ the local copy is the primitive, with four rules.
 current text and the full edit history both live beside it, so every edit is
 visible and reversible.
 
-**Compare-and-swap.** An edit supplies the *entire* existing line and applies
-only if it matches exactly. An agent cannot edit a line it misread, or one that
-shifted under it. The same identity is used in storage: edits are keyed by
-`original_sha256`, not by line number alone.
+**Compare-and-swap, addressed by line number.** Every tool and every screen
+addresses a line the way the rest of the contract already does: by
+`meeting_id` + 1-based `line_no`. The edit call also supplies the *entire*
+existing line text, and applies only if it matches - so an agent cannot edit a
+line it misread. The content hash is an **internal** durability detail used only
+to re-locate edits after a re-download (§6); it never appears in a tool
+signature or on screen.
 
 **Explicit permission, backed by reversibility.** The tool description states
 that transcripts are full of real names that only look misspelled, and that no
@@ -130,7 +143,69 @@ had 11 lines to fix. The TUI and the tool both offer "apply to every occurrence
 in this meeting" with a preview of the affected lines. Meeting-scoped, never
 global - global is exactly the alias mistake.
 
-## 6. Sync and re-download
+## 6. Sync: states, progress, and how it is shown
+
+The TypeScript behaviour is the specification here; it is good and must be kept.
+
+**Phase state machine**, persisted in `sync_state`:
+
+| Phase | Meaning | Shown to a person as |
+|---|---|---|
+| `idle` | never synced | "Waiting to start" |
+| `listing` | fetching the meeting list | "Discovering meetings" |
+| `downloading` | fetching transcripts | "Syncing meetings" |
+| `synced` | caught up | "Up to date" |
+| `needs_login` | session absent or expired | "Sign in required" / "Sana session expired" |
+| `error` | sync needs attention | "Sync needs attention" |
+
+**Progress metrics**, all read in one transaction so a snapshot is internally
+consistent: `transcripts_done` / `transcripts_total`, `remaining`, `eta_minutes`,
+`meetings` (fully downloaded, transcript *and* metadata), `meetings_total`
+(discovered from Sana, including still-pending rows), and `retrying`.
+
+**Sync starts during install, and the installer waits on it visibly.** After
+clients are configured and sign-in succeeds, an interactive install shows a live
+status view that polls the snapshot and renders a bar:
+
+```
+Syncing meetings
+[##########--------------]  103/240 transcripts   ~4 min left
+```
+
+It exits when the phase reaches `synced` with `remaining == 0`, or when the user
+presses enter to leave it running. Then:
+
+```
+Meeting sync complete.                     (green, when synced)
+Meeting sync continues in the background.  (otherwise)
+Reload  restart Claude Code sessions
+Run: sana-mcp
+```
+
+A non-interactive install (piped, `--yes`, CI) never renders the live view and
+prints the static summary instead - the same four lines the current installer
+produces:
+
+```
+sana-mcp setup
+AI clients  2 connected
+Sana account  signed in
+Meeting sync  complete | continuing in background
+Reload  restart Claude Code sessions
+Next: sana-mcp
+```
+
+**Resync** is the daemon polling every `sync_interval_minutes` (default 15): list
+meetings, insert new rows, fetch transcripts for anything not yet complete, retry
+what previously failed. Incomplete meetings never block ready ones - a meeting
+still processing upstream is listed with its status and picked up on a later
+cycle.
+
+**The same snapshot backs every surface**: the installer's live view, the TUI
+"Sync status" screen, `sana-mcp status`, and the `status` tool. One model, four
+renderers - no second source of truth about progress.
+
+## 7. Re-download
 
 Two rules, in this order.
 
@@ -160,7 +235,7 @@ becomes a store holding user-owned data. Deleting `sana.db` today loses nothing;
 after this it loses corrections. Backup, reset, and any "incompatible state"
 recovery path must treat `line_edits` as data to preserve, not cache to discard.
 
-## 7. Search
+## 8. Search
 
 Ordered by what the measurements support. Full evidence in `../plan.md`.
 
@@ -187,7 +262,7 @@ automatic detection method was measured and failed, so a garbled name is only
 correctable once noticed by some other route. What correction buys is that the
 fix is durable and shared by every later search of that transcript.
 
-## 8. Package layout
+## 9. Package layout
 
 ```
 main.go                  entrypoint and mode dispatch
