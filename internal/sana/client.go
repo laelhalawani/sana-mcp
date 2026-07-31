@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"time"
@@ -51,11 +52,16 @@ func New(baseURL string, session *Session) *Client {
 	if session != nil {
 		workspaceID = session.WorkspaceID
 	}
-	return &Client{
+	// A real jar is required, not just a header: Sana establishes the session
+	// across the CSRF and sign-in-link exchange, so Set-Cookie from one response
+	// has to reach the next request.
+	jar, _ := cookiejar.New(nil)
+	client := &Client{
 		baseURL:     strings.TrimRight(baseURL, "/"),
 		session:     session,
 		workspaceID: workspaceID,
 		http: &http.Client{
+			Jar:     jar,
 			Timeout: 60 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// Credentials must never follow a redirect off the configured
@@ -67,6 +73,44 @@ func New(baseURL string, session *Session) *Client {
 			},
 		},
 	}
+	client.seedJar()
+	return client
+}
+
+// seedJar puts the stored session cookies into the jar, so a resumed session
+// and a freshly established one take exactly the same code path.
+func (c *Client) seedJar() {
+	if c.session == nil || len(c.session.Cookies) == 0 {
+		return
+	}
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return
+	}
+	var cookies []*http.Cookie
+	for name, value := range c.session.Cookies {
+		cookies = append(cookies, &http.Cookie{Name: name, Value: value, Path: "/"})
+	}
+	c.http.Jar.SetCookies(base, cookies)
+}
+
+// Cookies returns the jar's cookies for this origin, which is what gets
+// persisted as the session.
+func (c *Client) Cookies() map[string]string {
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil
+	}
+	cookies := map[string]string{}
+	for _, cookie := range c.http.Jar.Cookies(base) {
+		cookies[cookie.Name] = cookie.Value
+	}
+	return cookies
+}
+
+// hasAuthCookie reports whether the jar currently holds a session cookie.
+func (c *Client) hasAuthCookie() bool {
+	return c.Cookies()[SessionCookie] != ""
 }
 
 // Session is the persisted sign-in state.
@@ -92,11 +136,7 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body io.R
 	if c.workspaceID != "" {
 		request.Header.Set("sana-ai-workspace-id", c.workspaceID)
 	}
-	if c.session != nil {
-		for name, value := range c.session.Cookies {
-			request.AddCookie(&http.Cookie{Name: name, Value: value})
-		}
-	}
+	// Cookies come from the jar, which http.Client attaches itself.
 	return request, nil
 }
 
