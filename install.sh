@@ -1,6 +1,6 @@
 #!/bin/sh
 # sana-mcp installer (Linux / macOS). Run with:
-#   curl -fsSL https://github.com/laelhalawani/sana-mcp/raw/main/install.sh | sh
+#   curl -fsSL https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.sh | sh
 set -e
 
 OWNER="laelhalawani"
