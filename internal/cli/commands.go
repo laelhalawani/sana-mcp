@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 
 	"fmt"
 	"os"
@@ -153,12 +154,78 @@ func runDocument(database *store.Store, command Command, options Options) int {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1
 	}
+	// These are rendered rather than dumped. The stored documents are the raw
+	// JSON Sana returned, which is the right thing to keep but the wrong thing
+	// to show a person at a terminal.
 	if command.Name == "summary" {
-		fmt.Fprintln(options.Stdout, summaryJSON)
-	} else {
-		fmt.Fprintln(options.Stdout, participantsJSON)
+		var metadata sana.Metadata
+		if err := json.Unmarshal([]byte(summaryJSON), &metadata); err != nil {
+			fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+			return 1
+		}
+		fmt.Fprint(options.Stdout, renderSummary(metadata))
+		return 0
 	}
+	var participants []sana.Participant
+	if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
+		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+		return 1
+	}
+	fmt.Fprint(options.Stdout, renderParticipants(participants))
 	return 0
+}
+
+// renderSummary lays out a meeting's summary document as plain text.
+func renderSummary(metadata sana.Metadata) string {
+	var out strings.Builder
+	if metadata.Summary != nil && strings.TrimSpace(*metadata.Summary) != "" {
+		out.WriteString(strings.TrimSpace(*metadata.Summary) + "\n\n")
+	}
+	for _, group := range metadata.Notes {
+		fmt.Fprintf(&out, "%s\n", group.Topic)
+		for _, note := range group.Notes {
+			fmt.Fprintf(&out, "  - %s\n", note)
+		}
+		out.WriteString("\n")
+	}
+	if len(metadata.ActionItems) > 0 {
+		out.WriteString("Action items\n")
+		for _, item := range metadata.ActionItems {
+			assignee := ""
+			if item.AssignedTo != nil && *item.AssignedTo != "" {
+				assignee = *item.AssignedTo + ": "
+			}
+			due := ""
+			if item.DueDate != nil && *item.DueDate != "" {
+				due = " (due " + *item.DueDate + ")"
+			}
+			fmt.Fprintf(&out, "  - %s%s%s\n", assignee, item.Action, due)
+		}
+	}
+	if out.Len() == 0 {
+		return "This meeting has no summary yet.\n"
+	}
+	return out.String()
+}
+
+// renderParticipants lists attendees as plain text.
+func renderParticipants(participants []sana.Participant) string {
+	if len(participants) == 0 {
+		return "No participants are recorded for this meeting.\n"
+	}
+	var out strings.Builder
+	for _, participant := range participants {
+		email := ""
+		if participant.Email != nil && *participant.Email != "" {
+			email = "  " + *participant.Email
+		}
+		host := ""
+		if participant.IsHost {
+			host = "  (host)"
+		}
+		fmt.Fprintf(&out, "%s%s%s\n", participant.DisplayName, email, host)
+	}
+	return out.String()
 }
 
 func runRecording(ctx context.Context, runtime *bootstrap.Runtime, command Command, options Options) int {

@@ -116,6 +116,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		interval = 15 * time.Minute
 	}
 	for {
+		before, _ := s.store.Status()
 		if err := s.SyncOnce(ctx); err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -123,12 +124,11 @@ func (s *Server) Serve(ctx context.Context) error {
 			s.logf("sync failed: %v", err)
 			s.store.SetError(err.Error())
 		}
-		// A cycle fetches a bounded batch, so a first sync of hundreds of
-		// meetings needs many of them. Waiting the poll interval between
-		// batches would turn a backfill into hours of idling; only wait once
-		// there is nothing left to fetch.
-		if status, err := s.store.Status(); err == nil && !status.Complete() &&
-			status.Phase == store.PhaseDownloading {
+		after, err := s.store.Status()
+		if err != nil {
+			after = before
+		}
+		if backfilling(before, after) {
 			select {
 			case <-ctx.Done():
 				return nil
@@ -142,6 +142,25 @@ func (s *Server) Serve(ctx context.Context) error {
 		case <-time.After(interval):
 		}
 	}
+}
+
+// backfilling reports whether the last cycle should be followed immediately by
+// another, rather than waiting for the poll interval.
+//
+// A cycle fetches a bounded batch, so a first sync of hundreds of meetings
+// needs many of them, and waiting between batches would turn a backfill into
+// hours of idling. But "work remains" is not sufficient on its own: when every
+// pending transcript fails - a meeting Sana will not serve, a network that is
+// down - work remains forever, and looping on that alone is a hot loop that
+// hammers the API, spins the CPU, and fills the log.
+//
+// So the condition is progress, not pending work. If a cycle stored nothing new,
+// the daemon waits, and the next interval retries what failed.
+func backfilling(before, after store.Status) bool {
+	if after.Complete() || after.Phase != store.PhaseDownloading {
+		return false
+	}
+	return after.TranscriptsDone > before.TranscriptsDone
 }
 
 // SyncOnce runs one full cycle: discover meetings, then fetch the transcripts
