@@ -223,6 +223,6 @@ func (s *Store) PendingMetadata(limit int) ([]string, error) {
 	return s.meetingIDs(
 		`SELECT m.meeting_id FROM meetings m
 		   LEFT JOIN meeting_metadata d ON d.meeting_id = m.meeting_id
-		  WHERE m.status = 'ready' AND d.meeting_id IS NULL
-		  ORDER BY m.created_ms DESC LIMIT ?`, limit)
+		  WHERE m.status = ? AND d.meeting_id IS NULL
+		  ORDER BY m.created_ms DESC LIMIT ?`, StatusReady, limit)
 }

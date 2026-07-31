@@ -10,6 +10,7 @@ import (
 	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
+	"github.com/laelhalawani/sana-mcp/internal/tui"
 )
 
 // menuItems pairs each label with the screen it opens, so the two cannot drift
@@ -207,8 +208,8 @@ func (m model) pageSize() int {
 // styles gives the shared renderer this application's colours.
 func (m model) styles() render.Styles {
 	return render.Styles{
-		Heading: func(text string) string { return render.Title.Render(text) },
-		Dim:     func(text string) string { return render.Dim.Render(text) },
-		Accent:  func(text string) string { return render.On.Render(text) },
+		Heading: func(text string) string { return tui.Title.Render(text) },
+		Dim:     func(text string) string { return tui.Dim.Render(text) },
+		Accent:  func(text string) string { return tui.On.Render(text) },
 	}
 }
