@@ -20,8 +20,10 @@ var (
 	Dim    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	Cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 	On     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	Off    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	Failed = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	Warn   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	Footer = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 )
 
 // Wrap moves a cursor within a list, wrapping at both ends. An empty list
