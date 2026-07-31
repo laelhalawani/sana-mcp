@@ -51,19 +51,17 @@ func (s *Store) Search(query string, limit, offset int, sort string) ([]Hit, err
 	// ms for a query matching 1,359 lines, against 4.0 ms this way, and 112 ms
 	// against 34 ms for a very common word. Only the sorts that need a column
 	// from meetings pull that table into the ranking step.
-	ranked := `SELECT ls.meeting_id, ls.line_no, bm25(line_search, ` + bm25Weights + `) AS score
-	             FROM line_search ls
-	            WHERE line_search MATCH ?
-	            ORDER BY score
-	            LIMIT ? OFFSET ?`
+	// The sorted variants need the meetings table inside the ranking step
+	// because it carries the sort key; relevance does not.
+	join := ""
 	if sort == SortNewest || sort == SortOldest {
-		ranked = `SELECT ls.meeting_id, ls.line_no, bm25(line_search, ` + bm25Weights + `) AS score
-		            FROM line_search ls
-		            JOIN meetings m ON m.meeting_id = ls.meeting_id
-		           WHERE line_search MATCH ?
-		           ORDER BY ` + rankedOrder + `
-		           LIMIT ? OFFSET ?`
+		join = "JOIN meetings m ON m.meeting_id = ls.meeting_id"
 	}
+	ranked := `SELECT ls.meeting_id, ls.line_no, bm25(line_search, ` + bm25Weights + `) AS score
+	             FROM line_search ls ` + join + `
+	            WHERE line_search MATCH ?
+	            ORDER BY ` + rankedOrder + `
+	            LIMIT ? OFFSET ?`
 	rows, err := s.db.Query(
 		`WITH page AS (`+ranked+`)
 		 SELECT page.meeting_id, m.title, page.line_no, l.text, m.created_ms

@@ -39,6 +39,23 @@ const transcriptBatch = 25
 // autostart check cannot disagree about which file is the lock.
 func newLock(path string) *flock.Flock { return flock.New(path) }
 
+// daemonRunning reports whether a daemon holds the lock, without taking it.
+//
+// Callers differ only in what they do when the answer cannot be determined, so
+// the probe itself has one definition.
+func daemonRunning(path string) (bool, error) {
+	lock := newLock(path)
+	held, err := lock.TryLock()
+	if err != nil {
+		return false, err
+	}
+	if held {
+		lock.Unlock()
+		return false, nil
+	}
+	return true, nil
+}
+
 // Server is a running sync daemon.
 type Server struct {
 	runtime *bootstrap.Runtime
@@ -427,17 +444,12 @@ func linesFrom(segments []sana.Segment) []store.Line {
 // The lock file is the only handle on the daemon, so "is it running" is exactly
 // "can the lock be taken".
 func Stop(ctx context.Context, runtime *bootstrap.Runtime) (bool, error) {
-	lock := newLock(runtime.Paths.Lock)
-	held, err := lock.TryLock()
+	running, err := daemonRunning(runtime.Paths.Lock)
 	if err != nil {
 		return false, err
 	}
-	if held {
-		lock.Unlock()
+	if !running {
 		return false, nil
 	}
 	return stopByPID(runtime.Paths.PID)
 }
-
-// Status returns the current sync snapshot.
-func (s *Server) Status() (store.Status, error) { return s.store.Status() }

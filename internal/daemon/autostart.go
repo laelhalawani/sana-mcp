@@ -26,7 +26,8 @@ func EnsureRunning(runtime *bootstrap.Runtime) {
 	if err != nil || !session.SignedIn() {
 		return
 	}
-	if running(runtime) {
+	// Unable to tell means assume one is running, rather than start a second.
+	if running, err := daemonRunning(runtime.Paths.Lock); err != nil || running {
 		return
 	}
 	command := exec.Command(runtime.Executable, "daemon", "--detach")
@@ -37,19 +38,4 @@ func EnsureRunning(runtime *bootstrap.Runtime) {
 	// The child is not waited on: it outlives this process by design. Releasing
 	// it avoids leaving a zombie for the parent's lifetime.
 	go command.Process.Release()
-}
-
-// running reports whether a daemon holds the lock.
-func running(runtime *bootstrap.Runtime) bool {
-	lock := newLock(runtime.Paths.Lock)
-	held, err := lock.TryLock()
-	if err != nil {
-		// Unable to tell; assume one is running rather than start a second.
-		return true
-	}
-	if held {
-		lock.Unlock()
-		return false
-	}
-	return true
 }

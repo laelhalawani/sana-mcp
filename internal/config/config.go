@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/laelhalawani/sana-mcp/internal/fsx"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -79,6 +78,8 @@ func Default() Config {
 func File(paths Paths) string { return filepath.Join(paths.Root, "config.toml") }
 
 // Load reads the settings, falling back to defaults when none are stored yet.
+// Nothing writes this file: it exists so a person can change the sync interval
+// by hand, which is the only setting worth changing today.
 //
 // A malformed file is reported rather than silently replaced with defaults: a
 // person who edited it by hand should be told, not have their file ignored.
@@ -100,15 +101,4 @@ func Load(paths Paths) (Config, error) {
 	}
 	settings.Version = currentVersion
 	return settings, nil
-}
-
-// Save writes the settings atomically, so an interrupted write cannot leave a
-// half-written file that then fails to parse.
-func Save(paths Paths, settings Config) error {
-	settings.Version = currentVersion
-	payload, err := toml.Marshal(settings)
-	if err != nil {
-		return err
-	}
-	return fsx.WriteAtomic(File(paths), payload, 0o600)
 }

@@ -47,7 +47,6 @@ type model struct {
 
 	signedIn bool
 	email    string
-	code     string
 	pending  sana.PendingSignIn
 	input    string
 	failure  string
@@ -219,7 +218,6 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.input = ""
 				return m, m.requestCode(value)
 			}
-			m.code = value
 			m.input = ""
 			return m, m.submitCode(value)
 		case tea.KeyBackspace:

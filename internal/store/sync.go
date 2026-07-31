@@ -113,24 +113,11 @@ func (s *Store) SetError(message string) error {
 // PendingTranscripts returns the meetings whose transcripts still need
 // fetching, newest first, so a person sees recent meetings appear soonest.
 func (s *Store) PendingTranscripts(limit int) ([]string, error) {
-	rows, err := s.db.Query(
+	return s.meetingIDs(
 		`SELECT meeting_id FROM meetings
 		  WHERE status = 'ready' AND transcript_state != ?
 		  ORDER BY created_ms DESC
 		  LIMIT ?`,
 		TranscriptComplete, limit,
 	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
 }
