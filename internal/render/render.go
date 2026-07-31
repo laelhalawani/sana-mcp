@@ -165,15 +165,14 @@ func StatusLabel(status store.Status) string {
 	return "Syncing meetings"
 }
 
-// ProgressBar draws a fixed-width bar. An unknown total renders as an empty
-// bar rather than a full one, and keeps its frame so the layout does not jump
-// when the first count arrives.
+// ProgressBar draws a fixed-width bar. An unknown total renders as nothing at
+// all: a frame with no fill reads as "zero of zero done", which is the one
+// thing a bar must never say while the first count is still being fetched.
 func ProgressBar(done, total, width int) string {
-	if total <= 0 {
-		return "[" + strings.Repeat("-", width) + "]"
+	if total <= 0 || width < 8 {
+		return ""
 	}
-	filled := done * width / total
-	filled = max(0, min(width, filled))
+	filled := max(0, min(width, done*width/total))
 	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
 }
 
@@ -192,15 +191,3 @@ func Timestamp(ms int64) string { return time.UnixMilli(ms).Format("2006-01-02 1
 
 // Date formats a meeting's date alone.
 func Date(ms int64) string { return time.UnixMilli(ms).Format("2006-01-02") }
-
-// Truncate shortens text to width, marking that it was cut.
-func Truncate(text string, width int) string {
-	if width < 8 {
-		width = 8
-	}
-	runes := []rune(text)
-	if len(runes) <= width {
-		return text
-	}
-	return string(runes[:width-1]) + "…"
-}

@@ -132,10 +132,25 @@ never edit a transcript unless you asked for that specific correction.
 ## Where things live
 
 Everything is under `~/.sana-mcp`: the SQLite database, your session, the daemon
-log. Uninstalling is `sana-mcp uninstall` and removing that directory.
+log, and the binary itself in `bin/`.
+
+`sana-mcp uninstall` removes all of it. It lists what it is about to remove and
+asks first: the client registrations, that directory, every copy of the binary
+the installers have written (including `~/.local/bin`, where an older version
+put it), and the PATH line they added to your shell profile. It stops any
+running daemon first, by asking each installed binary to stop its own - a daemon
+started by a different version only answers to that version.
 
 Note that the database holds your corrections, which cannot be re-synced from
 Sana. It is not purely a cache.
+
+## Installing over an older version
+
+An older version's database cannot be read by this one. The installer checks for
+that before it writes anything, says what continuing costs - your meetings are
+downloaded again, and you may have to sign in again - and asks. Nothing is
+deleted until the new setup succeeds, so cancelling or a failure part-way
+through puts the old state back exactly as it was.
 
 ## Development
 

@@ -131,6 +131,61 @@ CREATE TABLE IF NOT EXISTS sync_state (
 INSERT OR IGNORE INTO sync_state (id) VALUES (1);
 `
 
+// ErrForeignSchema means the file is a database this build cannot use: it was
+// written by a different implementation of sana-mcp.
+//
+// This is checked rather than assumed because the schema is applied with CREATE
+// TABLE IF NOT EXISTS, which silently does nothing against a foreign table of
+// the same name. Every later query then fails on a missing column, the sync
+// status stays at its zero value, and the application shows "Syncing meetings
+// 0/0" forever instead of saying what is wrong.
+var ErrForeignSchema = errors.New(
+	"the local database was written by a different version of sana-mcp and cannot be read by this one",
+)
+
+// foreignSchema reports whether the file holds someone else's meetings table.
+//
+// An unversioned database with no meetings table is simply new. An unversioned
+// database that already has one, without the primary key this build stores
+// meetings under, belongs to another implementation.
+func foreignSchema(db *sql.DB) (bool, error) {
+	var name string
+	err := db.QueryRow(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meetings'",
+	).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect database: %w", err)
+	}
+	rows, err := db.Query("PRAGMA table_info(meetings)")
+	if err != nil {
+		return false, fmt.Errorf("inspect meetings table: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			index      int
+			column     string
+			columnType string
+			notNull    int
+			preset     sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&index, &column, &columnType, &notNull, &preset, &primaryKey); err != nil {
+			return false, fmt.Errorf("inspect meetings table: %w", err)
+		}
+		if column == "meeting_id" {
+			return false, rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("inspect meetings table: %w", err)
+	}
+	return true, nil
+}
+
 func (s *Store) migrate() error {
 	var current int
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
@@ -144,6 +199,15 @@ func (s *Store) migrate() error {
 	}
 	if current == schemaVersion {
 		return nil
+	}
+	if current == 0 {
+		foreign, err := foreignSchema(s.db)
+		if err != nil {
+			return err
+		}
+		if foreign {
+			return ErrForeignSchema
+		}
 	}
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)

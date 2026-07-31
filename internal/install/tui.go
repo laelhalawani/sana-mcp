@@ -3,530 +3,323 @@ package install
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
-	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
 	"github.com/laelhalawani/sana-mcp/internal/cli"
-	"github.com/laelhalawani/sana-mcp/internal/render"
+	"github.com/laelhalawani/sana-mcp/internal/daemon"
+	"github.com/laelhalawani/sana-mcp/internal/localstate"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
-	"github.com/laelhalawani/sana-mcp/internal/store"
+	"github.com/laelhalawani/sana-mcp/internal/statusview"
 	"github.com/laelhalawani/sana-mcp/internal/tui"
 	detectharness "github.com/sairaph/detect-harness"
 )
 
-// step is one screen of the installer.
-type step int
+// The installer prints as it goes rather than owning the screen.
+//
+// Everything it settles - a client registered, a client that could not be, a
+// code emailed - stays in scrollback, so the run reads afterwards as a record
+// of what happened. Only the two screens that are genuinely live take over a
+// region: the client wizard, and the sync progress at the end.
 
-const (
-	// stepDetecting is first because probing every harness walks the
-	// filesystem and takes a visible moment. Without a screen for it the
-	// installer would print its download bar and then show nothing at all.
-	stepDetecting step = iota
-	stepHarnesses
-	stepApplying
-	stepSignInAsk
-	stepSignInEmail
-	stepSignInCode
-	stepSyncing
-	stepDone
-)
+// describeApply says what happened to one client, in the words a person would
+// use for it.
+func describeApply(result detectharness.Result) string {
+	switch result.State {
+	case detectharness.Applied:
+		return "registered"
+	case detectharness.ApplyNoop:
+		return "already registered (no change)"
+	case detectharness.ApplyConflict:
+		return "conflict: " + result.Reason
+	case detectharness.ApplySkipped:
+		return "skipped: " + result.Reason
+	default:
+		return "failed: " + result.Reason
+	}
+}
 
-type model struct {
+// describeRemove is the same for a removal, where "nothing to do" means
+// something different.
+func describeRemove(result detectharness.Result) string {
+	switch result.State {
+	case detectharness.Applied:
+		return "removed"
+	case detectharness.ApplyNoop:
+		return "not registered (nothing to remove)"
+	default:
+		return describeApply(result)
+	}
+}
+
+// applyState maps a result onto the glyph vocabulary. A conflict or a failure
+// needs a person to act, so both are failures here; a skip is not.
+func applyState(result detectharness.Result) tui.ApplyState {
+	switch result.State {
+	case detectharness.Applied:
+		return tui.ApplyOK
+	case detectharness.ApplyNoop:
+		return tui.ApplyNoop
+	case detectharness.ApplyConflict, detectharness.ApplyFailed:
+		return tui.ApplyFailed
+	default:
+		return tui.ApplySkipped
+	}
+}
+
+// needsManualAction reports a result the user has to do something about.
+func needsManualAction(result detectharness.Result) bool {
+	return result.State == detectharness.ApplyConflict || result.State == detectharness.ApplyFailed
+}
+
+// printApplyResult writes one settled client row.
+func printApplyResult(terminal tui.Terminal, harness Harness, result detectharness.Result, enabling bool) {
+	description := describeRemove(result)
+	if enabling {
+		description = describeApply(result)
+	}
+	hint := ""
+	if result.State == detectharness.Applied && enabling {
+		hint = harness.ReloadHint
+	}
+	terminal.Print(terminal.UI.Row(
+		terminal.UI.StatusGlyph(applyState(result), enabling),
+		harness.Name, description, hint,
+	))
+}
+
+// setup is one run of the installer.
+type setup struct {
 	ctx       context.Context
 	runtime   *bootstrap.Runtime
+	terminal  tui.Terminal
 	installer *Installer
-
-	step      step
-	frame     int
-	harnesses []Harness
-	selected  map[detectharness.ID]bool
-	cursor    int
-	showAll   bool
-	message   string
-
-	results []detectharness.Result
-
-	signedIn bool
-	email    string
-	pending  sana.PendingSignIn
-	input    string
-	failure  string
-
-	status store.Status
-	quit   bool
 }
 
-type detectedMsg []Harness
-type appliedMsg []detectharness.Result
-type tickMsg time.Time
-type signInRequestedMsg struct {
-	pending sana.PendingSignIn
-	err     error
-}
-type signedInMsg struct {
-	email string
-	err   error
-}
-type statusMsg store.Status
+// Run executes configure, install, or uninstall.
+func Run(ctx context.Context, runtime *bootstrap.Runtime, command cli.Command, options cli.Options) int {
+	terminal := openTerminal(options)
 
-var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	installer, err := NewInstaller(runtime)
+	if err != nil {
+		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+		return 1
+	}
+	flow := &setup{ctx: ctx, runtime: runtime, terminal: terminal, installer: installer}
 
-func (m model) spinner() string { return spinnerFrames[m.frame%len(spinnerFrames)] }
-
-func tick() tea.Cmd {
-	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	if command.Name == "uninstall" {
+		return flow.uninstall()
+	}
+	return flow.install()
 }
 
-func (m model) Init() tea.Cmd {
-	return tea.Batch(tick(), func() tea.Msg {
-		return detectedMsg(m.installer.Detect(m.ctx))
-	})
+// openTerminal resolves the streams the prompts need. The CLI passes writers so
+// tests can capture them, but an interactive prompt needs the files themselves.
+func openTerminal(options cli.Options) tui.Terminal {
+	in, out := os.Stdin, os.Stdout
+	if file, ok := options.Stdin.(*os.File); ok {
+		in = file
+	}
+	if file, ok := options.Stdout.(*os.File); ok {
+		out = file
+	}
+	return tui.Open(in, out)
 }
 
-func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := message.(type) {
-	case tickMsg:
-		m.frame++
-		// The spinner wants 120 ms; the progress numbers change at most once a
-		// second. Polling on every frame reopened the database eight times a
-		// second for the same answer.
-		if m.step == stepSyncing && m.frame%8 == 0 {
-			return m, tea.Batch(tick(), m.readStatus())
-		}
-		return m, tick()
+func (s *setup) install() int {
+	ui := s.terminal.UI
 
-	case detectedMsg:
-		m.harnesses = msg
-		m.selected = map[detectharness.ID]bool{}
-		for _, harness := range msg {
-			// Anything already configured stays configured unless the user says
-			// otherwise; anything detected is offered on by default, because
-			// that is what someone running an installer is asking for.
-			if harness.Configured || harness.State == detectharness.Detected {
-				m.selected[harness.ID] = true
+	// Anything a previous run left half-done is undone before this one looks at
+	// the state, so what it reports is what is actually there.
+	if err := localstate.Recover(s.runtime.Paths); err != nil {
+		s.terminal.Print(ui.Red("Previous setup could not be tidied up: "), err.Error())
+		return 1
+	}
+
+	reset, code := s.replaceIncompatibleState()
+	if code != 0 {
+		return code
+	}
+
+	failed := func(code int) int {
+		if reset != nil {
+			if err := reset.Rollback(); err != nil {
+				s.terminal.Print(ui.Red("The previous local state could not be restored: "), err.Error())
 			}
 		}
-		m.cursor = m.firstVisible()
-		m.step = stepHarnesses
-		return m, nil
-
-	case appliedMsg:
-		m.results = msg
-		if m.signedIn {
-			m.step = stepSyncing
-			return m, tea.Batch(m.startSync(), m.readStatus())
-		}
-		m.step = stepSignInAsk
-		return m, nil
-
-	case signInRequestedMsg:
-		if msg.err != nil {
-			m.failure = msg.err.Error()
-			m.step = stepSignInEmail
-			return m, nil
-		}
-		m.pending = msg.pending
-		m.failure = ""
-		m.input = ""
-		m.step = stepSignInCode
-		return m, nil
-
-	case signedInMsg:
-		if msg.err != nil {
-			m.failure = msg.err.Error()
-			m.input = ""
-			m.step = stepSignInCode
-			return m, nil
-		}
-		m.signedIn = true
-		m.email = msg.email
-		m.failure = ""
-		m.step = stepSyncing
-		return m, tea.Batch(m.startSync(), m.readStatus())
-
-	case statusMsg:
-		m.status = store.Status(msg)
-		if m.status.Complete() {
-			m.step = stepDone
-			return m, tea.Quit
-		}
-		return m, nil
-
-	case tea.KeyMsg:
-		return m.key(msg)
+		return code
 	}
-	return m, nil
-}
 
-func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch m.step {
-	case stepHarnesses:
-		switch key.String() {
-		case "up", "k":
-			m.moveCursor(-1)
-		case "down", "j":
-			m.moveCursor(1)
-		case "v":
-			m.showAll = !m.showAll
-			m.cursor = m.firstVisible()
-		case " ":
-			m.toggle()
-		case "a":
-			m.toggleAll()
-		case "enter":
-			m.step = stepApplying
-			return m, m.apply()
-		case "esc", "q", "ctrl+c":
-			m.quit = true
-			return m, tea.Quit
-		}
-	case stepSignInAsk:
-		switch key.String() {
-		case "y", "enter":
-			m.step = stepSignInEmail
-			m.input = ""
-		case "n", "esc", "q":
-			m.step = stepDone
-			return m, tea.Quit
-		case "ctrl+c":
-			m.quit = true
-			return m, tea.Quit
-		}
-	case stepSignInEmail, stepSignInCode:
-		switch key.Type {
-		case tea.KeyEnter:
-			value := strings.TrimSpace(m.input)
-			if value == "" {
-				return m, nil
+	harnesses := s.installer.Detect(s.ctx)
+	rows := make([]tui.WizardRow, 0, len(harnesses))
+	byID := make(map[string]Harness, len(harnesses))
+	for _, harness := range harnesses {
+		if !harness.Selectable() {
+			// A client that is here but cannot be configured is reported: the
+			// user has it, and needs to know it was left out.
+			//
+			// A client that is not here is not mentioned at all. Claude Desktop
+			// has no Linux configuration, and announcing that as a failure on
+			// every Linux install is a screenful of red about software the user
+			// never installed.
+			if harness.State == detectharness.Detected {
+				s.terminal.Print(ui.Row(
+					ui.StatusGlyph(tui.ApplyFailed, true),
+					harness.Name,
+					"configuration unavailable: "+harness.ConfigError,
+					"",
+				))
 			}
-			if m.step == stepSignInEmail {
-				m.email = value
-				m.input = ""
-				return m, m.requestCode(value)
-			}
-			m.input = ""
-			return m, m.submitCode(value)
-		case tea.KeyEsc:
-			m.step = stepDone
-			return m, tea.Quit
-		case tea.KeyCtrlC:
-			m.quit = true
-			return m, tea.Quit
-		default:
-			m.input, _ = tui.Typed(m.input, key)
+			continue
 		}
-	case stepSyncing:
-		switch key.String() {
-		case "enter", "esc", "q":
-			// Leaving the progress view does not stop the sync: it continues in
-			// the background, which the summary says.
-			m.step = stepDone
-			return m, tea.Quit
-		case "ctrl+c":
-			m.quit = true
-			return m, tea.Quit
-		}
+		byID[string(harness.ID)] = harness
+		rows = append(rows, tui.WizardRow{
+			ID:   string(harness.ID),
+			Name: harness.Name,
+			// An existing registration stays visible even when the client
+			// itself was not detected, so it can be disconnected without
+			// revealing every hidden row.
+			Detected: harness.State == detectharness.Detected || harness.Configured,
+			Current:  harness.Configured,
+		})
 	}
-	return m, nil
-}
 
-// visible is which harnesses earn a line.
-//
-// A client is worth showing if it is here, or if this tool is already
-// registered with it. Everything else is behind v: a list of thirteen clients,
-// eleven of them "not detected", tells the user nothing they asked for.
-func (m model) visible() []int {
-	var indices []int
-	for index, harness := range m.harnesses {
-		if harness.State == detectharness.Detected || harness.Configured || m.showAll {
-			indices = append(indices, index)
-		}
+	if !s.terminal.Policy.Interactive {
+		s.terminal.Print("An interactive terminal is required to choose clients.")
+		return failed(1)
 	}
-	return indices
-}
 
-func (m model) firstVisible() int {
-	if indices := m.visible(); len(indices) > 0 {
-		return indices[0]
+	selection, err := s.terminal.Wizard(s.ctx, "Configure sana-mcp for your AI clients", rows)
+	if err != nil {
+		s.terminal.Print(ui.Red("Client selection failed: "), err.Error())
+		return failed(1)
+	}
+	if !selection.Submitted {
+		s.terminal.Blank()
+		s.terminal.Print("Cancelled; no changes were made.")
+		return failed(1)
+	}
+
+	results, connected := s.apply(rows, byID, selection)
+	incomplete := false
+	for _, result := range results {
+		if !needsManualAction(result) {
+			continue
+		}
+		id := string(result.HarnessID)
+		printApplyResult(s.terminal, byID[id], result, selection.Desired[id])
+		incomplete = true
+	}
+	if incomplete {
+		s.terminal.Blank()
+		s.terminal.Print(ui.Red("Configuration is incomplete."),
+			" Review the client details above before trying again.")
+		return failed(1)
+	}
+
+	signedIn := s.signIn()
+	if err := s.showSummary(connected, signedIn, reloadHints(byID, results)); err != nil {
+		s.terminal.Print(ui.Red("Setup finished, but its final screen failed: "), err.Error())
+	}
+	if reset != nil {
+		if err := reset.Commit(); err != nil {
+			s.terminal.Print(ui.Yellow("The replaced local state could not be deleted: "), err.Error())
+		}
 	}
 	return 0
 }
 
-// moveCursor walks the visible rows, so hidden clients are skipped rather than
-// silently landed on.
-func (m *model) moveCursor(direction int) {
-	indices := m.visible()
-	if len(indices) == 0 {
-		return
+// replaceIncompatibleState checks the local state before anything is written,
+// and replaces it only with the user's agreement.
+//
+// This runs first for one reason: an installer that registers clients and then
+// discovers it cannot read the local database has already changed the machine
+// in exchange for nothing.
+func (s *setup) replaceIncompatibleState() (*localstate.Reset, int) {
+	ui := s.terminal.UI
+	report := localstate.Inspect(s.runtime.Paths)
+	if !report.Incompatible() {
+		return nil, 0
 	}
-	position := 0
-	for index, value := range indices {
-		if value == m.cursor {
-			position = index
-		}
+
+	s.terminal.Blank()
+	s.terminal.Print(ui.Yellow("This version cannot use the Sana data already on this machine."))
+	s.terminal.Print("  ", ui.Dim(report.Reason))
+	s.terminal.Blank()
+	s.terminal.Print("Continuing replaces it: your meetings and transcripts will be downloaded")
+	s.terminal.Print("again, and you may have to sign in to Sana again. Nothing is deleted until")
+	s.terminal.Print("the new setup succeeds.")
+	if len(report.Foreign) > 0 {
+		s.terminal.Print("  ", ui.Dim("also left behind: "+strings.Join(report.Foreign, ", ")))
 	}
-	position += direction
-	if position < 0 {
-		position = len(indices) - 1
+	s.terminal.Blank()
+
+	if !s.terminal.Policy.Interactive {
+		s.terminal.Print("Run sana-mcp install in a terminal to confirm this, or remove ",
+			report.Root, " yourself.")
+		return nil, 1
 	}
-	if position >= len(indices) {
-		position = 0
+	agreed, err := s.terminal.Confirm(s.ctx, "Replace it and continue?", false)
+	if err != nil || !agreed {
+		s.terminal.Blank()
+		s.terminal.Print("Cancelled; no changes were made.")
+		return nil, 1
 	}
-	m.cursor = indices[position]
+
+	// Whatever version wrote that state may still be syncing into it. Asking
+	// each installed binary to stop its own daemon is the only way to reach a
+	// daemon this build did not start; renaming the database out from under a
+	// live writer is how a half-written file gets left behind.
+	self, _ := os.Executable()
+	for _, line := range localstate.StopDaemons(s.ctx, localstate.PlanUninstall(s.runtime.Paths, self)) {
+		s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyOK, false), "Background sync", line, ""))
+	}
+
+	reset, err := localstate.Begin(s.runtime.Paths)
+	if err != nil {
+		s.terminal.Print(ui.Red("The old data could not be moved aside: "), err.Error())
+		return nil, 1
+	}
+	s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyOK, true),
+		"Previous Sana data", "moved aside", ""))
+	return reset, 0
 }
 
-func (m *model) toggle() {
-	if m.cursor >= len(m.harnesses) {
-		return
+// apply writes the chosen registrations and reports how many clients ended up
+// connected.
+func (s *setup) apply(
+	rows []tui.WizardRow,
+	byID map[string]Harness,
+	selection tui.WizardResult,
+) ([]detectharness.Result, int) {
+	var present, absent []detectharness.ID
+	connected := 0
+	for _, row := range rows {
+		harness := byID[row.ID]
+		if selection.Desired[row.ID] {
+			connected++
+			present = append(present, harness.ID)
+			continue
+		}
+		if row.Current {
+			absent = append(absent, harness.ID)
+		}
 	}
-	harness := m.harnesses[m.cursor]
-	if !harness.Selectable() {
-		m.message = harness.Name + " could not be inspected, so it cannot be changed."
-		return
-	}
-	m.selected[harness.ID] = !m.selected[harness.ID]
-	m.message = ""
+	results := s.installer.Apply(s.ctx, present, detectharness.Present)
+	results = append(results, s.installer.Apply(s.ctx, absent, detectharness.Absent)...)
+	return results, connected
 }
 
-func (m *model) toggleAll() {
-	anyUnselected := false
-	for _, harness := range m.harnesses {
-		if harness.Selectable() && !m.selected[harness.ID] {
-			anyUnselected = true
-			break
-		}
-	}
-	for _, harness := range m.harnesses {
-		if harness.Selectable() {
-			m.selected[harness.ID] = anyUnselected
-		}
-	}
-	if anyUnselected {
-		m.message = "Selected every detected client."
-	} else {
-		m.message = "Cleared every client."
-	}
-}
-
-// header matches the installer script's own output: a leading blank line and a
-// two-space indent, so the download and the setup read as one thing rather than
-// two programs taking turns.
-func header() string {
-	return "\n" + tui.Title.Render("  sana-mcp setup") + "\n"
-}
-
-func (m model) viewHarnesses() string {
-	var out strings.Builder
-	out.WriteString("\n  AI clients — which should be able to read your meetings?\n\n")
-
-	indices := m.visible()
-	if len(indices) == 0 {
-		out.WriteString(tui.Dim.Render(
-			"  No AI clients detected. Install one, then run\n  `sana-mcp configure`.\n"))
-	}
-	for _, index := range indices {
-		harness := m.harnesses[index]
-		cursor := " "
-		if index == m.cursor && harness.Selectable() {
-			cursor = tui.Cursor.Render(">")
-		}
-		mark := tui.Off.Render("○")
-		if !harness.Selectable() {
-			mark = tui.Dim.Render("·")
-		} else if m.selected[harness.ID] {
-			mark = tui.On.Render("●")
-		}
-		line := fmt.Sprintf("%-22s %s", harness.Name, tui.Dim.Render(harness.StatusText()))
-		if !harness.Selectable() {
-			line = tui.Dim.Render(fmt.Sprintf("%-22s ", harness.Name)) + tui.Warn.Render(harness.StatusText())
-		}
-		fmt.Fprintf(&out, " %s %s %s\n", cursor, mark, line)
-	}
-
-	hidden := len(m.harnesses) - len(indices)
-	if hidden > 0 && !m.showAll {
-		out.WriteString("\n" + tui.Dim.Render(
-			fmt.Sprintf("  press v to show %d client(s) that are not installed", hidden)))
-	} else if m.showAll {
-		out.WriteString("\n" + tui.Dim.Render("  press v to hide clients that are not installed"))
-	}
-	if m.message != "" {
-		out.WriteString("\n\n  " + m.message)
-	}
-	out.WriteString("\n\n" + tui.Footer.Render(
-		"  ↑↓ move · space toggle · a all/none · v show all · enter continue · q cancel"))
-	return out.String()
-}
-
-func (m model) apply() tea.Cmd {
-	return func() tea.Msg {
-		var present, absent []detectharness.ID
-		for _, harness := range m.harnesses {
-			if !harness.Selectable() {
-				continue
-			}
-			if m.selected[harness.ID] {
-				present = append(present, harness.ID)
-			} else if harness.Configured {
-				absent = append(absent, harness.ID)
-			}
-		}
-		results := m.installer.Apply(m.ctx, present, detectharness.Present)
-		results = append(results, m.installer.Apply(m.ctx, absent, detectharness.Absent)...)
-		return appliedMsg(results)
-	}
-}
-
-func (m model) requestCode(email string) tea.Cmd {
-	return func() tea.Msg {
-		client := sana.New("", nil)
-		pending, err := client.RequestSignInCode(m.ctx, email)
-		return signInRequestedMsg{pending: pending, err: err}
-	}
-}
-
-func (m model) submitCode(code string) tea.Cmd {
-	pending := m.pending
-	paths := m.runtime.Paths
-	return func() tea.Msg {
-		client := sana.New("", nil)
-		user, err := client.SubmitSignInCode(m.ctx, pending, code)
-		if err != nil {
-			return signedInMsg{err: err}
-		}
-		if err := sana.SaveSession(paths.Session, sana.SessionFrom(client, user)); err != nil {
-			return signedInMsg{err: err}
-		}
-		return signedInMsg{email: user.Email}
-	}
-}
-
-// startSync runs one sync cycle in the background so the progress view has
-// something to report. The daemon owns later cycles.
-func (m model) startSync() tea.Cmd {
-	runtime := m.runtime
-	return func() tea.Msg {
-		syncNow(runtime)
-		return nil
-	}
-}
-
-func (m model) readStatus() tea.Cmd {
-	path := m.runtime.Paths.Database
-	return func() tea.Msg {
-		database, err := store.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer database.Close()
-		status, err := database.Status()
-		if err != nil {
-			return nil
-		}
-		return statusMsg(status)
-	}
-}
-
-func (m model) View() string {
-	var out strings.Builder
-	out.WriteString(header())
-
-	switch m.step {
-	case stepDetecting:
-		fmt.Fprintf(&out, "  %s Looking for AI clients...\n", m.spinner())
-
-	case stepHarnesses:
-		out.WriteString(m.viewHarnesses())
-	case stepApplying:
-		fmt.Fprintf(&out, "  %s Writing client configuration...\n", m.spinner())
-
-	case stepSignInAsk:
-		out.WriteString("  Sign in to Sana now? [Y/n]\n")
-		out.WriteString(tui.Dim.Render("  You can also sign in later with: sana-mcp login") + "\n")
-
-	case stepSignInEmail:
-		if m.failure != "" {
-			out.WriteString("  " + tui.Failed.Render(m.failure) + "\n\n")
-		}
-		fmt.Fprintf(&out, "  Email: %s\n", m.input)
-		out.WriteString(tui.Dim.Render("  enter to send a sign-in code, esc to skip") + "\n")
-
-	case stepSignInCode:
-		if m.failure != "" {
-			out.WriteString("  " + tui.Failed.Render(m.failure) + "\n\n")
-		}
-		fmt.Fprintf(&out, "  A code was emailed to %s\n\n", m.email)
-		fmt.Fprintf(&out, "  Code: %s\n", m.input)
-		out.WriteString(tui.Dim.Render("  enter to confirm, esc to skip") + "\n")
-
-	case stepSyncing:
-		fmt.Fprintf(&out, "  %s %s\n\n", m.spinner(), render.StatusLabel(m.status))
-		out.WriteString("  " + render.ProgressBar(m.status.TranscriptsDone, m.status.TranscriptsTotal, 28) + "\n")
-		fmt.Fprintf(&out, "  %d/%d transcripts\n", m.status.TranscriptsDone, m.status.TranscriptsTotal)
-		out.WriteString("\n" + tui.Dim.Render("  enter to leave it running in the background") + "\n")
-
-	case stepDone:
-		out.WriteString(m.summary())
-	}
-	return out.String()
-}
-
-func (m model) summary() string {
-	var out strings.Builder
-	configured := 0
-	var failures []string
-	for _, result := range m.results {
-		switch {
-		case result.Desired == detectharness.Present && result.State == detectharness.Applied:
-			configured++
-		case result.State != detectharness.Applied && result.Reason != "":
-			failures = append(failures, fmt.Sprintf("%s: %s", result.Name, result.Reason))
-		}
-	}
-	fmt.Fprintf(&out, "  AI clients    %d connected\n", configured)
-	if m.signedIn {
-		fmt.Fprintf(&out, "  Sana account  signed in as %s\n", m.email)
-	} else {
-		out.WriteString("  Sana account  " + tui.Warn.Render("not signed in") + "\n")
-	}
-	switch {
-	case m.status.Complete():
-		out.WriteString("  Meeting sync  " + tui.On.Render("complete") + "\n")
-	case m.signedIn:
-		out.WriteString("  Meeting sync  continuing in the background\n")
-	default:
-		out.WriteString("  Meeting sync  waiting for sign-in\n")
-	}
-	for _, failure := range failures {
-		out.WriteString("  " + tui.Failed.Render(failure) + "\n")
-	}
-	if hints := m.reloadHints(); len(hints) > 0 {
-		fmt.Fprintf(&out, "  Reload        %s\n", strings.Join(hints, "; "))
-	}
-	if !m.signedIn {
-		out.WriteString("\n  Next: " + tui.Title.Render("sana-mcp login") + "\n")
-		return out.String()
-	}
-	out.WriteString("\n  Next: " + tui.Title.Render("sana-mcp") + "\n")
-	return out.String()
-}
-
-// reloadHints derives the reload advice from what was actually applied, rather
-// than accumulating it as state that has to be kept in step.
-func (m model) reloadHints() []string {
-	byID := make(map[detectharness.ID]string, len(m.harnesses))
-	for _, harness := range m.harnesses {
-		byID[harness.ID] = harness.ReloadHint
-	}
+// reloadHints is the advice for the clients that were actually registered.
+func reloadHints(byID map[string]Harness, results []detectharness.Result) []string {
 	var hints []string
 	seen := map[string]bool{}
-	for _, result := range m.results {
+	for _, result := range results {
 		if result.Desired != detectharness.Present || result.State != detectharness.Applied {
 			continue
 		}
-		hint := byID[result.HarnessID]
+		hint := byID[string(result.HarnessID)].ReloadHint
 		if hint == "" || seen[hint] {
 			continue
 		}
@@ -536,59 +329,193 @@ func (m model) reloadHints() []string {
 	return hints
 }
 
-// Run executes configure, install, or uninstall.
-func Run(ctx context.Context, runtime *bootstrap.Runtime, command cli.Command, options cli.Options) int {
-	installer, err := NewInstaller(runtime)
-	if err != nil {
-		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
-		return 1
+// signIn offers to sign in to Sana, and reports whether the user ended up
+// signed in. Declining is a normal outcome, not a failure.
+func (s *setup) signIn() bool {
+	ui := s.terminal.UI
+
+	if session, err := sana.LoadSession(s.runtime.Paths.Session); err == nil && session.SignedIn() {
+		return true
+	}
+	wanted, err := s.terminal.Confirm(s.ctx, "Sign in to Sana now?", true)
+	if err != nil || !wanted {
+		return false
+	}
+	email, err := s.terminal.Input(s.ctx, "Email for your Sana account:")
+	if err != nil || email == "" {
+		return false
 	}
 
-	if command.Name == "uninstall" {
-		return runUninstall(ctx, installer, options)
-	}
-
-	session, _ := sana.LoadSession(runtime.Paths.Session)
-	initial := model{
-		ctx:       ctx,
-		runtime:   runtime,
-		installer: installer,
-		signedIn:  session.SignedIn(),
-	}
-	if initial.signedIn {
-		initial.email = session.Email
-	}
-	program := tea.NewProgram(initial, tea.WithContext(ctx))
-	final, err := program.Run()
+	client := sana.New("", nil)
+	pending, err := client.RequestSignInCode(s.ctx, email)
 	if err != nil {
-		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
-		return 1
+		s.terminal.Blank()
+		s.terminal.Print(ui.Red("Sana sign-in is unavailable: "), err.Error())
+		return false
 	}
-	if result, ok := final.(model); ok && result.quit {
-		fmt.Fprintln(options.Stdout, "Cancelled; no changes were made.")
-		return 1
+	s.terminal.Print("We emailed a 6-digit sign-in code to ", email, ".")
+
+	code, err := s.terminal.Input(s.ctx, "Enter the 6-digit code:")
+	if err != nil {
+		return false
 	}
-	return 0
+	user, err := client.SubmitSignInCode(s.ctx, pending, code)
+	if err != nil {
+		s.terminal.Blank()
+		s.terminal.Print(ui.Red("Sana sign-in did not complete: "), err.Error())
+		return false
+	}
+	if err := sana.SaveSession(s.runtime.Paths.Session, sana.SessionFrom(client, user)); err != nil {
+		s.terminal.Blank()
+		s.terminal.Print(ui.Red("Signed in, but the session could not be saved: "), err.Error())
+		return false
+	}
+	return true
 }
 
-func runUninstall(ctx context.Context, installer *Installer, options cli.Options) int {
-	var ids []detectharness.ID
-	for _, harness := range installer.Detect(ctx) {
+// showSummary ends the run. When there is a session and a terminal it watches
+// the first sync live; otherwise it prints what it knows and stops.
+func (s *setup) showSummary(connected int, signedIn bool, hints []string) error {
+	ui := s.terminal.UI
+
+	if !signedIn || !s.terminal.Policy.Interactive {
+		info := statusview.Read(s.runtime.Paths)
+		s.terminal.Blank()
+		s.terminal.Print(ui.Bold("sana-mcp setup"))
+		s.terminal.Print("AI clients  ", fmt.Sprint(connected), " connected")
+		account := "not signed in"
+		if signedIn {
+			account = "signed in"
+		}
+		s.terminal.Print("Sana account  ", account)
+		sync := "continuing in background"
+		if info.Status.Complete() {
+			sync = "complete"
+		}
+		s.terminal.Print("Meeting sync  ", sync)
+		if len(hints) > 0 {
+			s.terminal.Print("Reload  ", strings.Join(hints, "; "))
+		}
+		s.terminal.Print("Next: sana-mcp")
+		return nil
+	}
+
+	// The daemon does the syncing and the screen watches it.
+	//
+	// Running a sync cycle here instead blocked for as long as it took, with
+	// nothing on screen: the progress view cannot report on work that is
+	// happening between it and the terminal.
+	daemon.EnsureRunning(s.runtime)
+
+	var final statusview.Info
+	read := func() statusview.Info {
+		final = statusview.Read(s.runtime.Paths)
+		return final
+	}
+	if _, err := statusview.Run(s.ctx, s.terminal, statusview.ModeSetup, read,
+		&statusview.Setup{ConnectedClients: connected, SignedIn: signedIn}); err != nil {
+		return err
+	}
+
+	s.terminal.Blank()
+	if final.Status.Complete() {
+		s.terminal.Print(ui.Green("Meeting sync complete."))
+	} else {
+		s.terminal.Print("Meeting sync continues in the background.")
+	}
+	if len(hints) > 0 {
+		s.terminal.Print("Reload  ", strings.Join(hints, "; "))
+	}
+	s.terminal.Print("Run: sana-mcp")
+	return nil
+}
+
+// uninstall removes sana-mcp from this machine: the client registrations, the
+// local data, every copy of the binary the installers have shipped, and the
+// PATH line they added.
+//
+// It is one command because a partial uninstall is what leaves a machine with
+// an old binary first on PATH quietly serving a client that was never
+// unregistered.
+func (s *setup) uninstall() int {
+	ui := s.terminal.UI
+
+	var registered []detectharness.ID
+	var names []string
+	for _, harness := range s.installer.Detect(s.ctx) {
 		if harness.Configured {
-			ids = append(ids, harness.ID)
+			registered = append(registered, harness.ID)
+			names = append(names, harness.Name)
 		}
 	}
-	if len(ids) == 0 {
-		fmt.Fprintln(options.Stdout, "sana-mcp is not registered with any client.")
+
+	self, err := os.Executable()
+	if err != nil {
+		self = ""
+	}
+	plan := localstate.PlanUninstall(s.runtime.Paths, self)
+
+	if len(registered) == 0 && plan.Empty() {
+		s.terminal.Print("sana-mcp is not installed on this machine.")
 		return 0
 	}
-	results := installer.Apply(ctx, ids, detectharness.Absent)
-	removed := 0
-	for _, result := range results {
-		if result.State == detectharness.Applied {
-			removed++
+
+	s.terminal.Blank()
+	s.terminal.Print(ui.Bold("Uninstall sana-mcp"))
+	if len(names) > 0 {
+		s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyOK, false),
+			"AI clients", strings.Join(names, ", "), "will be unregistered"))
+	}
+	for _, leftover := range plan.Leftovers {
+		s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyOK, false),
+			leftover.Path, leftover.Detail, ""))
+	}
+	s.terminal.Blank()
+
+	if s.terminal.Policy.Interactive {
+		agreed, err := s.terminal.Confirm(s.ctx, "Remove all of this?", false)
+		if err != nil || !agreed {
+			s.terminal.Print("Cancelled; nothing was removed.")
+			return 1
 		}
 	}
-	fmt.Fprintf(options.Stdout, "Removed sana-mcp from %d client(s).\n", removed)
+
+	for _, line := range localstate.StopDaemons(s.ctx, plan) {
+		s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyOK, false), "Background sync", line, ""))
+	}
+
+	failures := 0
+	for _, result := range s.installer.Apply(s.ctx, registered, detectharness.Absent) {
+		printApplyResult(s.terminal, Harness{Name: result.Name}, result, false)
+		if needsManualAction(result) {
+			failures++
+		}
+	}
+	removals := plan.Apply()
+	for _, removal := range removals {
+		switch {
+		case removal.Err != nil:
+			failures++
+			s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyFailed, false),
+				removal.Leftover.Path, removal.Err.Error(), ""))
+		case removal.Deferred:
+			s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyNoop, false),
+				removal.Leftover.Path, "will be gone once this program exits", ""))
+		default:
+			s.terminal.Print(ui.Row(ui.StatusGlyph(tui.ApplyOK, false),
+				removal.Leftover.Path, "removed", ""))
+		}
+	}
+
+	s.terminal.Blank()
+	if failures > 0 {
+		s.terminal.Print(ui.Red("Uninstall is incomplete."), " Review the details above.")
+		return 1
+	}
+	if remaining := localstate.StillOnPath(removals); remaining != "" {
+		s.terminal.Print(ui.Yellow("Another sana-mcp is still on your PATH: "), remaining)
+		s.terminal.Print("It was not installed by sana-mcp, so it was left alone. Remove it yourself if you want it gone.")
+	}
+	s.terminal.Print("sana-mcp has been removed. Open a new terminal to clear it from your PATH.")
 	return 0
 }
