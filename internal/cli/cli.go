@@ -39,11 +39,10 @@ const Usage = `sana-mcp - your Sana.AI meeting transcripts, on this machine.
 // Options carries process-level values the commands must not reach for
 // themselves, so that tests can supply their own.
 type Options struct {
-	Version    string
-	Executable string
-	Stdin      io.Reader
-	Stdout     io.Writer
-	Stderr     io.Writer
+	Version string
+	Stdin   io.Reader
+	Stdout  io.Writer
+	Stderr  io.Writer
 }
 
 // Command is a parsed invocation. Name is always set; the rest is per-command.

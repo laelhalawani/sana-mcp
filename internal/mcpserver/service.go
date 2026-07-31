@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
+	"github.com/laelhalawani/sana-mcp/internal/daemon"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -52,6 +53,10 @@ func New(runtime *bootstrap.Runtime, version string) (*Service, error) {
 		&mcp.Implementation{Name: serverName, Version: version},
 		&mcp.ServerOptions{Instructions: Instructions},
 	)
+	// An agent using this server expects meetings to keep arriving, so the sync
+	// daemon is started here rather than left to chance.
+	daemon.EnsureRunning(runtime)
+
 	service := &Service{runtime: runtime, server: server}
 	service.registerTool()
 	return service, nil

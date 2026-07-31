@@ -33,21 +33,26 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
+	// Every pragma goes in the DSN, not through db.Exec.
+	//
+	// synchronous and foreign_keys are per-connection settings, and database/sql
+	// hands out whichever pooled connection is free - so a pragma executed once
+	// after Open applies to one connection and silently not to the others.
+	// Foreign keys were effectively off for most work that way. In the DSN the
+	// driver applies them to every connection it opens.
+	//
 	// _txlock=immediate makes write transactions take the write lock up front,
-	// so a busy writer fails fast instead of deadlocking mid-transaction.
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
+	// so a busy writer fails fast instead of deadlocking mid-transaction. Reads
+	// that must not take it use an explicit read-only transaction.
+	dsn := path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(ON)" +
+		"&_txlock=immediate"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
-	}
-	for _, pragma := range []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA foreign_keys = ON",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("%s: %w", pragma, err)
-		}
 	}
 	store := &Store{db: db}
 	if err := store.migrate(); err != nil {

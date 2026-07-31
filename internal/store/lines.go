@@ -36,13 +36,13 @@ const (
 	StatusRetrying   = "retrying"
 )
 
-// MeetingStatuses is the filter cycle: no filter, then each real status.
-var MeetingStatuses = []string{"", StatusReady, StatusProcessing, StatusRetrying}
+// MeetingStatuses is the vocabulary, in the order a person cycles through it.
+// "No filter" is a surface affordance and is not a status, so it is not here.
+var MeetingStatuses = []string{StatusReady, StatusProcessing, StatusRetrying}
 
 // Transcript states.
 const (
 	TranscriptAbsent   = "absent"
-	TranscriptPartial  = "partial"
 	TranscriptComplete = "complete"
 )
 

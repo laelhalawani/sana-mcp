@@ -31,16 +31,9 @@ func TestLiveSyncOnce(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	runtime := &bootstrap.Runtime{
-		Paths: config.Paths{
-			Root:     root,
-			Database: filepath.Join(root, "sana.db"),
-			Session:  realSession, // read-only: sync never writes the session
-			Lock:     filepath.Join(root, "daemon.lock"),
-			Log:      filepath.Join(root, "daemon.log"),
-		},
-		Config: config.Default(),
-	}
+	paths := config.PathsUnder(root)
+	paths.Session = realSession // read-only: sync never writes the session
+	runtime := &bootstrap.Runtime{Paths: paths, Config: config.Default()}
 
 	server, err := Open(runtime)
 	if err != nil {
@@ -58,8 +51,8 @@ func TestLiveSyncOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	t.Logf("phase=%s label=%q meetings=%d/%d transcripts=%d/%d remaining=%d",
-		status.Phase, status.Label(), status.Meetings, status.MeetingsTotal,
+	t.Logf("phase=%s phase-label=%q meetings=%d/%d transcripts=%d/%d remaining=%d",
+		status.Phase, status.Phase, status.Meetings, status.MeetingsTotal,
 		status.TranscriptsDone, status.TranscriptsTotal, status.Remaining)
 
 	if status.MeetingsTotal == 0 {

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,7 +15,7 @@ import (
 func newTestModel(t *testing.T) model {
 	t.Helper()
 	root := t.TempDir()
-	paths := config.Paths{Root: root, Database: filepath.Join(root, "sana.db")}
+	paths := config.PathsUnder(root)
 	database, err := store.Open(paths.Database)
 	if err != nil {
 		t.Fatalf("open store: %v", err)

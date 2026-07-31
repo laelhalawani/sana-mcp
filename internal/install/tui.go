@@ -380,7 +380,7 @@ func (m model) View() string {
 		out.WriteString(render.Dim.Render("  enter to confirm, esc to skip") + "\n")
 
 	case stepSyncing:
-		fmt.Fprintf(&out, "  %s %s\n\n", m.spinner(), m.status.Label())
+		fmt.Fprintf(&out, "  %s %s\n\n", m.spinner(), render.StatusLabel(m.status))
 		out.WriteString("  " + render.ProgressBar(m.status.TranscriptsDone, m.status.TranscriptsTotal, 28) + "\n")
 		fmt.Fprintf(&out, "  %d/%d transcripts\n", m.status.TranscriptsDone, m.status.TranscriptsTotal)
 		out.WriteString("\n" + render.Dim.Render("  enter to leave it running in the background") + "\n")

@@ -352,6 +352,23 @@ func (m Metadata) Recording() string {
 	return ""
 }
 
+// RecordingLink fetches a meeting's usable recording link, or "" when it has
+// none. It is fetched rather than stored because the link expires within hours.
+//
+// The whole operation lives here because all three surfaces need exactly it:
+// they were each loading the session, building a client, calling Meeting, and
+// applying the fallback rule themselves.
+func RecordingLink(ctx context.Context, session *Session, meetingID string) (string, error) {
+	if !session.SignedIn() {
+		return "", ErrUnauthorized
+	}
+	metadata, err := New("", session).Meeting(ctx, meetingID)
+	if err != nil {
+		return "", err
+	}
+	return metadata.Recording(), nil
+}
+
 // Meeting returns a meeting's metadata.
 func (c *Client) Meeting(ctx context.Context, assetID string) (Metadata, error) {
 	var metadata Metadata

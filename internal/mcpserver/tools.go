@@ -10,33 +10,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Description is what a model reads before choosing this tool. It names every
-// sub-tool, because a model that cannot see the list will guess.
-const Description = `Read and search your Sana.AI meeting transcripts, synced locally.
-
-Pass a tool name and its args:
-
-  help          {tool?}                                   this list, or one tool's schema
-  login         {email} then {email, confirmation_code}   passwordless sign-in by email code
-  status        {}                                        sync progress and coverage
-  list          {page?, limit?, query?, sort?, filter?}   meetings: id, timestamp, title, status
-  read          {meeting_id, full?, lines?, timestamps?}  transcript lines, all or a [start,end] range
-  search        {query, page?, limit?, sort?, filter?}    matching lines with meeting id and line number
-  summary       {meeting_id}                              summary, notes by topic, action items
-  participants  {meeting_id}                              attendees
-  recording     {meeting_id}                              a temporary recording link, fetched live
-
-Transcripts come from speech recognition and contain errors. These correct them:
-
-  edit_line     {meeting_id, line, expected_text, new_text}   replace one line
-  line_history  {meeting_id, line?}                           what was changed, original and current
-  restore_line  {meeting_id, line}                            put a line back to what Sana delivered
-
-NEVER edit a transcript unless the user has explicitly asked for that specific
-correction. Meetings are full of product names, company names and personal names
-that look like misspellings and are not: "Zenolith", "Fabrix", "Vantik" are real.
-A rare word being unfamiliar to you is not evidence that it is wrong. Ask first.`
-
 // toolInput is the one argument shape every call uses.
 //
 // Args is a map rather than json.RawMessage because the SDK derives the tool's
@@ -87,7 +60,7 @@ type handlerFunc func(context.Context, *Service, json.RawMessage) (string, error
 // storeHandler is a handler that needs the local database. withStore opens and
 // closes it, so nine handlers do not each repeat that and none can forget the
 // close.
-type storeHandler func(context.Context, *Service, *store.Store, json.RawMessage) (string, error)
+type storeHandler func(context.Context, *store.Store, json.RawMessage) (string, error)
 
 func withStore(handler storeHandler) handlerFunc {
 	return func(ctx context.Context, service *Service, raw json.RawMessage) (string, error) {
@@ -96,28 +69,7 @@ func withStore(handler storeHandler) handlerFunc {
 			return "", err
 		}
 		defer database.Close()
-		return handler(ctx, service, database, raw)
-	}
-}
-
-var handlers map[string]handlerFunc
-
-func init() {
-	// Assigned in init because the handlers refer to helpText, which reads this
-	// map: a direct initialisation would be a cycle.
-	handlers = map[string]handlerFunc{
-		"help":         handleHelp,
-		"status":       withStore(handleStatus),
-		"list":         withStore(handleList),
-		"read":         withStore(handleRead),
-		"search":       withStore(handleSearch),
-		"summary":      withStore(handleSummary),
-		"participants": withStore(handleParticipants),
-		"recording":    handleRecording,
-		"login":        handleLogin,
-		"edit_line":    withStore(handleEditLine),
-		"line_history": withStore(handleLineHistory),
-		"restore_line": withStore(handleRestoreLine),
+		return handler(ctx, database, raw)
 	}
 }
 

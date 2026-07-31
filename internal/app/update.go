@@ -164,9 +164,12 @@ func (m model) meetingsKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Cycle the status filter rather than opening another prompt: there are
 		// only a few states and cycling is one key. The list comes from the
 		// store so the filter cannot offer a status nothing ever writes.
-		for index, state := range store.MeetingStatuses {
+		// The empty first entry is this screen's "no filter"; the rest is the
+		// store's vocabulary.
+		cycle := append([]string{""}, store.MeetingStatuses...)
+		for index, state := range cycle {
 			if state == m.statusFilter {
-				m.statusFilter = store.MeetingStatuses[(index+1)%len(store.MeetingStatuses)]
+				m.statusFilter = cycle[(index+1)%len(cycle)]
 				break
 			}
 		}
@@ -369,12 +372,10 @@ func (m model) confirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	action := m.confirming
 	m.confirming = ""
+	// Answering no always returns to where the question was asked from: for
+	// "discard changes?" that means back to editing, which is the only useful
+	// thing that answer can mean.
 	if answer != "y" {
-		if action == "discard" {
-			// Answering no to "discard changes?" returns to editing, which is
-			// the only useful thing that answer can mean.
-			return m, nil
-		}
 		return m, nil
 	}
 

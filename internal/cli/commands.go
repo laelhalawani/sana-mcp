@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 
 	"fmt"
 	"strconv"
@@ -52,14 +53,14 @@ func runStatus(database *store.Store, options Options) int {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1
 	}
-	fmt.Fprintf(options.Stdout, "%s\n", status.Label())
+	fmt.Fprintf(options.Stdout, "%s\n", render.StatusLabel(status))
 	fmt.Fprint(options.Stdout, render.StatusLines(status))
 	return 0
 }
 
 func runList(database *store.Store, command Command, options Options) int {
 	query := strings.Join(command.Args, " ")
-	meetings, total, err := database.ListMeetings(store.ListOptions{Limit: 25, Query: query})
+	meetings, total, err := database.ListMeetings(store.ListOptions{Query: query})
 	if err != nil {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1
@@ -101,8 +102,7 @@ func runRead(database *store.Store, command Command, options Options) int {
 	}
 	fmt.Fprintf(options.Stdout, "%s\n", meeting.Title)
 	for _, line := range lines {
-		fmt.Fprintf(options.Stdout, "%d [%s] %s: %s\n",
-			line.LineNo, render.Clock(line.StartMS), line.Speaker, line.Text)
+		fmt.Fprintln(options.Stdout, render.TranscriptLine(line, true))
 	}
 	return 0
 }
@@ -119,17 +119,11 @@ func runSearch(database *store.Store, command Command, options Options) int {
 		return 1
 	}
 	if len(hits) == 0 {
-		fmt.Fprintf(options.Stdout,
-			"Nothing matched %q.\n\n%s\n", query, render.NoMatchHint)
+		fmt.Fprint(options.Stdout, render.NoMatches(query))
 		return 0
 	}
 	fmt.Fprintf(options.Stdout, "%d results for %q\n\n", len(hits), query)
-	for _, hit := range hits {
-		fmt.Fprintf(options.Stdout, "%s  line %d  %s\n  %s\n",
-			hit.MeetingID, hit.LineNo,
-			render.Date(hit.CreatedMS),
-			strings.TrimSpace(hit.Text))
-	}
+	fmt.Fprint(options.Stdout, render.SearchHits(hits))
 	return 0
 }
 
@@ -160,17 +154,19 @@ func runRecording(ctx context.Context, runtime *bootstrap.Runtime, command Comma
 		return 2
 	}
 	session, err := sana.LoadSession(runtime.Paths.Session)
-	if err != nil || !session.SignedIn() {
-		fmt.Fprintln(options.Stderr, "sana-mcp: not signed in; run sana-mcp login")
-		return 1
-	}
-	client := sana.New("", session)
-	metadata, err := client.Meeting(ctx, command.Args[0])
 	if err != nil {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1
 	}
-	link := metadata.Recording()
+	link, err := sana.RecordingLink(ctx, session, command.Args[0])
+	if errors.Is(err, sana.ErrUnauthorized) {
+		fmt.Fprintln(options.Stderr, "sana-mcp: not signed in; run sana-mcp login")
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+		return 1
+	}
 	if link == "" {
 		fmt.Fprintln(options.Stdout, "This meeting has no recording.")
 		return 0

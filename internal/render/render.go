@@ -115,6 +115,56 @@ func StatusLines(status store.Status) string {
 	return out.String()
 }
 
+// TranscriptLine formats one line the way every surface prints it. This is the
+// most-read output of the program and the shape an agent parses, so it has one
+// definition.
+func TranscriptLine(line store.Line, timestamps bool) string {
+	if timestamps {
+		return fmt.Sprintf("%d [%s] %s: %s", line.LineNo, Clock(line.StartMS), line.Speaker, line.Text)
+	}
+	return fmt.Sprintf("%d %s: %s", line.LineNo, line.Speaker, line.Text)
+}
+
+// SearchHits lists matches with the meeting and line to read next.
+func SearchHits(hits []store.Hit) string {
+	var out strings.Builder
+	for _, hit := range hits {
+		fmt.Fprintf(&out, "%s  line %d  %s\n  %s\n",
+			hit.MeetingID, hit.LineNo, Date(hit.CreatedMS), strings.TrimSpace(hit.Text))
+	}
+	return out.String()
+}
+
+// NoMatches explains an empty result, including why a name may be spelled
+// differently than the user expects.
+func NoMatches(query string) string {
+	return fmt.Sprintf("Nothing matched %q.\n\n%s\n", query, NoMatchHint)
+}
+
+// StatusLabel renders a sync phase for a person. It lives here rather than on
+// store.Status because it is phrasing, and every surface that shows it already
+// renders the numbers through StatusLines.
+func StatusLabel(status store.Status) string {
+	switch status.Phase {
+	case store.PhaseIdle:
+		return "Waiting to start"
+	case store.PhaseListing:
+		return "Discovering meetings"
+	case store.PhaseDownloading:
+		return "Syncing meetings"
+	case store.PhaseSynced:
+		if status.Remaining == 0 {
+			return "Up to date"
+		}
+		return "Syncing meetings"
+	case store.PhaseNeedsLogin:
+		return "Sign in required"
+	case store.PhaseError:
+		return "Sync needs attention"
+	}
+	return "Syncing meetings"
+}
+
 // ProgressBar draws a fixed-width bar. An unknown total renders as an empty
 // bar rather than a full one, and keeps its frame so the layout does not jump
 // when the first count arrives.
