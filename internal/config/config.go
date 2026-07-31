@@ -4,8 +4,11 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 const currentVersion = 1
@@ -61,12 +64,51 @@ func Default() Config {
 	}
 }
 
+// File is where settings are persisted.
+func File(paths Paths) string { return filepath.Join(paths.Root, "config.toml") }
+
 // Load reads the settings, falling back to defaults when none are stored yet.
+//
+// A malformed file is reported rather than silently replaced with defaults: a
+// person who edited it by hand should be told, not have their file ignored.
 func Load(paths Paths) (Config, error) {
-	// Settings are not written until the user changes one, so a missing file is
-	// the normal case rather than an error.
-	if _, err := os.Stat(filepath.Join(paths.Root, "config.toml")); errors.Is(err, os.ErrNotExist) {
+	payload, err := os.ReadFile(File(paths))
+	if errors.Is(err, os.ErrNotExist) {
+		// Settings are not written until one is changed, so absence is normal.
 		return Default(), nil
 	}
-	return Default(), nil // TODO: decode config.toml once the settings screen exists
+	if err != nil {
+		return Config{}, err
+	}
+	settings := Default()
+	if err := toml.Unmarshal(payload, &settings); err != nil {
+		return Config{}, fmt.Errorf("read %s: %w", File(paths), err)
+	}
+	if settings.SyncIntervalMinutes <= 0 {
+		settings.SyncIntervalMinutes = Default().SyncIntervalMinutes
+	}
+	settings.Version = currentVersion
+	return settings, nil
+}
+
+// Save writes the settings atomically, so an interrupted write cannot leave a
+// half-written file that then fails to parse.
+func Save(paths Paths, settings Config) error {
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		return err
+	}
+	settings.Version = currentVersion
+	payload, err := toml.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	temporary := File(paths) + ".new"
+	if err := os.WriteFile(temporary, payload, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, File(paths)); err != nil {
+		os.Remove(temporary)
+		return err
+	}
+	return nil
 }

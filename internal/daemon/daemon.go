@@ -123,6 +123,19 @@ func (s *Server) Serve(ctx context.Context) error {
 			s.logf("sync failed: %v", err)
 			s.store.SetError(err.Error())
 		}
+		// A cycle fetches a bounded batch, so a first sync of hundreds of
+		// meetings needs many of them. Waiting the poll interval between
+		// batches would turn a backfill into hours of idling; only wait once
+		// there is nothing left to fetch.
+		if status, err := s.store.Status(); err == nil && !status.Complete() &&
+			status.Phase == store.PhaseDownloading {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				continue
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return nil

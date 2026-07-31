@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+
 	"strings"
 	"time"
 
@@ -271,7 +272,7 @@ func handleSearch(_ context.Context, service *Service, raw json.RawMessage) (str
 	}
 	defer database.Close()
 
-	hits, err := database.Search(args.Query, args.Limit, (args.Page-1)*args.Limit)
+	hits, err := database.Search(args.Query, args.Limit, (args.Page-1)*args.Limit, args.Sort)
 	if err != nil {
 		return "", err
 	}
@@ -280,12 +281,6 @@ func handleSearch(_ context.Context, service *Service, raw json.RawMessage) (str
 			"Nothing matched %q.\n\nTranscripts come from speech recognition, so a name may be "+
 				"spelled differently than you expect. Try a distinctive word from the same "+
 				"discussion instead.", args.Query), nil
-	}
-	switch args.Sort {
-	case "newest":
-		sort.SliceStable(hits, func(i, j int) bool { return hits[i].CreatedMS > hits[j].CreatedMS })
-	case "oldest":
-		sort.SliceStable(hits, func(i, j int) bool { return hits[i].CreatedMS < hits[j].CreatedMS })
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "%d results for %q\n\n", len(hits), args.Query)

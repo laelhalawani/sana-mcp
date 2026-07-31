@@ -121,7 +121,7 @@ func runSearch(database *store.Store, command Command, options Options) int {
 		fmt.Fprintln(options.Stderr, "sana-mcp: search needs a query")
 		return 2
 	}
-	hits, err := database.Search(query, 20, 0)
+	hits, err := database.Search(query, 20, 0, store.SortBest)
 	if err != nil {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1

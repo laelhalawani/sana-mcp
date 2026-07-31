@@ -164,7 +164,7 @@ func TestSearchOpensTheMatchingLine(t *testing.T) {
 	}
 	m = press(m, "enter")
 	// The search command runs asynchronously; drive it directly.
-	hits, err := m.store.Search("pricing", 10, 0)
+	hits, err := m.store.Search("pricing", 10, 0, store.SortBest)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}

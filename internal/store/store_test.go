@@ -45,7 +45,7 @@ func TestEditAppliesAndIsSearchable(t *testing.T) {
 		t.Fatalf("edit: %v", err)
 	}
 
-	hits, err := store.Search("Fabrix", 10, 0)
+	hits, err := store.Search("Fabrix", 10, 0, SortBest)
 	if err != nil {
 		t.Fatalf("search corrected: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestEditAppliesAndIsSearchable(t *testing.T) {
 
 	// What was actually said stays reachable: the original column is still
 	// indexed, just weighted far below the current text.
-	spoken, err := store.Search("Fabrik", 10, 0)
+	spoken, err := store.Search("Fabrik", 10, 0, SortBest)
 	if err != nil {
 		t.Fatalf("search original: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestEditRejectsMismatchedText(t *testing.T) {
 		t.Fatalf("expected ErrLineMismatch, got %v", err)
 	}
 	// The line must be untouched.
-	hits, err := store.Search("Fabrik", 10, 0)
+	hits, err := store.Search("Fabrik", 10, 0, SortBest)
 	if err != nil || len(hits) != 1 {
 		t.Fatalf("original line should be intact, got %+v (%v)", hits, err)
 	}
@@ -153,7 +153,7 @@ func TestEditsSurviveRedownloadWhenLinesShift(t *testing.T) {
 		t.Fatalf("re-download: %v", err)
 	}
 
-	hits, err := store.Search("Fabrix", 10, 0)
+	hits, err := store.Search("Fabrix", 10, 0, SortBest)
 	if err != nil {
 		t.Fatalf("search after re-download: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestVanishedLineLeavesEditStaleNotApplied(t *testing.T) {
 		t.Fatalf("an unmatched edit must be kept as stale, got %+v", history)
 	}
 	// It must not have been applied to the surviving line.
-	hits, err := store.Search("corrected", 10, 0)
+	hits, err := store.Search("corrected", 10, 0, SortBest)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}

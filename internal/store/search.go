@@ -18,13 +18,30 @@ type Hit struct {
 // a correct hit. The two UNINDEXED columns take weight 0.
 const bm25Weights = `0.0, 0.0, 10.0, 0.5`
 
-// Search runs a keyword query across transcripts, newest-best first by
-// relevance. It is the primary channel: BM25 wins on proper nouns, which is
-// what people actually search meetings for.
-func (s *Store) Search(query string, limit, offset int) ([]Hit, error) {
+// Sort orders for Search.
+const (
+	SortBest   = "best"
+	SortNewest = "newest"
+	SortOldest = "oldest"
+)
+
+// Search runs a keyword query across transcripts. It is the primary channel:
+// BM25 wins on proper nouns, which is what people actually search meetings for.
+//
+// The sort is applied in SQL rather than to the returned page. Sorting a page
+// that relevance already selected would order a handful of rows and call it
+// "newest", which is not what the caller asked for.
+func (s *Store) Search(query string, limit, offset int, sort string) ([]Hit, error) {
 	match := ftsQuery(query)
 	if match == "" {
 		return nil, nil
+	}
+	order := "score"
+	switch sort {
+	case SortNewest:
+		order = "m.created_ms DESC, score"
+	case SortOldest:
+		order = "m.created_ms ASC, score"
 	}
 	rows, err := s.db.Query(
 		`SELECT ls.meeting_id, m.title, ls.line_no, l.text, m.created_ms,
@@ -34,7 +51,7 @@ func (s *Store) Search(query string, limit, offset int) ([]Hit, error) {
 		   JOIN transcript_lines l
 		     ON l.meeting_id = ls.meeting_id AND l.line_no = ls.line_no
 		  WHERE line_search MATCH ?
-		  ORDER BY score
+		  ORDER BY `+order+`
 		  LIMIT ? OFFSET ?`,
 		match, limit, offset,
 	)
