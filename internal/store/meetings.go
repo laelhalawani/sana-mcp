@@ -36,6 +36,17 @@ func (o *ListOptions) Normalize() {
 	}
 }
 
+// Pages reports how many pages of this size a total spans, at least one so an
+// empty result still reads as "page 1 of 1". It lives beside Normalize so a
+// caller rendering "page X of Y" uses the same numbers the query did.
+func (o ListOptions) Pages(total int) int {
+	o.Normalize()
+	if pages := (total + o.Limit - 1) / o.Limit; pages > 1 {
+		return pages
+	}
+	return 1
+}
+
 // ListMeetings returns one page of meetings and the total matching count.
 func (s *Store) ListMeetings(options ListOptions) ([]Meeting, int, error) {
 	options.Normalize()

@@ -99,7 +99,7 @@ func handleList(_ context.Context, database *store.Store, raw json.RawMessage) (
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "%d meetings, page %d of %d\n\n",
-		total, options.Page, (total+options.Limit-1)/options.Limit)
+		total, options.Page, options.Pages(total))
 	for _, meeting := range meetings {
 		fmt.Fprintf(&out, "%s  %s  %s  %s\n",
 			meeting.MeetingID,

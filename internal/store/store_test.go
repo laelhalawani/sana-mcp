@@ -368,3 +368,22 @@ func TestSearchSortsAcrossMeetings(t *testing.T) {
 		t.Fatalf("paging returned %+v then %+v", first, second)
 	}
 }
+
+func TestPagesNeverReportsZero(t *testing.T) {
+	cases := []struct {
+		limit, total, want int
+	}{
+		{25, 0, 1}, // an empty result still reads as page 1 of 1
+		{25, 1, 1},
+		{25, 25, 1},
+		{25, 26, 2},
+		{10, 240, 24},
+		{0, 26, 2}, // an unset limit uses the default
+	}
+	for _, tc := range cases {
+		got := ListOptions{Limit: tc.limit}.Pages(tc.total)
+		if got != tc.want {
+			t.Errorf("limit %d total %d: pages %d, want %d", tc.limit, tc.total, got, tc.want)
+		}
+	}
+}

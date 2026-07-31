@@ -120,15 +120,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS line_search USING fts5(
   tokenize = 'unicode61'
 );
 
+-- Progress counters are not stored: Status derives every number by counting
+-- the meetings table, so a column here would be a second, staler answer.
 CREATE TABLE IF NOT EXISTS sync_state (
-  id                INTEGER PRIMARY KEY CHECK (id = 1),
-  phase             TEXT NOT NULL DEFAULT 'idle',
-  meetings_total    INTEGER,
-  transcripts_done  INTEGER,
-  transcripts_total INTEGER,
-  retrying          INTEGER NOT NULL DEFAULT 0,
-  last_error        TEXT,
-  updated_ms        INTEGER NOT NULL DEFAULT 0
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  phase      TEXT NOT NULL DEFAULT 'idle',
+  last_error TEXT,
+  updated_ms INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO sync_state (id) VALUES (1);
 `
