@@ -779,6 +779,39 @@ The working tree still has, from before the pivot:
 Decide whether any of this is worth landing on `main` before the rewrite takes
 over.
 
+## DELIVERED
+
+**v0.5.1 is released and live.** The rewrite is merged to `main`, CI and
+autorelease are green, and all six platform binaries plus both installers are
+published. The published one-liner was run end to end on a clean home.
+
+Measured outcomes against the TypeScript implementation:
+
+| | TypeScript / Bun | Go |
+|---|---|---|
+| binary | 120,854,656 B | **14,123,170 B** |
+| download time | ~90 s | **~8 s** |
+| indexing memory | 1.5 -> 6.79 GB, unbounded | bounded; no model, no daemon inference |
+| source | 33k lines `src/` + 42k tests | **6,289 lines total** |
+| `install.sh` / `.ps1` | 1,840 / 2,778 | 265 / 193 |
+| release ceremony | 6 files, 7 locations | one `VERSION` file |
+
+Verified against reality, not in the abstract: sign-in with a real emailed code,
+240 meetings discovered, transcripts stored and searchable, a second sync cycle
+that re-downloads nothing, the MCP protocol driven over stdio, the
+edit/history/restore cycle driven in a real terminal, and the published
+one-liner installed from the release.
+
+Five bugs were found only by running the thing, and none would have been caught
+by unit tests over mocks:
+
+1. `BeginTx(nil, ...)` blocked forever instead of failing.
+2. The MCP tool schema was derived from `json.RawMessage` and rejected every
+   well-formed call.
+3. `PutMeeting` overwrote `word_count`, emptying every meeting on each sync.
+4. A normal client disconnect was reported as a crash, exit 1.
+5. The installer announced stopping a daemon that never existed.
+
 ## Status
 
 - [x] Create `go-rewrite` branch and this plan
@@ -787,8 +820,15 @@ over.
 - [x] Investigation: Go options for search + semantic search
 - [x] Decide search architecture (pending real-corpus validation)
 - [x] Preserve investigation prototypes in `prototypes/`
-- [ ] **Validate potion vs MiniLM on the real corpus** - the one open question
-- [ ] Port plan: auth, sync, local ops, MCP contract, TUI
+- [x] Search decision revised against the real corpus (see below)
+- [x] Port: auth, sync, local ops, MCP contract, TUI, installer
+- [x] Review, fix every finding, test end to end
+- [x] Merge to main and release v0.5.1
+
+Deferred, deliberately: the optional dense channel. v1 ships keyword-only,
+because the measurements showed the semantic index never retrieved the cases it
+existed for. potion-retrieval-32M in Go remains the option if real use shows a
+need; the prototype in `prototypes/` is ready.
 
 ## Also worth fixing, found while testing v0.4.22
 
