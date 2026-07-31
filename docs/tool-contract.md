@@ -79,12 +79,13 @@ Rules, enforced rather than merely documented:
 ## Semantics
 
 - `list.sort` is `"newest"` (default) or `"oldest"`. `list.filter` is
-  `{status: "ready"|"downloading"|"processing"|"retrying", date: {from, to}}`
+  `{status: "ready"|"processing"|"retrying", date: {from, to}}`
   with ISO dates (`YYYY-MM-DD`) or epoch milliseconds.
 - `read.lines` is a 1-based, inclusive `[start, end]` range. With no selection
   it reports the line count and the options rather than dumping the transcript;
   `full: true` returns everything.
 - `search.sort` is `"best"` (relevance, default), `"newest"`, or `"oldest"`.
+  `search` takes no date filter.
   Search is FTS5 BM25 over both the current text and what was originally
   transcribed, weighted 20:1 in favour of the current text.
 - `recording` fetches a live Sana URL that expires after a few hours. It is the

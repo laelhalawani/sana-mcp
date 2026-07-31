@@ -4,7 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
+
+	"github.com/laelhalawani/sana-mcp/internal/fsx"
 )
 
 // LoadSession reads the persisted session. A missing file is not an error: it
@@ -28,22 +29,18 @@ func LoadSession(path string) (*Session, error) {
 // cookie that grants access to a person's meetings, so it is written 0600 and
 // replaced by rename rather than truncated in place.
 func SaveSession(path string, session *Session) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	payload, err := json.MarshalIndent(session, "", "  ")
 	if err != nil {
 		return err
 	}
-	temporary := path + ".new"
-	if err := os.WriteFile(temporary, payload, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		os.Remove(temporary)
-		return err
-	}
-	return nil
+	return fsx.WriteAtomic(path, payload, 0o600)
+}
+
+// SignedIn reports whether this session can authenticate. A nil session is not
+// signed in, which lets every caller ask the same question the same way instead
+// of spelling out the nil-and-cookie check themselves.
+func (s *Session) SignedIn() bool {
+	return s != nil && s.Cookies[SessionCookie] != ""
 }
 
 // SessionFrom captures the client's current cookies and identity for storage.

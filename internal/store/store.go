@@ -20,7 +20,7 @@ import (
 // schemaVersion is bumped whenever migrate needs to do more work. Every
 // migration must preserve line_edits: corrections are user-owned data, not
 // cache, and cannot be rebuilt by re-syncing.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Store is an open database.
 type Store struct {
@@ -59,9 +59,6 @@ func Open(path string) (*Store, error) {
 
 // Close releases the database.
 func (s *Store) Close() error { return s.db.Close() }
-
-// DB exposes the handle for packages that own their own queries.
-func (s *Store) DB() *sql.DB { return s.db }
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meetings (
@@ -148,10 +145,44 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	// Version 2 aligns each line_search row's rowid with its transcript_lines
+	// row, so corrections can update the index by rowid instead of scanning
+	// every indexed line. A database written by version 1 has arbitrary index
+	// rowids, and updating those by rowid would rewrite the wrong line's index
+	// entry - so the index is rebuilt rather than trusted.
+	//
+	// Only the index is rebuilt. Transcript text and corrections are untouched:
+	// line_edits is user-owned data that no re-sync can recover.
+	if current < 2 {
+		if err := rebuildSearchIndex(s.db); err != nil {
+			return fmt.Errorf("rebuild search index: %w", err)
+		}
+	}
 	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("record schema version: %w", err)
 	}
 	return nil
+}
+
+// rebuildSearchIndex repopulates line_search from transcript_lines, giving each
+// index row the rowid of the line it describes.
+func rebuildSearchIndex(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM line_search`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO line_search (rowid, meeting_id, line_no, text, original_text)
+		 SELECT rowid, meeting_id, line_no, text, original_text FROM transcript_lines`,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ErrNotFound is returned when a meeting or line does not exist locally.

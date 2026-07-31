@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 
 	"strings"
 	"time"
 
+	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
@@ -20,9 +20,9 @@ var schemas = map[string]string{
 	"help":         `{tool?: string}`,
 	"login":        `{email: string, confirmation_code?: string}  - call with email first, then with the code`,
 	"status":       `{}`,
-	"list":         `{page?: int=1, limit?: int=25, query?: string, sort?: "newest"|"oldest", filter?: {status?: "ready"|"downloading"|"processing"|"retrying", date?: {from?: string, to?: string}}}`,
+	"list":         `{page?: int=1, limit?: int=25, query?: string, sort?: "newest"|"oldest", filter?: {status?: "ready"|"processing"|"retrying", date?: {from?: string, to?: string}}}`,
 	"read":         `{meeting_id: string, full?: bool, lines?: [start:int, end:int], timestamps?: bool=true}`,
-	"search":       `{query: string, page?: int=1, limit?: int=10, sort?: "best"|"newest"|"oldest", filter?: {date?: {from?: string, to?: string}}}`,
+	"search":       `{query: string, page?: int=1, limit?: int=10, sort?: "best"|"newest"|"oldest"}`,
 	"summary":      `{meeting_id: string}`,
 	"participants": `{meeting_id: string}`,
 	"recording":    `{meeting_id: string}  - fetched live from Sana; the link expires after a few hours`,
@@ -61,27 +61,14 @@ func handleHelp(_ context.Context, _ *Service, raw json.RawMessage) (string, err
 	return helpText(args.Tool), nil
 }
 
-func handleStatus(_ context.Context, service *Service, _ json.RawMessage) (string, error) {
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
+func handleStatus(_ context.Context, service *Service, database *store.Store, _ json.RawMessage) (string, error) {
 	status, err := database.Status()
 	if err != nil {
 		return "", err
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "%s\n", status.Label())
-	fmt.Fprintf(&out, "meetings      %d of %d downloaded\n", status.Meetings, status.MeetingsTotal)
-	fmt.Fprintf(&out, "transcripts   %d of %d\n", status.TranscriptsDone, status.TranscriptsTotal)
-	if status.Remaining > 0 {
-		fmt.Fprintf(&out, "remaining     %d\n", status.Remaining)
-	}
-	if status.LastError != "" {
-		fmt.Fprintf(&out, "last error    %s\n", status.LastError)
-	}
+	out.WriteString(render.StatusLines(status))
 	if status.Phase == store.PhaseNeedsLogin {
 		out.WriteString("\nSign in with meeting_transcripts(\"login\", {\"email\": \"you@example.com\"}).\n")
 	}
@@ -109,7 +96,7 @@ type dateFilter struct {
 	To   string `json:"to"`
 }
 
-func handleList(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleList(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		Page   int    `json:"page"`
 		Limit  int    `json:"limit"`
@@ -127,6 +114,7 @@ func handleList(_ context.Context, service *Service, raw json.RawMessage) (strin
 		Page: args.Page, Limit: args.Limit, Query: args.Query,
 		Sort: args.Sort, Status: args.Filter.Status,
 	}
+	options.Normalize()
 	if args.Filter.Date != nil {
 		from, err := dateMS(args.Filter.Date.From)
 		if err != nil {
@@ -139,12 +127,6 @@ func handleList(_ context.Context, service *Service, raw json.RawMessage) (strin
 		options.FromMS, options.ToMS = from, to
 	}
 
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
 	meetings, total, err := database.ListMeetings(options)
 	if err != nil {
 		return "", err
@@ -152,27 +134,20 @@ func handleList(_ context.Context, service *Service, raw json.RawMessage) (strin
 	if len(meetings) == 0 {
 		return "No meetings match. Try meeting_transcripts(\"status\") to see whether sync has run.", nil
 	}
-	page := options.Page
-	if page < 1 {
-		page = 1
-	}
-	limit := options.Limit
-	if limit < 1 {
-		limit = 25
-	}
 	var out strings.Builder
-	fmt.Fprintf(&out, "%d meetings, page %d of %d\n\n", total, page, (total+limit-1)/limit)
+	fmt.Fprintf(&out, "%d meetings, page %d of %d\n\n",
+		total, options.Page, (total+options.Limit-1)/options.Limit)
 	for _, meeting := range meetings {
 		fmt.Fprintf(&out, "%s  %s  %s  %s\n",
 			meeting.MeetingID,
-			time.UnixMilli(meeting.CreatedMS).Format("2006-01-02 15:04"),
+			render.Timestamp(meeting.CreatedMS),
 			meeting.Status,
 			meeting.Title)
 	}
 	return out.String(), nil
 }
 
-func handleRead(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleRead(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID  string `json:"meeting_id"`
 		Full       bool   `json:"full"`
@@ -185,12 +160,6 @@ func handleRead(_ context.Context, service *Service, raw json.RawMessage) (strin
 	if args.MeetingID == "" {
 		return "", errors.New("meeting_id is required")
 	}
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
 	meeting, err := database.GetMeeting(args.MeetingID)
 	if err != nil {
 		return "", notFoundHint(err, args.MeetingID)
@@ -220,7 +189,7 @@ func handleRead(_ context.Context, service *Service, raw json.RawMessage) (strin
 		return fmt.Sprintf(
 			"%s\n%s, %d lines.\n\nRead it with lines: [1, %d] for a range, or full: true for everything.",
 			meeting.Title,
-			time.UnixMilli(meeting.CreatedMS).Format("2006-01-02 15:04"),
+			render.Timestamp(meeting.CreatedMS),
 			count, min(count, 50)), nil
 	}
 
@@ -234,7 +203,7 @@ func handleRead(_ context.Context, service *Service, raw json.RawMessage) (strin
 	for _, line := range lines {
 		if timestamps {
 			fmt.Fprintf(&out, "%d [%s] %s: %s\n",
-				line.LineNo, clock(line.StartMS), line.Speaker, line.Text)
+				line.LineNo, render.Clock(line.StartMS), line.Speaker, line.Text)
 			continue
 		}
 		fmt.Fprintf(&out, "%d %s: %s\n", line.LineNo, line.Speaker, line.Text)
@@ -242,12 +211,7 @@ func handleRead(_ context.Context, service *Service, raw json.RawMessage) (strin
 	return out.String(), nil
 }
 
-func clock(ms int64) string {
-	seconds := ms / 1000
-	return fmt.Sprintf("%d:%02d", seconds/60, seconds%60)
-}
-
-func handleSearch(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleSearch(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		Query string `json:"query"`
 		Page  int    `json:"page"`
@@ -266,119 +230,47 @@ func handleSearch(_ context.Context, service *Service, raw json.RawMessage) (str
 	if args.Limit < 1 {
 		args.Limit = 10
 	}
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
 	hits, err := database.Search(args.Query, args.Limit, (args.Page-1)*args.Limit, args.Sort)
 	if err != nil {
 		return "", err
 	}
 	if len(hits) == 0 {
-		return fmt.Sprintf(
-			"Nothing matched %q.\n\nTranscripts come from speech recognition, so a name may be "+
-				"spelled differently than you expect. Try a distinctive word from the same "+
-				"discussion instead.", args.Query), nil
+		return fmt.Sprintf("Nothing matched %q.\n\n%s", args.Query, render.NoMatchHint), nil
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "%d results for %q\n\n", len(hits), args.Query)
 	for _, hit := range hits {
 		fmt.Fprintf(&out, "%s  line %d  %s\n  %s\n",
 			hit.MeetingID, hit.LineNo,
-			time.UnixMilli(hit.CreatedMS).Format("2006-01-02"),
+			render.Date(hit.CreatedMS),
 			strings.TrimSpace(hit.Text))
 	}
 	out.WriteString("\nRead around a hit with read {meeting_id, lines: [n-5, n+5]}.\n")
 	return out.String(), nil
 }
 
-func handleSummary(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleSummary(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	meetingID, err := meetingArg(raw)
 	if err != nil {
 		return "", err
 	}
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
-	summaryJSON, _, err := database.Metadata(meetingID)
+	metadata, _, err := database.Metadata(meetingID)
 	if err != nil {
 		return "", notFoundHint(err, meetingID)
 	}
-	var metadata sana.Metadata
-	if err := json.Unmarshal([]byte(summaryJSON), &metadata); err != nil {
-		return "", err
-	}
-	var out strings.Builder
-	if metadata.Summary != nil && *metadata.Summary != "" {
-		fmt.Fprintf(&out, "%s\n\n", strings.TrimSpace(*metadata.Summary))
-	}
-	for _, group := range metadata.Notes {
-		fmt.Fprintf(&out, "%s\n", group.Topic)
-		for _, note := range group.Notes {
-			fmt.Fprintf(&out, "  - %s\n", note)
-		}
-		out.WriteString("\n")
-	}
-	if len(metadata.ActionItems) > 0 {
-		out.WriteString("Action items\n")
-		for _, item := range metadata.ActionItems {
-			assignee := ""
-			if item.AssignedTo != nil && *item.AssignedTo != "" {
-				assignee = *item.AssignedTo + ": "
-			}
-			due := ""
-			if item.DueDate != nil && *item.DueDate != "" {
-				due = " (due " + *item.DueDate + ")"
-			}
-			fmt.Fprintf(&out, "  - %s%s%s\n", assignee, item.Action, due)
-		}
-	}
-	if out.Len() == 0 {
-		return "This meeting has no summary yet.", nil
-	}
-	return out.String(), nil
+	return render.Summary(metadata, render.Styles{}), nil
 }
 
-func handleParticipants(_ context.Context, service *Service, raw json.RawMessage) (string, error) {
+func handleParticipants(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
 	meetingID, err := meetingArg(raw)
 	if err != nil {
 		return "", err
 	}
-	database, err := service.openStore()
-	if err != nil {
-		return "", err
-	}
-	defer database.Close()
-
-	_, participantsJSON, err := database.Metadata(meetingID)
+	_, participants, err := database.Metadata(meetingID)
 	if err != nil {
 		return "", notFoundHint(err, meetingID)
 	}
-	var participants []sana.Participant
-	if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
-		return "", err
-	}
-	if len(participants) == 0 {
-		return "No participants are recorded for this meeting.", nil
-	}
-	var out strings.Builder
-	for _, participant := range participants {
-		email := ""
-		if participant.Email != nil {
-			email = "  " + *participant.Email
-		}
-		host := ""
-		if participant.IsHost {
-			host = "  (host)"
-		}
-		fmt.Fprintf(&out, "%s%s%s\n", participant.DisplayName, email, host)
-	}
-	return out.String(), nil
+	return render.Participants(participants, render.Styles{}), nil
 }
 
 // handleRecording fetches the link live: it expires after a few hours, so a
@@ -392,21 +284,20 @@ func handleRecording(ctx context.Context, service *Service, raw json.RawMessage)
 	if err != nil {
 		return "", err
 	}
-	if session == nil || session.Cookies[sana.SessionCookie] == "" {
+	if !session.SignedIn() {
 		return "", errors.New(
 			"not signed in; call meeting_transcripts(\"login\", {\"email\": \"you@example.com\"})")
 	}
-	client := sana.New(os.Getenv("SANA_BASE_URL"), session)
+	client := sana.New("", session)
 	metadata, err := client.Meeting(ctx, meetingID)
 	if err != nil {
 		return "", err
 	}
-	for _, candidate := range []*string{metadata.RecordingURL, metadata.FallbackRecordingURL} {
-		if candidate != nil && *candidate != "" {
-			return *candidate + "\n\nThis link expires after a few hours.", nil
-		}
+	link := metadata.Recording()
+	if link == "" {
+		return "This meeting has no recording.", nil
 	}
-	return "This meeting has no recording.", nil
+	return link + "\n\nThis link expires after a few hours.", nil
 }
 
 func handleLogin(ctx context.Context, service *Service, raw json.RawMessage) (string, error) {
@@ -420,7 +311,7 @@ func handleLogin(ctx context.Context, service *Service, raw json.RawMessage) (st
 	if strings.TrimSpace(args.Email) == "" {
 		return "", errors.New("email is required")
 	}
-	client := sana.New(os.Getenv("SANA_BASE_URL"), nil)
+	client := sana.New("", nil)
 
 	if args.Code == "" {
 		pending, err := client.RequestSignInCode(ctx, args.Email)
@@ -476,11 +367,4 @@ func notFoundHint(err error, meetingID string) error {
 			"no meeting %s is stored locally; find its id with meeting_transcripts(\"list\")", meetingID)
 	}
 	return err
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

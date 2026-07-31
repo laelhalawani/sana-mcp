@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/laelhalawani/sana-mcp/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -83,6 +84,22 @@ func (s *Service) dispatch(ctx context.Context, _ *mcp.CallToolRequest, input to
 
 type handlerFunc func(context.Context, *Service, json.RawMessage) (string, error)
 
+// storeHandler is a handler that needs the local database. withStore opens and
+// closes it, so nine handlers do not each repeat that and none can forget the
+// close.
+type storeHandler func(context.Context, *Service, *store.Store, json.RawMessage) (string, error)
+
+func withStore(handler storeHandler) handlerFunc {
+	return func(ctx context.Context, service *Service, raw json.RawMessage) (string, error) {
+		database, err := service.openStore()
+		if err != nil {
+			return "", err
+		}
+		defer database.Close()
+		return handler(ctx, service, database, raw)
+	}
+}
+
 var handlers map[string]handlerFunc
 
 func init() {
@@ -90,17 +107,17 @@ func init() {
 	// map: a direct initialisation would be a cycle.
 	handlers = map[string]handlerFunc{
 		"help":         handleHelp,
-		"status":       handleStatus,
-		"list":         handleList,
-		"read":         handleRead,
-		"search":       handleSearch,
-		"summary":      handleSummary,
-		"participants": handleParticipants,
+		"status":       withStore(handleStatus),
+		"list":         withStore(handleList),
+		"read":         withStore(handleRead),
+		"search":       withStore(handleSearch),
+		"summary":      withStore(handleSummary),
+		"participants": withStore(handleParticipants),
 		"recording":    handleRecording,
 		"login":        handleLogin,
-		"edit_line":    handleEditLine,
-		"line_history": handleLineHistory,
-		"restore_line": handleRestoreLine,
+		"edit_line":    withStore(handleEditLine),
+		"line_history": withStore(handleLineHistory),
+		"restore_line": withStore(handleRestoreLine),
 	}
 }
 

@@ -62,7 +62,7 @@ CREATE TABLE meetings (
   meeting_id   TEXT PRIMARY KEY,
   title        TEXT NOT NULL,
   created_ms   INTEGER NOT NULL,
-  status       TEXT NOT NULL,   -- ready | downloading | processing | retrying
+  status       TEXT NOT NULL,   -- ready | processing | retrying
   word_count   INTEGER NOT NULL DEFAULT 0
 );
 

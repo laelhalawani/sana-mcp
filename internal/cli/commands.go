@@ -3,15 +3,13 @@ package cli
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
+	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
@@ -55,14 +53,7 @@ func runStatus(database *store.Store, options Options) int {
 		return 1
 	}
 	fmt.Fprintf(options.Stdout, "%s\n", status.Label())
-	fmt.Fprintf(options.Stdout, "meetings      %d of %d downloaded\n", status.Meetings, status.MeetingsTotal)
-	fmt.Fprintf(options.Stdout, "transcripts   %d of %d\n", status.TranscriptsDone, status.TranscriptsTotal)
-	if status.Remaining > 0 {
-		fmt.Fprintf(options.Stdout, "remaining     %d\n", status.Remaining)
-	}
-	if status.LastError != "" {
-		fmt.Fprintf(options.Stdout, "last error    %s\n", status.LastError)
-	}
+	fmt.Fprint(options.Stdout, render.StatusLines(status))
 	return 0
 }
 
@@ -81,7 +72,7 @@ func runList(database *store.Store, command Command, options Options) int {
 	for _, meeting := range meetings {
 		fmt.Fprintf(options.Stdout, "%s  %s  %6d words  %-10s  %s\n",
 			meeting.MeetingID,
-			time.UnixMilli(meeting.CreatedMS).Format("2006-01-02 15:04"),
+			render.Timestamp(meeting.CreatedMS),
 			meeting.WordCount, meeting.Status, meeting.Title)
 	}
 	return 0
@@ -111,7 +102,7 @@ func runRead(database *store.Store, command Command, options Options) int {
 	fmt.Fprintf(options.Stdout, "%s\n", meeting.Title)
 	for _, line := range lines {
 		fmt.Fprintf(options.Stdout, "%d [%s] %s: %s\n",
-			line.LineNo, clock(line.StartMS), line.Speaker, line.Text)
+			line.LineNo, render.Clock(line.StartMS), line.Speaker, line.Text)
 	}
 	return 0
 }
@@ -129,16 +120,14 @@ func runSearch(database *store.Store, command Command, options Options) int {
 	}
 	if len(hits) == 0 {
 		fmt.Fprintf(options.Stdout,
-			"Nothing matched %q.\n\nTranscripts come from speech recognition, so a name may be\n"+
-				"spelled differently than you expect. Try a distinctive word from the\n"+
-				"same discussion instead.\n", query)
+			"Nothing matched %q.\n\n%s\n", query, render.NoMatchHint)
 		return 0
 	}
 	fmt.Fprintf(options.Stdout, "%d results for %q\n\n", len(hits), query)
 	for _, hit := range hits {
 		fmt.Fprintf(options.Stdout, "%s  line %d  %s\n  %s\n",
 			hit.MeetingID, hit.LineNo,
-			time.UnixMilli(hit.CreatedMS).Format("2006-01-02"),
+			render.Date(hit.CreatedMS),
 			strings.TrimSpace(hit.Text))
 	}
 	return 0
@@ -149,7 +138,7 @@ func runDocument(database *store.Store, command Command, options Options) int {
 		fmt.Fprintf(options.Stderr, "sana-mcp: %s needs a meeting id\n", command.Name)
 		return 2
 	}
-	summaryJSON, participantsJSON, err := database.Metadata(command.Args[0])
+	metadata, participants, err := database.Metadata(command.Args[0])
 	if err != nil {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1
@@ -158,74 +147,11 @@ func runDocument(database *store.Store, command Command, options Options) int {
 	// JSON Sana returned, which is the right thing to keep but the wrong thing
 	// to show a person at a terminal.
 	if command.Name == "summary" {
-		var metadata sana.Metadata
-		if err := json.Unmarshal([]byte(summaryJSON), &metadata); err != nil {
-			fmt.Fprintln(options.Stderr, "sana-mcp:", err)
-			return 1
-		}
-		fmt.Fprint(options.Stdout, renderSummary(metadata))
+		fmt.Fprint(options.Stdout, render.Summary(metadata, render.Styles{}))
 		return 0
 	}
-	var participants []sana.Participant
-	if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
-		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
-		return 1
-	}
-	fmt.Fprint(options.Stdout, renderParticipants(participants))
+	fmt.Fprint(options.Stdout, render.Participants(participants, render.Styles{}))
 	return 0
-}
-
-// renderSummary lays out a meeting's summary document as plain text.
-func renderSummary(metadata sana.Metadata) string {
-	var out strings.Builder
-	if metadata.Summary != nil && strings.TrimSpace(*metadata.Summary) != "" {
-		out.WriteString(strings.TrimSpace(*metadata.Summary) + "\n\n")
-	}
-	for _, group := range metadata.Notes {
-		fmt.Fprintf(&out, "%s\n", group.Topic)
-		for _, note := range group.Notes {
-			fmt.Fprintf(&out, "  - %s\n", note)
-		}
-		out.WriteString("\n")
-	}
-	if len(metadata.ActionItems) > 0 {
-		out.WriteString("Action items\n")
-		for _, item := range metadata.ActionItems {
-			assignee := ""
-			if item.AssignedTo != nil && *item.AssignedTo != "" {
-				assignee = *item.AssignedTo + ": "
-			}
-			due := ""
-			if item.DueDate != nil && *item.DueDate != "" {
-				due = " (due " + *item.DueDate + ")"
-			}
-			fmt.Fprintf(&out, "  - %s%s%s\n", assignee, item.Action, due)
-		}
-	}
-	if out.Len() == 0 {
-		return "This meeting has no summary yet.\n"
-	}
-	return out.String()
-}
-
-// renderParticipants lists attendees as plain text.
-func renderParticipants(participants []sana.Participant) string {
-	if len(participants) == 0 {
-		return "No participants are recorded for this meeting.\n"
-	}
-	var out strings.Builder
-	for _, participant := range participants {
-		email := ""
-		if participant.Email != nil && *participant.Email != "" {
-			email = "  " + *participant.Email
-		}
-		host := ""
-		if participant.IsHost {
-			host = "  (host)"
-		}
-		fmt.Fprintf(&out, "%s%s%s\n", participant.DisplayName, email, host)
-	}
-	return out.String()
 }
 
 func runRecording(ctx context.Context, runtime *bootstrap.Runtime, command Command, options Options) int {
@@ -234,23 +160,22 @@ func runRecording(ctx context.Context, runtime *bootstrap.Runtime, command Comma
 		return 2
 	}
 	session, err := sana.LoadSession(runtime.Paths.Session)
-	if err != nil || session == nil || session.Cookies[sana.SessionCookie] == "" {
+	if err != nil || !session.SignedIn() {
 		fmt.Fprintln(options.Stderr, "sana-mcp: not signed in; run sana-mcp login")
 		return 1
 	}
-	client := sana.New(os.Getenv("SANA_BASE_URL"), session)
+	client := sana.New("", session)
 	metadata, err := client.Meeting(ctx, command.Args[0])
 	if err != nil {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1
 	}
-	for _, candidate := range []*string{metadata.RecordingURL, metadata.FallbackRecordingURL} {
-		if candidate != nil && *candidate != "" {
-			fmt.Fprintln(options.Stdout, *candidate)
-			return 0
-		}
+	link := metadata.Recording()
+	if link == "" {
+		fmt.Fprintln(options.Stdout, "This meeting has no recording.")
+		return 0
 	}
-	fmt.Fprintln(options.Stdout, "This meeting has no recording.")
+	fmt.Fprintln(options.Stdout, link)
 	return 0
 }
 
@@ -274,7 +199,7 @@ func runLogin(ctx context.Context, runtime *bootstrap.Runtime, command Command, 
 		return 2
 	}
 
-	client := sana.New(os.Getenv("SANA_BASE_URL"), nil)
+	client := sana.New("", nil)
 	pending, err := client.RequestSignInCode(ctx, email)
 	if err != nil {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
@@ -297,9 +222,4 @@ func runLogin(ctx context.Context, runtime *bootstrap.Runtime, command Command, 
 	}
 	fmt.Fprintf(options.Stdout, "Signed in as %s.\nSync starts with the daemon; check sana-mcp status.\n", user.Email)
 	return 0
-}
-
-func clock(ms int64) string {
-	seconds := ms / 1000
-	return fmt.Sprintf("%d:%02d", seconds/60, seconds%60)
 }
