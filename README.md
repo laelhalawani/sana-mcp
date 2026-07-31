@@ -51,8 +51,9 @@ Linux, Windows, and WSL.
   on-demand **recording** links.
 - **Search** - line-level SQLite FTS5 with BM25 ranking, phrase and date-range
   filters, and sort options.
-- **Automatic sync** - the daemon polls for new meetings, retries incomplete
-  downloads, and never re-downloads a transcript it already has.
+- **Automatic sync** - a background daemon starts itself whenever you use
+  sana-mcp, polls for new meetings, retries incomplete downloads, and never
+  re-downloads a transcript it already has.
 - **Correct transcription errors** - and keep the original. See below.
 - **Works with your client** - registers with Claude Desktop, Claude Code,
   Cursor, VS Code, Codex, Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q,

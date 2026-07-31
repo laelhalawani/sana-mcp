@@ -21,6 +21,12 @@ Read `docs/tool-contract.md` before changing anything an agent sees, and
   only the single writer under a `flock`, and every reader opens SQLite
   directly. Do not add a socket.
 
+- **`render` has no terminal dependency.** It lays out domain values as text for
+  every surface, two of which are a stdio server and a one-shot CLI. Keystroke
+  handling and lipgloss live in `internal/tui`, which only the two terminal
+  surfaces import. This split was made after `render` was found dragging
+  bubbletea into the MCP server's dependency graph.
+
 ## Things that are load-bearing
 
 - **`line_edits` is user-owned data, not cache.** Deleting the database loses
@@ -33,6 +39,9 @@ Read `docs/tool-contract.md` before changing anything an agent sees, and
 - **Edits re-attach by content hash, not line number.** Re-transcription shifts
   line boundaries. An edit whose line cannot be found becomes `stale` and stays
   in history: never dropped, never applied to a different line.
+- **Sync starts itself.** Every surface calls `daemon.EnsureRunning`. Before it
+  existed, the `--detach` flag and the already-running branch were machinery for
+  a caller nobody had written, and background sync simply never happened.
 - **The tool description's warning about editing is part of the contract.** It
   is the only thing between a confident model and a corrupted transcript, and a
   test pins it. Transcripts are full of real names that look like misspellings -
