@@ -88,6 +88,23 @@ func (s *Store) Search(query string, limit, offset int, sort string) ([]Hit, err
 	return hits, rows.Err()
 }
 
+// SearchCount is how many lines match, for paging.
+//
+// It is a separate query rather than a window function over the page, because a
+// page cannot know the size of the set it came from, and "page 3 of ?" is not
+// something to show a person.
+func (s *Store) SearchCount(query string) (int, error) {
+	match := ftsQuery(query)
+	if match == "" {
+		return 0, nil
+	}
+	var total int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM line_search WHERE line_search MATCH ?`, match,
+	).Scan(&total)
+	return total, err
+}
+
 // ftsQuery turns a user's words into an FTS5 MATCH expression. Every term is
 // quoted, so punctuation a person types cannot become FTS5 syntax and cannot
 // make the query fail.

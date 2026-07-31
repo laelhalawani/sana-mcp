@@ -27,6 +27,10 @@ type Status struct {
 	TranscriptsTotal int
 	Remaining        int
 	LastError        string
+	// UpdatedMS is when the daemon last moved the phase on. It is what the
+	// status screen reports as the last completed sync, and it is the only
+	// evidence a person has that the daemon is alive at all.
+	UpdatedMS int64
 }
 
 // Complete reports whether there is nothing left to fetch.
@@ -54,8 +58,8 @@ func (s *Store) Status() (Status, error) {
 	var status Status
 	var lastError sql.NullString
 	err = tx.QueryRow(
-		`SELECT phase, last_error FROM sync_state WHERE id = 1`,
-	).Scan(&status.Phase, &lastError)
+		`SELECT phase, last_error, updated_ms FROM sync_state WHERE id = 1`,
+	).Scan(&status.Phase, &lastError, &status.UpdatedMS)
 	if err != nil {
 		return Status{}, err
 	}

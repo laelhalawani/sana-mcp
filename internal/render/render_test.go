@@ -71,15 +71,19 @@ func TestClockCarriesHours(t *testing.T) {
 	}
 }
 
-func TestProgressBarKeepsItsFrameWhenTotalIsUnknown(t *testing.T) {
-	bar := ProgressBar(0, 0, 4)
-	if bar != "[----]" {
-		t.Fatalf("an unknown total should still be framed, got %q", bar)
+func TestProgressBarDrawsNothingUntilTheTotalIsKnown(t *testing.T) {
+	// A framed but empty bar is what the user saw for twenty minutes while the
+	// first listing had not landed. It has to draw nothing instead.
+	if bar := ProgressBar(0, 0, 24); bar != "" {
+		t.Fatalf("an unknown total must not draw a bar, got %q", bar)
 	}
-	if got := ProgressBar(2, 4, 4); got != "[##--]" {
+	if bar := ProgressBar(2, 4, 4); bar != "" {
+		t.Fatalf("a bar narrower than eight columns must not draw, got %q", bar)
+	}
+	if got := ProgressBar(4, 8, 8); got != "[####----]" {
 		t.Fatalf("half progress = %q", got)
 	}
-	if got := ProgressBar(9, 4, 4); got != "[####]" {
+	if got := ProgressBar(99, 8, 8); got != "[########]" {
 		t.Fatalf("overflow must clamp, got %q", got)
 	}
 }

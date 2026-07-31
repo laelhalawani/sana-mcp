@@ -25,6 +25,14 @@ func run(ctx context.Context, runtime *bootstrap.Runtime, command Command, optio
 	database, err := store.Open(runtime.Paths.Database)
 	if err != nil {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+		// An unreadable database is not something a person can guess their way
+		// out of, and every command hits it, so the way out is printed here
+		// rather than left to be discovered.
+		if errors.Is(err, store.ErrForeignSchema) {
+			fmt.Fprintf(options.Stderr,
+				"Run sana-mcp install to replace it, or remove %s and sync again.\n",
+				runtime.Paths.Root)
+		}
 		return 1
 	}
 	defer database.Close()
