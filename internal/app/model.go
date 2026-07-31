@@ -88,7 +88,6 @@ func newModel(ctx context.Context, runtime *bootstrap.Runtime, database *store.S
 	}
 }
 
-type refreshMsg struct{}
 type tickMsg time.Time
 
 func tick() tea.Cmd {

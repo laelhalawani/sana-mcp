@@ -190,5 +190,25 @@ func rebuildSearchIndex(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// meetingIDs runs a query returning one id per row. The "what is still
+// pending" queries all have this shape, and each carried its own copy of the
+// scan loop.
+func (s *Store) meetingIDs(query string, args ...any) ([]string, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ErrNotFound is returned when a meeting or line does not exist locally.
 var ErrNotFound = errors.New("not found")

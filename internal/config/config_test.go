@@ -7,8 +7,7 @@ import (
 )
 
 func TestLoadReturnsDefaultsWhenNothingIsStored(t *testing.T) {
-	paths := Paths{Root: t.TempDir()}
-	settings, err := Load(paths)
+	settings, err := Load(PathsUnder(t.TempDir()))
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -17,32 +16,33 @@ func TestLoadReturnsDefaultsWhenNothingIsStored(t *testing.T) {
 	}
 }
 
-func TestSaveThenLoadRoundTrips(t *testing.T) {
-	paths := Paths{Root: t.TempDir()}
-	settings := Default()
-	settings.SyncIntervalMinutes = 45
-	settings.SemanticSearch = true
-	if err := Save(paths, settings); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	loaded, err := Load(paths)
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if loaded.SyncIntervalMinutes != 45 || !loaded.SemanticSearch {
-		t.Fatalf("settings did not round-trip: %+v", loaded)
-	}
-}
-
-// A hand-edited file that no longer parses must be reported, not silently
-// replaced with defaults.
-func TestMalformedConfigIsReported(t *testing.T) {
-	paths := Paths{Root: t.TempDir()}
+// The file is hand-edited rather than written by this program, so a person's
+// change to the interval has to be picked up.
+func TestLoadReadsAHandEditedFile(t *testing.T) {
+	paths := PathsUnder(t.TempDir())
 	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(paths.Root, "config.toml"),
-		[]byte("this is not = = toml"), 0o600); err != nil {
+	if err := os.WriteFile(File(paths), []byte("sync_interval_minutes = 45\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := Load(paths)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if settings.SyncIntervalMinutes != 45 {
+		t.Fatalf("expected the edited interval, got %d", settings.SyncIntervalMinutes)
+	}
+}
+
+// A malformed file is reported rather than silently replaced with defaults: a
+// person who edited it by hand should be told.
+func TestMalformedConfigIsReported(t *testing.T) {
+	paths := PathsUnder(t.TempDir())
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(File(paths), []byte("this is not = = toml"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(paths); err == nil {
@@ -52,17 +52,35 @@ func TestMalformedConfigIsReported(t *testing.T) {
 
 // A nonsensical interval must not make the daemon spin.
 func TestZeroIntervalFallsBackToTheDefault(t *testing.T) {
-	paths := Paths{Root: t.TempDir()}
-	settings := Default()
-	settings.SyncIntervalMinutes = 0
-	if err := Save(paths, settings); err != nil {
-		t.Fatalf("save: %v", err)
+	paths := PathsUnder(t.TempDir())
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	loaded, err := Load(paths)
+	if err := os.WriteFile(File(paths), []byte("sync_interval_minutes = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := Load(paths)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if loaded.SyncIntervalMinutes != Default().SyncIntervalMinutes {
-		t.Fatalf("a zero interval should fall back, got %d", loaded.SyncIntervalMinutes)
+	if settings.SyncIntervalMinutes != Default().SyncIntervalMinutes {
+		t.Fatalf("a zero interval should fall back, got %d", settings.SyncIntervalMinutes)
+	}
+}
+
+// Every path must come from the root, so a caller cannot assemble one that
+// silently misses a field and writes to "".
+func TestPathsUnderFillsEveryField(t *testing.T) {
+	paths := PathsUnder("/tmp/example")
+	for name, value := range map[string]string{
+		"Root": paths.Root, "Database": paths.Database, "Session": paths.Session,
+		"Lock": paths.Lock, "PID": paths.PID, "Log": paths.Log, "Pending": paths.Pending,
+	} {
+		if value == "" {
+			t.Errorf("%s is empty", name)
+		}
+		if name != "Root" && filepath.Dir(value) != "/tmp/example" {
+			t.Errorf("%s = %q, want it under the root", name, value)
+		}
 	}
 }

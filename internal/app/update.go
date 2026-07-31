@@ -7,6 +7,31 @@ import (
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
 
+// wrap moves a cursor within a list, wrapping at both ends. An empty list
+// leaves the cursor at zero rather than dividing by it.
+func wrap(cursor, delta, length int) int {
+	if length == 0 {
+		return 0
+	}
+	return (cursor + delta + length) % length
+}
+
+// typed applies one keystroke to a text buffer, reporting whether it changed.
+// Backspace on an empty buffer is not a change, which is what lets the editor
+// tell "typed then deleted" from "never touched".
+func typed(buffer string, key tea.KeyMsg) (string, bool) {
+	switch key.Type {
+	case tea.KeyBackspace:
+		if buffer == "" {
+			return buffer, false
+		}
+		return buffer[:len(buffer)-1], true
+	case tea.KeyRunes, tea.KeySpace:
+		return buffer + string(key.Runes), true
+	}
+	return buffer, false
+}
+
 func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
@@ -67,9 +92,9 @@ func (m model) key(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) menuKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "up", "k":
-		m.menuCursor = (m.menuCursor - 1 + len(menuItems)) % len(menuItems)
+		m.menuCursor = wrap(m.menuCursor, -1, len(menuItems))
 	case "down", "j":
-		m.menuCursor = (m.menuCursor + 1) % len(menuItems)
+		m.menuCursor = wrap(m.menuCursor, 1, len(menuItems))
 	case "enter":
 		target := menuItems[m.menuCursor].target
 		if target == screenQuit {
@@ -126,25 +151,17 @@ func (m model) meetingsKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case tea.KeyEsc:
 			m.filtering = false
 			m.filterInput = ""
-		case tea.KeyBackspace:
-			if len(m.filterInput) > 0 {
-				m.filterInput = m.filterInput[:len(m.filterInput)-1]
-			}
-		case tea.KeyRunes, tea.KeySpace:
-			m.filterInput += string(key.Runes)
+		default:
+			m.filterInput, _ = typed(m.filterInput, key)
 		}
 		return m, nil
 	}
 
 	switch key.String() {
 	case "up", "k":
-		if len(m.meetings) > 0 {
-			m.meetingCursor = (m.meetingCursor - 1 + len(m.meetings)) % len(m.meetings)
-		}
+		m.meetingCursor = wrap(m.meetingCursor, -1, len(m.meetings))
 	case "down", "j":
-		if len(m.meetings) > 0 {
-			m.meetingCursor = (m.meetingCursor + 1) % len(m.meetings)
-		}
+		m.meetingCursor = wrap(m.meetingCursor, 1, len(m.meetings))
 	case "pgdown", "right":
 		if m.meetingPage*m.pageSize() < m.meetingTotal {
 			m.meetingPage++
@@ -267,27 +284,19 @@ func (m model) searchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.runSearch()
 		case tea.KeyEsc:
 			m.screen = screenMenu
-		case tea.KeyBackspace:
-			if len(m.queryInput) > 0 {
-				m.queryInput = m.queryInput[:len(m.queryInput)-1]
-			}
 		case tea.KeyCtrlC:
 			return m, tea.Quit
-		case tea.KeyRunes, tea.KeySpace:
-			m.queryInput += string(key.Runes)
+		default:
+			m.queryInput, _ = typed(m.queryInput, key)
 		}
 		return m, nil
 	}
 
 	switch key.String() {
 	case "up", "k":
-		if len(m.hits) > 0 {
-			m.hitCursor = (m.hitCursor - 1 + len(m.hits)) % len(m.hits)
-		}
+		m.hitCursor = wrap(m.hitCursor, -1, len(m.hits))
 	case "down", "j":
-		if len(m.hits) > 0 {
-			m.hitCursor = (m.hitCursor + 1) % len(m.hits)
-		}
+		m.hitCursor = wrap(m.hitCursor, 1, len(m.hits))
 	case "enter":
 		if m.hitCursor < len(m.hits) {
 			hit := m.hits[m.hitCursor]
@@ -328,16 +337,12 @@ func (m model) editKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.screen = screenTranscript
 		return m, nil
-	case tea.KeyBackspace:
-		if len(m.editBuffer) > 0 {
-			m.editBuffer = m.editBuffer[:len(m.editBuffer)-1]
-			m.editDirty = true
-		}
 	case tea.KeyCtrlC:
 		return m, tea.Quit
-	case tea.KeyRunes, tea.KeySpace:
-		m.editBuffer += string(key.Runes)
-		m.editDirty = true
+	default:
+		buffer, changed := typed(m.editBuffer, key)
+		m.editBuffer = buffer
+		m.editDirty = m.editDirty || changed
 	}
 	return m, nil
 }
@@ -345,13 +350,9 @@ func (m model) editKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) historyKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "up", "k":
-		if len(m.history) > 0 {
-			m.historyCursor = (m.historyCursor - 1 + len(m.history)) % len(m.history)
-		}
+		m.historyCursor = wrap(m.historyCursor, -1, len(m.history))
 	case "down", "j":
-		if len(m.history) > 0 {
-			m.historyCursor = (m.historyCursor + 1) % len(m.history)
-		}
+		m.historyCursor = wrap(m.historyCursor, 1, len(m.history))
 	case "r":
 		if m.historyCursor < len(m.history) {
 			m.confirming = "restore"
