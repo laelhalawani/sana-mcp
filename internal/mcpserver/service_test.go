@@ -2,7 +2,7 @@ package mcpserver
 
 import (
 	"context"
-	"encoding/json"
+
 	"path/filepath"
 	"strings"
 	"testing"
@@ -214,5 +214,3 @@ func TestStatusReportsPhase(t *testing.T) {
 		t.Fatalf("status should report coverage, got %q", text)
 	}
 }
-
-var _ = json.Marshal

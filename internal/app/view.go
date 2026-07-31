@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/laelhalawani/sana-mcp/internal/store"
 )
 
 func (m model) View() string {
@@ -281,5 +279,3 @@ func truncate(text string, width int) string {
 	}
 	return string(runes[:width-1]) + "…"
 }
-
-var _ = store.PhaseSynced

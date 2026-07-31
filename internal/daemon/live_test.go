@@ -71,7 +71,7 @@ func TestLiveSyncOnce(t *testing.T) {
 
 	// The stored transcripts must be searchable straight away: indexing is part
 	// of storing a line, not a later pass.
-	hits, err := server.store.Search("meeting", 5, 0)
+	hits, err := server.store.Search("meeting", 5, 0, store.SortBest)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -105,5 +105,4 @@ func TestLiveSyncOnce(t *testing.T) {
 			t.Fatalf("%s is pending but reports it needs no transcript", id)
 		}
 	}
-	_ = store.PhaseSynced
 }

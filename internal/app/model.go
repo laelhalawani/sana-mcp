@@ -203,7 +203,7 @@ func (m model) runSearch() tea.Cmd {
 	query := m.query
 	database := m.store
 	return func() tea.Msg {
-		hits, err := database.Search(query, 50, 0)
+		hits, err := database.Search(query, 50, 0, store.SortBest)
 		if err != nil {
 			return detailMsg(err.Error())
 		}
