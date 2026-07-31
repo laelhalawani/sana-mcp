@@ -361,3 +361,6 @@ func Stop(ctx context.Context, runtime *bootstrap.Runtime) (bool, error) {
 	pidPath := filepath.Join(runtime.Paths.Root, "daemon.pid")
 	return stopByPID(pidPath)
 }
+
+// Status returns the current sync snapshot.
+func (s *Server) Status() (store.Status, error) { return s.store.Status() }
