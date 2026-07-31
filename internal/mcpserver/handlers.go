@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 
 	"strings"
 	"time"
@@ -14,42 +13,6 @@ import (
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
-
-// schemas is the per-tool argument documentation `help` renders.
-var schemas = map[string]string{
-	"help":         `{tool?: string}`,
-	"login":        `{email: string, confirmation_code?: string}  - call with email first, then with the code`,
-	"status":       `{}`,
-	"list":         `{page?: int=1, limit?: int=25, query?: string, sort?: "newest"|"oldest", filter?: {status?: "ready"|"processing"|"retrying", date?: {from?: string, to?: string}}}`,
-	"read":         `{meeting_id: string, full?: bool, lines?: [start:int, end:int], timestamps?: bool=true}`,
-	"search":       `{query: string, page?: int=1, limit?: int=10, sort?: "best"|"newest"|"oldest"}`,
-	"summary":      `{meeting_id: string}`,
-	"participants": `{meeting_id: string}`,
-	"recording":    `{meeting_id: string}  - fetched live from Sana; the link expires after a few hours`,
-	"edit_line":    `{meeting_id: string, line: int, expected_text: string, new_text: string}  - expected_text must equal the line as it currently reads`,
-	"line_history": `{meeting_id: string, line?: int}`,
-	"restore_line": `{meeting_id: string, line: int}`,
-}
-
-func helpText(tool string) string {
-	if tool != "" {
-		if schema, known := schemas[strings.ToLower(tool)]; known {
-			return fmt.Sprintf("%s\n  args: %s", tool, schema)
-		}
-		return fmt.Sprintf("Unknown tool %q.\n\n%s", tool, helpText(""))
-	}
-	names := make([]string, 0, len(schemas))
-	for name := range schemas {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	var out strings.Builder
-	out.WriteString("meeting_transcripts tools:\n")
-	for _, name := range names {
-		fmt.Fprintf(&out, "  %-13s %s\n", name, schemas[name])
-	}
-	return out.String()
-}
 
 func handleHelp(_ context.Context, _ *Service, raw json.RawMessage) (string, error) {
 	var args struct {
@@ -61,13 +24,13 @@ func handleHelp(_ context.Context, _ *Service, raw json.RawMessage) (string, err
 	return helpText(args.Tool), nil
 }
 
-func handleStatus(_ context.Context, service *Service, database *store.Store, _ json.RawMessage) (string, error) {
+func handleStatus(_ context.Context, database *store.Store, _ json.RawMessage) (string, error) {
 	status, err := database.Status()
 	if err != nil {
 		return "", err
 	}
 	var out strings.Builder
-	fmt.Fprintf(&out, "%s\n", status.Label())
+	fmt.Fprintf(&out, "%s\n", render.StatusLabel(status))
 	out.WriteString(render.StatusLines(status))
 	if status.Phase == store.PhaseNeedsLogin {
 		out.WriteString("\nSign in with meeting_transcripts(\"login\", {\"email\": \"you@example.com\"}).\n")
@@ -96,7 +59,7 @@ type dateFilter struct {
 	To   string `json:"to"`
 }
 
-func handleList(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleList(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		Page   int    `json:"page"`
 		Limit  int    `json:"limit"`
@@ -147,7 +110,7 @@ func handleList(_ context.Context, service *Service, database *store.Store, raw 
 	return out.String(), nil
 }
 
-func handleRead(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleRead(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID  string `json:"meeting_id"`
 		Full       bool   `json:"full"`
@@ -201,17 +164,12 @@ func handleRead(_ context.Context, service *Service, database *store.Store, raw 
 	var out strings.Builder
 	fmt.Fprintf(&out, "%s\n", meeting.Title)
 	for _, line := range lines {
-		if timestamps {
-			fmt.Fprintf(&out, "%d [%s] %s: %s\n",
-				line.LineNo, render.Clock(line.StartMS), line.Speaker, line.Text)
-			continue
-		}
-		fmt.Fprintf(&out, "%d %s: %s\n", line.LineNo, line.Speaker, line.Text)
+		fmt.Fprintln(&out, render.TranscriptLine(line, timestamps))
 	}
 	return out.String(), nil
 }
 
-func handleSearch(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleSearch(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		Query string `json:"query"`
 		Page  int    `json:"page"`
@@ -235,21 +193,16 @@ func handleSearch(_ context.Context, service *Service, database *store.Store, ra
 		return "", err
 	}
 	if len(hits) == 0 {
-		return fmt.Sprintf("Nothing matched %q.\n\n%s", args.Query, render.NoMatchHint), nil
+		return render.NoMatches(args.Query), nil
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "%d results for %q\n\n", len(hits), args.Query)
-	for _, hit := range hits {
-		fmt.Fprintf(&out, "%s  line %d  %s\n  %s\n",
-			hit.MeetingID, hit.LineNo,
-			render.Date(hit.CreatedMS),
-			strings.TrimSpace(hit.Text))
-	}
+	out.WriteString(render.SearchHits(hits))
 	out.WriteString("\nRead around a hit with read {meeting_id, lines: [n-5, n+5]}.\n")
 	return out.String(), nil
 }
 
-func handleSummary(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleSummary(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	meetingID, err := meetingArg(raw)
 	if err != nil {
 		return "", err
@@ -261,7 +214,7 @@ func handleSummary(_ context.Context, service *Service, database *store.Store, r
 	return render.Summary(metadata, render.Styles{}), nil
 }
 
-func handleParticipants(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleParticipants(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	meetingID, err := meetingArg(raw)
 	if err != nil {
 		return "", err
@@ -284,16 +237,14 @@ func handleRecording(ctx context.Context, service *Service, raw json.RawMessage)
 	if err != nil {
 		return "", err
 	}
-	if !session.SignedIn() {
+	link, err := sana.RecordingLink(ctx, session, meetingID)
+	if errors.Is(err, sana.ErrUnauthorized) {
 		return "", errors.New(
 			"not signed in; call meeting_transcripts(\"login\", {\"email\": \"you@example.com\"})")
 	}
-	client := sana.New("", session)
-	metadata, err := client.Meeting(ctx, meetingID)
 	if err != nil {
 		return "", err
 	}
-	link := metadata.Recording()
 	if link == "" {
 		return "This meeting has no recording.", nil
 	}
@@ -318,7 +269,7 @@ func handleLogin(ctx context.Context, service *Service, raw json.RawMessage) (st
 		if err != nil {
 			return "", err
 		}
-		if err := savePending(service.runtime.Paths.Root, pending); err != nil {
+		if err := savePending(service.runtime.Paths.Pending, pending); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf(
@@ -327,7 +278,7 @@ func handleLogin(ctx context.Context, service *Service, raw json.RawMessage) (st
 			pending.Email, pending.Email), nil
 	}
 
-	pending, err := loadPending(service.runtime.Paths.Root)
+	pending, err := loadPending(service.runtime.Paths.Pending)
 	if err != nil {
 		return "", err
 	}
@@ -342,7 +293,7 @@ func handleLogin(ctx context.Context, service *Service, raw json.RawMessage) (st
 	if err := sana.SaveSession(service.runtime.Paths.Session, sana.SessionFrom(client, user)); err != nil {
 		return "", err
 	}
-	clearPending(service.runtime.Paths.Root)
+	clearPending(service.runtime.Paths.Pending)
 	return fmt.Sprintf(
 		"Signed in as %s.\n\nSync starts in the background; check meeting_transcripts(\"status\").",
 		user.Email), nil

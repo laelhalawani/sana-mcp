@@ -216,8 +216,8 @@ func main() {
 	}
 
 	m := &Model{
-		wp:    &WordPiece{vocab: vocab, unkID: unk, maxChars: 100},
-		emb:   emb, dim: meta.Dim, scale: float32(meta.Scale),
+		wp:  &WordPiece{vocab: vocab, unkID: unk, maxChars: 100},
+		emb: emb, dim: meta.Dim, scale: float32(meta.Scale),
 	}
 	fmt.Fprintf(os.Stderr, "loaded vocab=%d dim=%d scale=%g emb=%.1fMB\n",
 		len(vocab), meta.Dim, meta.Scale, float64(len(emb))/1048576)

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -160,18 +161,15 @@ func (m model) loadRecording() tea.Cmd {
 	meetingID := m.current.MeetingID
 	session := m.session
 	return func() tea.Msg {
-		if !session.SignedIn() {
-			return detailMsg("Sign in first: sana-mcp login")
-		}
-		client := sana.New("", session)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		metadata, err := client.Meeting(ctx, meetingID)
-		if err != nil {
+		link, err := sana.RecordingLink(ctx, session, meetingID)
+		switch {
+		case errors.Is(err, sana.ErrUnauthorized):
+			return detailMsg("Sign in first: sana-mcp login")
+		case err != nil:
 			return detailMsg("Could not fetch the recording link: " + err.Error())
-		}
-		link := metadata.Recording()
-		if link == "" {
+		case link == "":
 			return detailMsg("This meeting has no recording.")
 		}
 		return detailMsg(link + "\n\nThis link expires after a few hours.")

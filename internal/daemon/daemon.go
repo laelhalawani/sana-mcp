@@ -13,9 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -35,6 +35,10 @@ var errNoRecordedPID = errors.New("a daemon holds the lock but recorded no proce
 // own state, so a large backfill still reports progress as it goes.
 const transcriptBatch = 25
 
+// newLock builds the singleton lock. It is one function so that Open and the
+// autostart check cannot disagree about which file is the lock.
+func newLock(path string) *flock.Flock { return flock.New(path) }
+
 // Server is a running sync daemon.
 type Server struct {
 	runtime *bootstrap.Runtime
@@ -49,7 +53,7 @@ func Open(runtime *bootstrap.Runtime) (*Server, error) {
 	if err := os.MkdirAll(runtime.Paths.Root, 0o700); err != nil {
 		return nil, err
 	}
-	lock := flock.New(runtime.Paths.Lock)
+	lock := newLock(runtime.Paths.Lock)
 	held, err := lock.TryLock()
 	if err != nil {
 		return nil, fmt.Errorf("acquire daemon lock: %w", err)
@@ -70,7 +74,7 @@ func Open(runtime *bootstrap.Runtime) (*Server, error) {
 	}
 	// The pid is recorded so `daemon --stop` has something to signal. It is
 	// written after the lock is held, so it always describes the lock holder.
-	pidPath := filepath.Join(runtime.Paths.Root, "daemon.pid")
+	pidPath := runtime.Paths.PID
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		logFile.Close()
 		database.Close()
@@ -338,20 +342,32 @@ func (s *Server) fetchMetadata(ctx context.Context, client *sana.Client) (int, e
 		if ctx.Err() != nil {
 			return stored, nil
 		}
-		metadata, err := client.Meeting(ctx, meetingID)
-		if err != nil {
+		// The summary document and the participants are independent requests
+		// and both are always needed, so they go out together. Serially they
+		// were fifty round trips per cycle where twenty-five would do -
+		// measured at roughly 0.9 s each against Sana.
+		var (
+			metadata     sana.Metadata
+			participants []sana.Participant
+			metaErr      error
+			peopleErr    error
+			wait         sync.WaitGroup
+		)
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			metadata, metaErr = client.Meeting(ctx, meetingID)
+		}()
+		go func() {
+			defer wait.Done()
+			participants, peopleErr = client.Participants(ctx, meetingID)
+		}()
+		wait.Wait()
+		if err := firstError(metaErr, peopleErr); err != nil {
 			if errors.Is(err, sana.ErrUnauthorized) {
 				return stored, err
 			}
 			s.logf("metadata %s failed: %v", meetingID, err)
-			continue
-		}
-		participants, err := client.Participants(ctx, meetingID)
-		if err != nil {
-			if errors.Is(err, sana.ErrUnauthorized) {
-				return stored, err
-			}
-			s.logf("participants %s failed: %v", meetingID, err)
 			continue
 		}
 		// The word count is not recomputed here: PutTranscript already stored
@@ -363,6 +379,22 @@ func (s *Server) fetchMetadata(ctx context.Context, client *sana.Client) (int, e
 		stored++
 	}
 	return stored, nil
+}
+
+// firstError returns the first non-nil error, preferring an expired session so
+// a cycle stops rather than logging it as one meeting failing.
+func firstError(errs ...error) error {
+	for _, err := range errs {
+		if errors.Is(err, sana.ErrUnauthorized) {
+			return err
+		}
+	}
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // linesFrom turns speaker segments into numbered transcript lines. One segment
@@ -395,7 +427,7 @@ func linesFrom(segments []sana.Segment) []store.Line {
 // The lock file is the only handle on the daemon, so "is it running" is exactly
 // "can the lock be taken".
 func Stop(ctx context.Context, runtime *bootstrap.Runtime) (bool, error) {
-	lock := flock.New(runtime.Paths.Lock)
+	lock := newLock(runtime.Paths.Lock)
 	held, err := lock.TryLock()
 	if err != nil {
 		return false, err
@@ -404,8 +436,7 @@ func Stop(ctx context.Context, runtime *bootstrap.Runtime) (bool, error) {
 		lock.Unlock()
 		return false, nil
 	}
-	pidPath := filepath.Join(runtime.Paths.Root, "daemon.pid")
-	return stopByPID(pidPath)
+	return stopByPID(runtime.Paths.PID)
 }
 
 // Status returns the current sync snapshot.

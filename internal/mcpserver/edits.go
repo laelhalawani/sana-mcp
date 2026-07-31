@@ -6,11 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/laelhalawani/sana-mcp/internal/fsx"
+	"github.com/laelhalawani/sana-mcp/internal/render"
 	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
@@ -20,7 +19,7 @@ import (
 // expected_text must equal the line as it currently reads. That is not
 // ceremony: it is what stops a model editing a line it misread, or one whose
 // number shifted since it last looked.
-func handleEditLine(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleEditLine(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID    string `json:"meeting_id"`
 		Line         int    `json:"line"`
@@ -59,7 +58,7 @@ func handleEditLine(_ context.Context, service *Service, database *store.Store, 
 		edit.LineNo, edit.OriginalText, edit.EditedText, edit.LineNo), nil
 }
 
-func handleLineHistory(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleLineHistory(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID string `json:"meeting_id"`
 		Line      int    `json:"line"`
@@ -85,7 +84,7 @@ func handleLineHistory(_ context.Context, service *Service, database *store.Stor
 	for _, edit := range edits {
 		fmt.Fprintf(&out, "line %d  %s  by %s  [%s]\n  original: %s\n  changed:  %s\n\n",
 			edit.LineNo,
-			time.UnixMilli(edit.EditedMS).Format("2006-01-02 15:04"),
+			render.Timestamp(edit.EditedMS),
 			edit.Author, edit.State, edit.OriginalText, edit.EditedText)
 	}
 	if args.Line == 0 {
@@ -94,7 +93,7 @@ func handleLineHistory(_ context.Context, service *Service, database *store.Stor
 	return out.String(), nil
 }
 
-func handleRestoreLine(_ context.Context, service *Service, database *store.Store, raw json.RawMessage) (string, error) {
+func handleRestoreLine(_ context.Context, database *store.Store, raw json.RawMessage) (string, error) {
 	var args struct {
 		MeetingID string `json:"meeting_id"`
 		Line      int    `json:"line"`
@@ -119,21 +118,20 @@ func handleRestoreLine(_ context.Context, service *Service, database *store.Stor
 		args.Line, lines[0].Text), nil
 }
 
-// Pending sign-in state lives beside the session so the two login calls can be
+// Pending sign-in state is written between the two login calls, which may be
 // made by different processes. It holds no secret: the CSRF token is useless
 // without the emailed code.
-func pendingPath(root string) string { return filepath.Join(root, "pending-login.json") }
 
-func savePending(root string, pending sana.PendingSignIn) error {
+func savePending(path string, pending sana.PendingSignIn) error {
 	payload, err := json.Marshal(pending)
 	if err != nil {
 		return err
 	}
-	return fsx.WriteAtomic(pendingPath(root), payload, 0o600)
+	return fsx.WriteAtomic(path, payload, 0o600)
 }
 
-func loadPending(root string) (sana.PendingSignIn, error) {
-	payload, err := os.ReadFile(pendingPath(root))
+func loadPending(path string) (sana.PendingSignIn, error) {
+	payload, err := os.ReadFile(path)
 	if err != nil {
 		return sana.PendingSignIn{}, errors.New(
 			"no pending sign-in; call login with just the email first")
@@ -145,4 +143,4 @@ func loadPending(root string) (sana.PendingSignIn, error) {
 	return pending, nil
 }
 
-func clearPending(root string) { os.Remove(pendingPath(root)) }
+func clearPending(path string) { os.Remove(path) }

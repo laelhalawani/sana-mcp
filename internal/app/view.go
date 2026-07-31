@@ -58,7 +58,7 @@ func (m model) viewMenu() string {
 		}
 		fmt.Fprintf(&out, "  %s%s\n", pointer, label)
 	}
-	out.WriteString("\n  " + render.Dim.Render(m.status.Label()))
+	out.WriteString("\n  " + render.Dim.Render(render.StatusLabel(m.status)))
 	return out.String() + footer("up/down navigate  enter select  q quit")
 }
 
@@ -112,15 +112,13 @@ func (m model) viewTranscript() string {
 		if index == m.lineCursor {
 			pointer = render.Cursor.Render(">")
 		}
-		text := line.Text
 		// A corrected line is marked, so nobody mistakes an edit for what was
 		// said. The original stays one keypress away under h.
 		marker := ""
 		if line.Text != line.OriginalText {
 			marker = render.Warn.Render(" *")
 		}
-		fmt.Fprintf(&out, "%s %d [%s] %s: %s%s\n",
-			pointer, line.LineNo, render.Clock(line.StartMS), line.Speaker, text, marker)
+		fmt.Fprintf(&out, "%s %s%s\n", pointer, render.TranscriptLine(line, true), marker)
 	}
 	return out.String() + footer(
 		"up/down scroll  e edit line  h history  t/s/p/o switch  esc meetings  q quit")
@@ -168,7 +166,7 @@ func (m model) viewSearch() string {
 func (m model) viewStatus() string {
 	var out strings.Builder
 	out.WriteString(render.Title.Render("Sync status") + "\n\n")
-	fmt.Fprintf(&out, "  %s\n\n", m.status.Label())
+	fmt.Fprintf(&out, "  %s\n\n", render.StatusLabel(m.status))
 	fmt.Fprintf(&out, "  %s\n", render.ProgressBar(m.status.TranscriptsDone, m.status.TranscriptsTotal, 30))
 	for _, line := range strings.Split(strings.TrimRight(render.StatusLines(m.status), "\n"), "\n") {
 		fmt.Fprintf(&out, "  %s\n", line)

@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
+	"github.com/laelhalawani/sana-mcp/internal/daemon"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
 
@@ -37,6 +38,8 @@ const (
 
 // Run opens the interactive application.
 func Run(ctx context.Context, runtime *bootstrap.Runtime, version string) int {
+	daemon.EnsureRunning(runtime)
+
 	database, err := store.Open(runtime.Paths.Database)
 	if err != nil {
 		fmt.Println("sana-mcp:", err)

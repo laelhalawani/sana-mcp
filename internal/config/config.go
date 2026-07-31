@@ -19,10 +19,11 @@ const currentVersion = 1
 type Paths struct {
 	Root     string // ~/.sana-mcp
 	Database string // the SQLite store: meetings, transcripts, edits, indexes
-	Models   string // lazily downloaded embedding model, when the dense channel is enabled
 	Session  string // the signed-in Sana session
 	Lock     string // daemon singleton lock
+	PID      string // the running daemon's process id
 	Log      string // daemon log
+	Pending  string // a sign-in awaiting its emailed code
 }
 
 // DefaultPaths resolves the per-user root. It does not create anything: a
@@ -32,15 +33,24 @@ func DefaultPaths() (Paths, error) {
 	if err != nil {
 		return Paths{}, errors.New("cannot resolve the home directory")
 	}
-	root := filepath.Join(home, ".sana-mcp")
+	return PathsUnder(filepath.Join(home, ".sana-mcp")), nil
+}
+
+// PathsUnder derives every path from a root.
+//
+// It exists so that no caller assembles a Paths field by field: one that misses
+// a field yields an empty path, and the failure surfaces far from the mistake
+// as a write to "".
+func PathsUnder(root string) Paths {
 	return Paths{
 		Root:     root,
 		Database: filepath.Join(root, "sana.db"),
-		Models:   filepath.Join(root, "models"),
 		Session:  filepath.Join(root, "session.json"),
 		Lock:     filepath.Join(root, "daemon.lock"),
+		PID:      filepath.Join(root, "daemon.pid"),
 		Log:      filepath.Join(root, "daemon.log"),
-	}, nil
+		Pending:  filepath.Join(root, "pending-login.json"),
+	}
 }
 
 // Config is the complete persisted settings document.

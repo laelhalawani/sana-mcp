@@ -1,8 +1,11 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -282,5 +285,86 @@ func TestMigrationRebuildsMisalignedSearchIndex(t *testing.T) {
 	}
 	if len(other) != 1 || other[0].LineNo != 2 {
 		t.Fatalf("line 2 should still be indexed, got %+v", other)
+	}
+}
+
+// Pragmas are per-connection, and database/sql hands out whichever pooled
+// connection is free. Applying them once after Open left foreign keys off on
+// every other connection, so this checks a connection other than the first.
+func TestPragmasApplyToEveryPooledConnection(t *testing.T) {
+	store := openTest(t)
+
+	// Force several connections to exist at once, then check each reports the
+	// settings the DSN asked for.
+	var held []*sql.Conn
+	for i := 0; i < 4; i++ {
+		conn, err := store.db.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("conn %d: %v", i, err)
+		}
+		held = append(held, conn)
+	}
+	for index, conn := range held {
+		var foreignKeys int
+		if err := conn.QueryRowContext(context.Background(), "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+			t.Fatalf("conn %d foreign_keys: %v", index, err)
+		}
+		if foreignKeys != 1 {
+			t.Errorf("connection %d has foreign_keys off", index)
+		}
+		var journal string
+		if err := conn.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&journal); err != nil {
+			t.Fatalf("conn %d journal_mode: %v", index, err)
+		}
+		if !strings.EqualFold(journal, "wal") {
+			t.Errorf("connection %d journal_mode = %q, want wal", index, journal)
+		}
+		conn.Close()
+	}
+}
+
+// Search must return the same rows whichever sort is asked for, and the sorts
+// must actually order by date rather than by relevance.
+func TestSearchSortsAcrossMeetings(t *testing.T) {
+	store := openTest(t)
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "old", Title: "Older", CreatedMS: 1000, Status: "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "new", Title: "Newer", CreatedMS: 9000, Status: "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"old", "new"} {
+		if err := store.PutTranscript(id, []Line{
+			{LineNo: 1, Speaker: "S", OriginalText: "shared keyword here"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sort := range []string{SortBest, SortNewest, SortOldest} {
+		hits, err := store.Search("keyword", 10, 0, sort)
+		if err != nil {
+			t.Fatalf("%s: %v", sort, err)
+		}
+		if len(hits) != 2 {
+			t.Fatalf("%s returned %d hits, want 2", sort, len(hits))
+		}
+	}
+	newest, _ := store.Search("keyword", 10, 0, SortNewest)
+	if newest[0].MeetingID != "new" {
+		t.Errorf("newest should lead with the newer meeting, got %s", newest[0].MeetingID)
+	}
+	oldest, _ := store.Search("keyword", 10, 0, SortOldest)
+	if oldest[0].MeetingID != "old" {
+		t.Errorf("oldest should lead with the older meeting, got %s", oldest[0].MeetingID)
+	}
+	// Paging must not lose or repeat rows.
+	first, _ := store.Search("keyword", 1, 0, SortNewest)
+	second, _ := store.Search("keyword", 1, 1, SortNewest)
+	if len(first) != 1 || len(second) != 1 || first[0].MeetingID == second[0].MeetingID {
+		t.Fatalf("paging returned %+v then %+v", first, second)
 	}
 }

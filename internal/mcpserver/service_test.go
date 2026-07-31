@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,11 +22,7 @@ import (
 func newTestService(t *testing.T) *mcp.ClientSession {
 	t.Helper()
 	root := t.TempDir()
-	paths := config.Paths{
-		Root:     root,
-		Database: filepath.Join(root, "sana.db"),
-		Session:  filepath.Join(root, "session.json"),
-	}
+	paths := config.PathsUnder(root)
 	database, err := store.Open(paths.Database)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -108,9 +103,9 @@ func TestToolIsRegisteredWithItsContract(t *testing.T) {
 func TestHelpListsEveryTool(t *testing.T) {
 	session := newTestService(t)
 	text := call(t, session, "help", nil)
-	for name := range schemas {
-		if !strings.Contains(text, name) {
-			t.Errorf("help does not mention %q", name)
+	for _, entry := range tools {
+		if !strings.Contains(text, entry.name) {
+			t.Errorf("help does not mention %q", entry.name)
 		}
 	}
 }
@@ -234,5 +229,25 @@ func TestNormalDisconnectIsNotAnError(t *testing.T) {
 	real := errors.New("permission denied")
 	if normalizeRunError(real) == nil {
 		t.Error("a real failure must still be reported")
+	}
+}
+
+// The description and the help text are generated from one registry, so a tool
+// cannot exist without being documented, and the two cannot drift the way three
+// hand-synced lists did.
+func TestDescriptionCoversEveryTool(t *testing.T) {
+	for _, entry := range tools {
+		if !strings.Contains(Description, entry.name) {
+			t.Errorf("the tool description omits %q", entry.name)
+		}
+		if !strings.Contains(Description, entry.args) {
+			t.Errorf("the tool description omits the args of %q", entry.name)
+		}
+	}
+	if strings.Contains(Description, "filter?}    matching") {
+		t.Error("search must not advertise a filter argument it does not accept")
+	}
+	if handlers == nil || len(handlers) != len(tools) {
+		t.Fatalf("registry and dispatch disagree: %d tools, %d handlers", len(tools), len(handlers))
 	}
 }

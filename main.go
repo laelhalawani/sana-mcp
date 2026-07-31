@@ -34,10 +34,6 @@ func run(ctx context.Context, args []string) int {
 		Version: version,
 		Stdin:   os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
 	}
-	if executable, err := os.Executable(); err == nil {
-		options.Executable = executable
-	}
-
 	command, err := cli.Parse(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sana-mcp:", err)
@@ -57,9 +53,6 @@ func run(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sana-mcp:", err)
 		return 1
-	}
-	if options.Executable != "" {
-		runtime.Executable = options.Executable
 	}
 
 	switch command.Name {

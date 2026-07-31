@@ -26,31 +26,7 @@ type Status struct {
 	TranscriptsDone  int
 	TranscriptsTotal int
 	Remaining        int
-	Retrying         int
 	LastError        string
-	UpdatedMS        int64
-}
-
-// Label renders a phase the way a person should read it.
-func (s Status) Label() string {
-	switch s.Phase {
-	case PhaseIdle:
-		return "Waiting to start"
-	case PhaseListing:
-		return "Discovering meetings"
-	case PhaseDownloading:
-		return "Syncing meetings"
-	case PhaseSynced:
-		if s.Remaining == 0 {
-			return "Up to date"
-		}
-		return "Syncing meetings"
-	case PhaseNeedsLogin:
-		return "Sign in required"
-	case PhaseError:
-		return "Sync needs attention"
-	}
-	return "Syncing meetings"
 }
 
 // Complete reports whether there is nothing left to fetch.
@@ -78,9 +54,8 @@ func (s *Store) Status() (Status, error) {
 	var status Status
 	var lastError sql.NullString
 	err = tx.QueryRow(
-		`SELECT phase, COALESCE(retrying, 0), last_error, COALESCE(updated_ms, 0)
-		   FROM sync_state WHERE id = 1`,
-	).Scan(&status.Phase, &status.Retrying, &lastError, &status.UpdatedMS)
+		`SELECT phase, last_error FROM sync_state WHERE id = 1`,
+	).Scan(&status.Phase, &lastError)
 	if err != nil {
 		return Status{}, err
 	}
