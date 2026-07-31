@@ -204,9 +204,11 @@ trap - EXIT HUP INT TERM
 # Stopping here closes that window. Whatever is running is asked to stop, and
 # the next tool call starts the version just installed.
 stopped=$("$TARGET" daemon --stop 2>/dev/null) || stopped=""
+# Announce only when something was actually stopped. Matching on the negative
+# ("no daemon is running") ties this script to that exact sentence, and when
+# the wording drifted the installer began reporting a stop that never happened.
 case "$stopped" in
-  *"No session daemon"*|"") ;;
-  *)
+  *Stopped*)
     printf '\n  %s\n' "$stopped"
     # The daemon carries session behaviour and restarts on the next tool call,
     # so that part is already current. Tool descriptions come from the MCP
