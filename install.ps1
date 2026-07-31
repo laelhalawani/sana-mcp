@@ -38,11 +38,14 @@ if (Test-Path $Target) {
 
 Write-Host "  Downloading $Asset..."
 
-# If the old binary is still present, clear it so we can write fresh. If it is
-# locked (a session is still attached), fall back to a temp file and swap.
+# Always download beside the target, never over it.
+#
+# Clearing the old binary first meant a re-install that could not download -
+# offline, a 5xx from the release host, a full disk - left no binary at all,
+# with the user PATH still pointing at an empty directory. The shell installer
+# has always downloaded to a temporary file and moved it into place only after
+# the bytes are on disk; this does the same.
 $tempTarget = "$Target.new"
-$usingTemp  = $false
-Remove-Item $Target -Force -ErrorAction SilentlyContinue
 
 $request = $null
 $response = $null
@@ -54,12 +57,7 @@ try {
   $response = $request.GetResponse()
   $total = [int]$response.ContentLength
   $stream = $response.GetResponseStream()
-  try {
-    $fs = [System.IO.File]::Create($Target)
-  } catch {
-    $fs = [System.IO.File]::Create($tempTarget)
-    $usingTemp = $true
-  }
+  $fs = [System.IO.File]::Create($tempTarget)
   $buffer = New-Object byte[] 65536
   $downloaded = 0
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -101,7 +99,8 @@ try {
   Write-Host "  Download failed. Please check your connection and try again." -ForegroundColor Red
   Write-Host "  URL: $Url" -ForegroundColor Red
   Write-Host "  Reason: $_" -ForegroundColor Red
-  Remove-Item $Target -ErrorAction SilentlyContinue
+  # Only the partial download is removed. Whatever was installed before is
+  # still there and still works.
   Remove-Item $tempTarget -ErrorAction SilentlyContinue
   return
 } finally {
@@ -110,23 +109,22 @@ try {
   if ($response -ne $null) { $response.Close() }
 }
 
-# If we downloaded to a temp file (the old exe was locked), swap it into place.
-if ($usingTemp) {
-  Remove-Item $Target -Force -ErrorAction SilentlyContinue
-  try {
-    Move-Item $tempTarget $Target -Force
-  } catch {
-    Write-Host ""
-    Write-Host "  Could not replace $Binary.exe: $_" -ForegroundColor Red
-    Write-Host "  Close any attached session and re-run the installer." -ForegroundColor Yellow
-    Remove-Item $tempTarget -ErrorAction SilentlyContinue
-    return
-  }
-}
-# Clean up a partial / zero-byte download so a later retry starts fresh.
-if (-not (Test-Path $Target) -or (Get-Item $Target).Length -eq 0) {
-  Remove-Item $Target -ErrorAction SilentlyContinue
+# Nothing was downloaded, so nothing is replaced.
+if (-not (Test-Path $tempTarget) -or (Get-Item $tempTarget).Length -eq 0) {
+  Remove-Item $tempTarget -ErrorAction SilentlyContinue
   Write-Host "  Download did not complete; nothing was installed." -ForegroundColor Red
+  return
+}
+
+# The bytes are on disk, so the swap is the only step that can still lose the
+# working install, and it is a single move.
+try {
+  Move-Item $tempTarget $Target -Force
+} catch {
+  Write-Host ""
+  Write-Host "  Could not replace $Binary.exe: $_" -ForegroundColor Red
+  Write-Host "  Close any attached session and re-run the installer." -ForegroundColor Yellow
+  Remove-Item $tempTarget -ErrorAction SilentlyContinue
   return
 }
 

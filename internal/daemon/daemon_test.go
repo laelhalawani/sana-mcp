@@ -1,8 +1,12 @@
 package daemon
 
 import (
+	"os"
 	"testing"
 
+	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
+	"github.com/laelhalawani/sana-mcp/internal/config"
+	"github.com/laelhalawani/sana-mcp/internal/sana"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 )
 
@@ -41,5 +45,39 @@ func TestBackfillingRequiresProgressNotPendingWork(t *testing.T) {
 		if backfilling(downloading(25), after) {
 			t.Errorf("phase %q must not loop without waiting", phase)
 		}
+	}
+}
+
+func TestASignInDuringACycleIsNotMarkedExpired(t *testing.T) {
+	// A cycle that started with the old cookie and is rejected must not record
+	// that verdict against a session someone stored while it was running: every
+	// screen would then call the fresh sign-in expired until the next cycle.
+	paths := config.PathsUnder(t.TempDir())
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{runtime: &bootstrap.Runtime{Paths: paths}}
+
+	write := func(cookie string) {
+		t.Helper()
+		if err := sana.SaveSession(paths.Session, &sana.Session{
+			Cookies: map[string]string{sana.SessionCookie: cookie},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := server.sessionCookie(); got != "" {
+		t.Fatalf("no session yet, got %q", got)
+	}
+	write("old")
+	before := server.sessionCookie()
+	if before != "old" {
+		t.Fatalf("cookie = %q", before)
+	}
+	// Somebody signs in while the cycle is in flight.
+	write("new")
+	if server.sessionCookie() == before {
+		t.Fatal("a replaced session must be distinguishable from the one in use")
 	}
 }

@@ -105,6 +105,20 @@ func (s *Store) SetPhase(phase string) error {
 	return err
 }
 
+// ResumeAfterSignIn forgets a needs_login verdict, and does nothing otherwise.
+//
+// updated_ms is deliberately untouched: it is when a sync last got somewhere,
+// and every surface reports it as "last completed sync". Clearing the phase
+// with SetPhase stamped it with the moment the user signed in, so both status
+// screens then reported a sync that never ran.
+func (s *Store) ResumeAfterSignIn() error {
+	_, err := s.db.Exec(
+		`UPDATE sync_state SET phase = ?, last_error = NULL WHERE id = 1 AND phase = ?`,
+		PhaseIdle, PhaseNeedsLogin,
+	)
+	return err
+}
+
 // SetError records a failure and moves to the error phase.
 func (s *Store) SetError(message string) error {
 	_, err := s.db.Exec(

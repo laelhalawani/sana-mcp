@@ -8,7 +8,12 @@ type Hit struct {
 	Title     string
 	LineNo    int
 	Text      string
-	CreatedMS int64
+	// OriginalText is the line as Sana delivered it. The index covers both, so
+	// a search for the pre-correction spelling matches a line whose current
+	// text no longer contains it - and a result showing neither the word nor
+	// any reason for itself is worse than no result.
+	OriginalText string
+	CreatedMS    int64
 }
 
 // Column weights for bm25. The current text is preferred 20:1 over the original,
@@ -62,7 +67,7 @@ func (s *Store) Search(query string, limit, offset int, sort string) ([]Hit, err
 	            LIMIT ? OFFSET ?`
 	rows, err := s.db.Query(
 		`WITH page AS (`+ranked+`)
-		 SELECT page.meeting_id, m.title, page.line_no, l.text, m.created_ms
+		 SELECT page.meeting_id, m.title, page.line_no, l.text, l.original_text, m.created_ms
 		   FROM page
 		   JOIN meetings m ON m.meeting_id = page.meeting_id
 		   JOIN transcript_lines l
@@ -79,7 +84,7 @@ func (s *Store) Search(query string, limit, offset int, sort string) ([]Hit, err
 	for rows.Next() {
 		var hit Hit
 		if err := rows.Scan(
-			&hit.MeetingID, &hit.Title, &hit.LineNo, &hit.Text, &hit.CreatedMS,
+			&hit.MeetingID, &hit.Title, &hit.LineNo, &hit.Text, &hit.OriginalText, &hit.CreatedMS,
 		); err != nil {
 			return nil, err
 		}

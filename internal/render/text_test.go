@@ -109,3 +109,64 @@ func TestRowPutsTheDetailAfterAColon(t *testing.T) {
 		t.Fatalf("an absent detail must not print a colon, got %q", got)
 	}
 }
+
+func TestTruncateStyledNeverExceedsTheWidth(t *testing.T) {
+	styled := "\x1b[2msome long dim text\x1b[0m"
+	for _, width := range []int{1, 2, 3, 4, 8, 12, 40} {
+		for _, marker := range []string{"…", "..."} {
+			cut := TruncateStyled(styled, width, marker)
+			if got := StyledWidth(cut); got > width {
+				t.Errorf("width %d marker %q: cut to %d columns: %q", width, marker, got, cut)
+			}
+		}
+	}
+	// The whole marker used to be appended even when there was no room for it,
+	// so a row came out wider than the width it had just been cut to.
+	if got := StyledWidth(TruncateStyled(styled, 2, "...")); got > 2 {
+		t.Fatalf("a marker wider than the width must itself be cut, got %d columns", got)
+	}
+}
+
+func TestTruncateStyledKeepsSequencesIntact(t *testing.T) {
+	value := "\x1b[1m\x1b[31mbold red text that is far too long\x1b[0m"
+	cut := TruncateStyled(value, 10, "…")
+	if strings.Count(cut, "\x1b[") < 3 {
+		t.Fatalf("the opening sequences were lost: %q", cut)
+	}
+	if !strings.HasSuffix(cut, "\x1b[0m") {
+		t.Fatalf("the style was left open: %q", cut)
+	}
+	// Text with no styling at all takes the plain path.
+	if got := TruncateStyled("plain and long", 6, "…"); got != "plain…" {
+		t.Fatalf("TruncateStyled = %q", got)
+	}
+}
+
+func TestWrapDoesNotInventABlankRow(t *testing.T) {
+	// A trailing space run flushed the line and left the builder empty, so an
+	// unconditional final append added a row that is not there - and inflated
+	// the row count a scroll limit is computed from.
+	if got := Wrap("abc ", 3, "…"); len(got) != 1 || got[0] != "abc" {
+		t.Fatalf("Wrap = %q, want [abc]", got)
+	}
+	if got := Wrap("", 3, "…"); len(got) != 1 || got[0] != "" {
+		t.Fatalf("an empty line is still one row, got %q", got)
+	}
+	if got := Wrap("a\n\nb", 3, "…"); len(got) != 3 {
+		t.Fatalf("blank lines must survive, got %q", got)
+	}
+}
+
+func TestTruncateStyledKeepsGraphemesWhole(t *testing.T) {
+	family := "\U0001f468‍\U0001f469‍\U0001f467"
+	value := "\x1b[31m" + family + " and more text here\x1b[0m"
+	// Measuring rune by rune counted each part of the sequence separately and
+	// cut it in half, leaving a dangling zero-width joiner.
+	cut := TruncateStyled(value, 4, "…")
+	if strings.Contains(cut, "‍") && !strings.Contains(cut, family) {
+		t.Fatalf("a ZWJ sequence was cut in half: %q", cut)
+	}
+	if got := StyledWidth(TruncateStyled(value, 20, "…")); got > 20 {
+		t.Fatalf("cut to %d columns, limit 20", got)
+	}
+}

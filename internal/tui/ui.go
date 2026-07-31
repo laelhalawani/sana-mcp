@@ -250,15 +250,12 @@ func (u UI) Screen(title string, body []Text, footer string) string {
 		rendered = rendered[:rows]
 	}
 
+	// Every row is cut to the width, styled or not. Letting styled rows through
+	// unmeasured is what allowed a coloured prompt or an error to overflow the
+	// terminal, soft-wrap into an extra row and push the footer off the screen.
 	lines := make([]string, 0, len(rendered))
 	for _, line := range rendered {
-		// A styled line was already truncated by whoever styled it; truncating
-		// again would cut through the escape bytes.
-		if strings.Contains(string(line), "\x1b[") {
-			lines = append(lines, string(line))
-			continue
-		}
-		lines = append(lines, u.Truncate(string(line), width))
+		lines = append(lines, render.TruncateStyled(string(line), width, u.TruncationMarker))
 	}
 	return strings.Join(lines, "\n")
 }

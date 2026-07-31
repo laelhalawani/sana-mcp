@@ -224,6 +224,11 @@ case ":$PATH:" in
   *) on_path=0 ;;
 esac
 
+# The setup checks the startup files itself rather than being told what this
+# process's PATH looks like. "Already on PATH" here can mean nothing more than
+# that the user exported it by hand in this one terminal, and passing that on
+# silenced the only warning they would ever get.
+
 if [ "$on_path" -eq 0 ]; then
   line="export PATH=\"$INSTALL_DIR:\$PATH\""
   # The trailing `|| true` matters: if none of these files exist, the loop's
@@ -238,6 +243,14 @@ if [ "$on_path" -eq 0 ]; then
     break
   done || true
 fi
+
+# Put it on this script's own PATH before running the setup.
+#
+# The line above only takes effect in the user's *next* shell, so without this
+# the setup looked for its own command, could not find it, and closed by telling
+# the user to add the very line the installer had just written.
+PATH="$INSTALL_DIR:$PATH"
+export PATH
 
 # If we have a controlling terminal, run the interactive setup right away.
 # Under `curl | sh` stdin is the script pipe, so read from /dev/tty to reach

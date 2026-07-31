@@ -72,11 +72,18 @@ const (
 type refreshMsg time.Time
 
 // detailMsg carries a document that had to be fetched.
+//
+// request is which fetch it belongs to. A recording link takes up to thirty
+// seconds and cannot be cancelled, so without it the answer to a request the
+// user has already navigated away from lands on top of whatever they opened
+// instead - leaving a recording URL under a transcript's footer, and the edit
+// key pointing into a transcript that is no longer on screen.
 type detailMsg struct {
-	id     string
-	title  string
-	lines  []string
-	target int
+	request int
+	id      string
+	title   string
+	lines   []string
+	target  int
 }
 
 type browser struct {
@@ -97,7 +104,18 @@ type browser struct {
 	filterInput *string
 	statusInput *int
 
-	view     view
+	view view
+	// request counts document openings, so a fetch that finishes late can tell
+	// whether it is still the one being waited for.
+	request int
+	// revision changes whenever the body does, which is what lets the wrapped
+	// layout be kept rather than recomputed for every frame and every key.
+	revision   int
+	wrapCache  []string
+	wrapWidth  int
+	wrapSource int
+	wrapView   view
+
 	scroll   int
 	title    string
 	lines    []string
@@ -149,6 +167,8 @@ func tickBrowser() tea.Cmd {
 // keeping the selection on the same meeting where it still exists.
 func (b *browser) refresh() {
 	b.info = statusview.Read(b.app.runtime.Paths)
+	// The status and sync-detail bodies are built from what was just read.
+	b.revision++
 	meetings, _, err := b.app.store.ListMeetings(store.ListOptions{
 		Page: 1, Limit: 1000, Query: b.filter, Status: b.statusFilter,
 	})
@@ -204,21 +224,31 @@ func (b *browser) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		// A prompt that is taking typed input is not interrupted by a refresh:
 		// the list moving under a half-typed filter is worse than stale counts.
-		if b.filterInput == nil && b.statusInput == nil && b.view != viewEdit {
+		if b.filterInput == nil && b.statusInput == nil && !b.working() {
 			b.refresh()
 		}
 		return b, tickBrowser()
 
 	case detailMsg:
-		if msg.id == b.detailID {
+		// Still the document being waited for, and still on the screen that
+		// asked for it: a fetch that lands after the user has gone back to the
+		// actions menu would otherwise retitle it.
+		if msg.request == b.request && b.view == viewDetail {
 			b.title, b.lines, b.loading = msg.title, msg.lines, false
 			b.scroll = msg.target
+			b.revision++
 		}
 
 	case tea.KeyMsg:
 		return b, b.key(msg)
 	}
 	return b, nil
+}
+
+// working is a screen the user is part-way through, where a refresh would
+// destroy what they are looking at.
+func (b *browser) working() bool {
+	return b.view == viewEdit || b.view == viewHistory || b.confirm != ""
 }
 
 func (b *browser) quit() tea.Cmd {
@@ -260,10 +290,10 @@ func (b *browser) key(key tea.KeyMsg) tea.Cmd {
 		return nil
 	case "i":
 		b.refresh()
-		b.view, b.scroll = viewStatus, 0
+		b.view, b.scroll, b.revision = viewStatus, 0, b.revision+1
 		return nil
 	case "?":
-		b.view, b.scroll = viewHelp, 0
+		b.view, b.scroll, b.revision = viewHelp, 0, b.revision+1
 		return nil
 	}
 
@@ -311,6 +341,7 @@ func (b *browser) listKey(name string) tea.Cmd {
 			return nil
 		}
 		meeting, _ := b.meeting(b.selected)
+		b.request++
 		b.view, b.scroll, b.action = viewActions, 0, 0
 		b.title = meeting.Title
 		b.detailID = b.selected
@@ -365,6 +396,7 @@ func (b *browser) moveSelection(name string) tea.Cmd {
 func (b *browser) actionsKey(name string) tea.Cmd {
 	switch name {
 	case "esc":
+		b.request++
 		b.view, b.scroll = viewList, 0
 		return nil
 	case "t", "s", "p":
@@ -417,14 +449,23 @@ func (b *browser) documentKey(name string) tea.Cmd {
 		}
 	}
 	if name == "esc" {
+		// The title belongs to whatever is on screen. Leaving a document has to
+		// put the meeting's name back, or the actions menu is headed
+		// "Recording".
+		b.request++
 		if (b.view == viewDetail || b.view == viewSync) && b.back == backActions {
+			if meeting, found := b.meeting(b.detailID); found {
+				b.title = meeting.Title
+			}
 			b.view, b.scroll = viewActions, 0
 			return nil
 		}
 		b.view, b.scroll = viewList, 0
 		return nil
 	}
-	return b.scrollBy(name, len(b.body()))
+	// Scrolling counts the rows that are drawn, which is what wrapping produces
+	// - not the stored lines, one of which can be a whole paragraph.
+	return b.scrollBy(name, len(b.wrapped(b.body())))
 }
 
 func (b *browser) scrollBy(name string, total int) tea.Cmd {
@@ -499,6 +540,8 @@ func (b *browser) openDocument(id, kind string, back backTo) tea.Cmd {
 	if id == "" {
 		return nil
 	}
+	b.request++
+	b.revision++
 	b.detailID, b.back, b.scroll, b.loading = id, back, 0, false
 	b.view = viewDetail
 	b.transcript = nil
@@ -560,11 +603,14 @@ func (b *browser) openRecording(id string, back backTo) tea.Cmd {
 	if id == "" {
 		return nil
 	}
+	b.request++
+	b.revision++
 	b.detailID, b.back, b.scroll = id, back, 0
 	b.view, b.loading = viewDetail, true
 	b.title, b.lines = "Recording", []string{"Loading recording..."}
 	b.transcript = nil
 
+	request := b.request
 	session, _ := sana.LoadSession(b.app.runtime.Paths.Session)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -572,18 +618,20 @@ func (b *browser) openRecording(id string, back backTo) tea.Cmd {
 		link, err := sana.RecordingLink(ctx, session, id)
 		switch {
 		case err != nil:
-			return detailMsg{id: id, title: "Recording",
+			return detailMsg{request: request, id: id, title: "Recording",
 				lines: []string{"Could not load the recording link: " + err.Error()}}
 		case link == "":
-			return detailMsg{id: id, title: "Recording",
+			return detailMsg{request: request, id: id, title: "Recording",
 				lines: []string{"No recording is available."}}
 		}
-		return detailMsg{id: id, title: "Recording",
+		return detailMsg{request: request, id: id, title: "Recording",
 			lines: []string{link, "", "This link expires after a few hours."}}
 	}
 }
 
 func (b *browser) openSync(id string, back backTo) {
+	b.request++
+	b.revision++
 	b.detailID, b.back, b.scroll = id, back, 0
 	b.view = viewSync
 }
@@ -630,11 +678,17 @@ func (b *browser) body() []string {
 
 func (b *browser) statusLines() []string {
 	info := b.info
+	if info.Expired {
+		return []string{"Your Sana session has expired. Sign in again."}
+	}
 	if !info.SignedIn {
-		if info.Expired {
-			return []string{"Your Sana session has expired. Sign in again."}
-		}
 		return []string{"You are not signed in to Sana."}
+	}
+	if info.Unavailable != "" {
+		// The counts were never read, so they are not reported. A zero from a
+		// database that could not be opened tells someone with two hundred
+		// meetings that they have none.
+		return []string{"Background sync unavailable: " + info.Unavailable}
 	}
 	status := info.Status
 	lines := []string{

@@ -43,6 +43,18 @@ func (s *Session) SignedIn() bool {
 	return s != nil && s.Cookies[SessionCookie] != ""
 }
 
+// Address is the signed-in email, or empty when there is no session.
+//
+// LoadSession returns a nil session for a machine that has never signed in,
+// which is the normal case, so reading the field directly is a nil dereference
+// waiting for its first user.
+func (s *Session) Address() string {
+	if s == nil {
+		return ""
+	}
+	return s.Email
+}
+
 // SessionFrom captures the client's current cookies and identity for storage.
 func SessionFrom(client *Client, user User) *Session {
 	return &Session{
