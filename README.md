@@ -9,6 +9,8 @@ transcripts - it runs a background daemon that syncs them into a local database,
 unlocking search, read, summarize, and more through a single
 [MCP](https://modelcontextprotocol.io) tool (`meeting_transcripts`) and a CLI.
 
+One static binary, about 14 MB. Nothing to install alongside it.
+
 macOS / Linux:
 
 ```bash
@@ -21,90 +23,41 @@ Windows (PowerShell):
 irm https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.ps1 | iex
 ```
 
-The installer selects the release for your OS, CPU, and (on Linux) libc, verifies
-the release manifest, checksums, and embedded binary identity, and updates PATH
-for supported bash and zsh shells. Every successful direct installer run attempts setup
-after the runtime transaction has committed and installer cleanup has finished.
-It detects your AI clients, shows registrations
-that exactly match the installed command checked initially, and lets you change
-registrations. When at least one safely configurable client row is available and
-client selection/configuration completes, interactive setup reaches sign-in and
-recognizes valid saved Sana authentication. With no safely configurable rows it
-reports that no clients are available and returns before authentication.
+The installer downloads the binary for your OS and CPU, finds the AI clients on
+your machine, asks which to connect, signs you in to Sana, and shows your
+meetings downloading. Then run `sana-mcp`.
 
-On macOS and Linux, setup reads and writes through the terminal even when the
-installer is piped to `sh`. Compatible direct reinstalls reopen setup on every
-platform. Without a terminal, the installed runtime remains successful and an
-exact retry command is printed. `SANA_MCP_YES=1` configures detected clients
-without the picker or authentication.
-
-Run `sana-mcp update` to check for and install the latest release. A compatible
-receipt-backed update verifies the installed runtime and release metadata, then
-replaces the runtime without requiring Sana to be reachable; your login and local
-meeting state remain in place. The command reports a no-op when you already have
-the latest version and never downgrades a newer installation. Updater handoffs do
-not launch the configurer. A compatible Windows updater is silent about setup and
-preserves registrations and local state; only an incompatible Windows updater
-prints the deferred command to configure clients and sign in.
-
-Set `SANA_MCP_VERSION` to an exact tag such as `v0.4.23` to pin an install. Linux
-x64/ARM64 (glibc and musl), macOS x64/Apple Silicon, and Windows x64 are
-published. On Alpine, install Bun's required C++ runtime first with
-`apk add --no-cache libstdc++ libgcc gcompat`; the installer detects and reports this
-before downloading release metadata or binary assets. Windows ARM64 is not yet
-in the verified release matrix.
-
-On Windows, an older official installation that cannot be updated in place is
-handled as an incompatible replacement. Before changing anything, the installer explains that
-local meetings must be resynced and you must sign in again, then asks whether to
-continue. Declining leaves the installation unchanged. Confirming replaces the
-verified old runtime and resets its default local state; it does not migrate or
-revalidate the old authentication. After commit and cleanup, a direct script run
-uses the same public configurer behavior described above. An incompatible
-updater handoff launches no configurer and prints its exact deferred
-configure-and-sign-in command. An unrecognized receiptless executable is never
-run or overwritten, and an overridden data or transcript directory is never
-reset automatically.
-
-Linux and macOS support compatible receipt-backed updates. An epoch-changing
-update is refused before confirmation until their destructive replacement
-coordinator is implemented.
-
-For an intentional unattended incompatible replacement, set
-`SANA_MCP_REPLACE_INCOMPATIBLE=1`. `SANA_MCP_YES=1` configures detected clients;
-it does not authorize deleting incompatible local state.
+Linux x64/ARM64, macOS x64/Apple Silicon, and Windows x64/ARM64 are published.
 
 ## What it does
 
 Sana has no public API for meetings. `sana-mcp` drives the same web backend the
 Sana app uses (tRPC at `sana.ai/x-api`) with your logged-in session, over HTTPS
-via direct `fetch` and a cookie jar. **No browser is required**, so it runs
-headless on macOS, Linux, Windows, and WSL.
+with a cookie jar. **No browser is required**, so it runs headless on macOS,
+Linux, Windows, and WSL.
 
 - A background **daemon** downloads your meetings, transcripts, and metadata into
-  a local SQLite database, then checks periodically for new meetings.
+  a local SQLite database, then checks periodically for new ones.
 - The **agent tools read only from that database**, so they respond instantly and
   never block on the network. The sole exception is `recording`, which fetches a
   short-lived link on demand.
-- Everything - session, database, models, logs - stays on your machine.
+- Everything - session, database, logs - stays on your machine.
 
 ## Features
 
 - **One tool for agents** - `meeting_transcripts` - with built-in discovery:
-  `help` lists everything, `help {tool}` shows exact arguments and an example.
+  `help` lists everything, `help {tool}` shows exact arguments.
 - **List, read, search** transcripts, plus **summaries**, **participants**, and
   on-demand **recording** links.
-- **Keyword search always available** - line-level SQLite FTS5 with BM25 ranking,
-  whole-word matching, phrase, date-range, and sort options.
-- **Semantic / hybrid search** - BM25 line hits combine with thematic
-  speaker-turn and smaller detail vectors. Enabled by default; set
-  `SANA_SEMANTIC=0` for keyword-only search.
-- **Automatic sync** - the daemon polls for new meetings and keeps retrying
-  incomplete downloads in the background without blocking ready meetings.
-- **Works with your client** - auto-registers with Claude Desktop, Claude Code,
+- **Search** - line-level SQLite FTS5 with BM25 ranking, phrase and date-range
+  filters, and sort options.
+- **Automatic sync** - the daemon polls for new meetings, retries incomplete
+  downloads, and never re-downloads a transcript it already has.
+- **Correct transcription errors** - and keep the original. See below.
+- **Works with your client** - registers with Claude Desktop, Claude Code,
   Cursor, VS Code, Codex, Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q,
   Continue, opencode.
-- **Local-first & private** - no data leaves your machine except authenticated
+- **Local-first and private** - no data leaves your machine except authenticated
   requests to Sana.
 
 ## Agent tools
@@ -116,233 +69,88 @@ Agents call one tool, `meeting_transcripts`, with a `tool` name and an optional
 meeting_transcripts("<tool>", { ...args })
 ```
 
-| tool          | args                                                       | returns                                                                 |
-|---------------|------------------------------------------------------------|-------------------------------------------------------------------------|
-| `help`        | `{tool?}`                                                  | all tools, or the argument schema for one                               |
-| `login`       | `{email}`, then `{email, confirmation_code}`               | passwordless sign-in via email code                                     |
-| `status`      | (none)                                                     | sync progress and coverage                                              |
-| `list`        | `{page?, limit?, query?, sort?, filter?}`                  | meetings: id, timestamp, title, status                                  |
-| `read`        | `{meeting_id, full?, lines?, timestamps?}`                 | transcript lines (all, or a `[start,end]` range)                        |
-| `search`      | `{query, page?, limit?, sort?, filter?}`                   | matching lines with meeting id + line number                            |
-| `summary`     | `{meeting_id}`                                             | summary, notes by topic, and action items                               |
-| `participants`| `{meeting_id}`                                             | attendees (name, email, host)                                           |
-| `recording`   | `{meeting_id}`                                             | a temporary recording link, fetched live                                |
-
-Notes:
-
-- `list.sort` is `"newest"` (default) or `"oldest"`; `list.filter` is
-  `{status: "ready"|"downloading"|"processing"|"retrying", date: {from, to}}` with ISO dates
-  (`"YYYY-MM-DD"`) or epoch ms.
-- `read.lines` is a 1-based `[start, end]` range. With no selection it reports
-  the line count and your options; `full: true` returns everything.
-- `search.sort` is `"best"` (relevance, default), `"newest"`, or `"oldest"`.
-- `recording` fetches a live Sana URL that expires after a few hours. Initial
-  semantic indexing or search may also download the verified public model; no
-  meeting data is sent with that request.
-
-Example:
+| tool | args | returns |
+|---|---|---|
+| `help` | `{tool?}` | all tools, or one tool's schema |
+| `login` | `{email}`, then `{email, confirmation_code}` | passwordless sign-in by email code |
+| `status` | (none) | sync progress and coverage |
+| `list` | `{page?, limit?, query?, sort?, filter?}` | meetings: id, timestamp, title, status |
+| `read` | `{meeting_id, full?, lines?, timestamps?}` | transcript lines, all or a `[start,end]` range |
+| `search` | `{query, page?, limit?, sort?, filter?}` | matching lines with meeting id and line number |
+| `summary` | `{meeting_id}` | summary, notes by topic, action items |
+| `participants` | `{meeting_id}` | attendees (name, email, host) |
+| `recording` | `{meeting_id}` | a temporary recording link, fetched live |
+| `edit_line` | `{meeting_id, line, expected_text, new_text}` | corrects one line |
+| `line_history` | `{meeting_id, line?}` | what was changed, original and current |
+| `restore_line` | `{meeting_id, line}` | puts a line back to what Sana delivered |
 
 ```text
 meeting_transcripts("search", {"query": "pricing", "sort": "newest"})
 meeting_transcripts("read",   {"meeting_id": "v72HzzJDZx9WqTmF", "lines": [22, 26]})
 ```
 
-## Use from the CLI
+Full schemas and semantics: [`docs/tool-contract.md`](docs/tool-contract.md).
 
-The same tools work on the command line. Run `sana-mcp help` to see everything.
+## Use it from the CLI
 
-```bash
-sana-mcp login --email you@example.com
-sana-mcp login --email you@example.com --code 123456
-sana-mcp status
-sana-mcp list --limit 20
-sana-mcp read --id <meeting-id>
-sana-mcp search --query pricing
+```sh
+sana-mcp                       # the full-screen application
+sana-mcp status                # sync progress
+sana-mcp list                  # meetings, newest first
+sana-mcp search pricing        # search every transcript
+sana-mcp read <meeting-id> 20 40
+sana-mcp configure             # change which clients are connected
+sana-mcp daemon --stop
 ```
 
-Subcommands:
+A bare `sana-mcp` opens the application on a terminal, and serves MCP without
+one - so a client that runs the binary with no arguments still gets a server.
 
-| command                       | purpose                                                  |
-|-------------------------------|----------------------------------------------------------|
-| `sana-mcp <tool> [json]`      | run a tool, e.g. `sana-mcp list '{"limit":10}'`          |
-| `sana-mcp daemon`             | run the background sync daemon in the foreground         |
-| `sana-mcp install`            | detect MCP clients and register sana-mcp with your picks |
-| `sana-mcp uninstall`          | remove sana-mcp from the clients you choose              |
-| `sana-mcp update`             | verify this install and update to the latest release     |
-| `sana-mcp mcp`                | run the MCP server on stdio (used by clients internally) |
+## Fixing transcription errors
 
-## Register with an AI client
+Transcripts come from speech recognition, and it gets names wrong. A discussion
+about **Fabrix** can be transcribed as **Fabrik**, and then no search for
+"Fabrix" will ever find it.
 
-The one-line installer runs this for you. To change your selection later, or if
-you installed the binary manually, run:
+You can correct any line - in the application (`e` to edit, `ctrl+s` to save,
+`h` for history) or through the tools. Corrections are safe by construction:
 
-```bash
-sana-mcp install      # detect installed clients, register sana-mcp with your picks
+- **Nothing is destroyed.** What Sana delivered is kept forever, shown beside
+  every change, and restoring is one key.
+- **A correction survives a re-sync.** Edits re-attach by content, so they follow
+  their line even when re-transcription shifts the numbering. One that no longer
+  matches anything is kept and marked, never applied to the wrong line.
+- **Both spellings stay searchable.** The corrected name finds the line; what was
+  actually said still finds it too, ranked well below.
+
+A warning that also sits in the tool description and on the edit screen: meeting
+transcripts are full of product, company and personal names that look like
+misspellings and are not - `Zenolith`, `Fabrix`, `Vantik` are real. An agent must
+never edit a transcript unless you asked for that specific correction.
+
+## Where things live
+
+Everything is under `~/.sana-mcp`: the SQLite database, your session, the daemon
+log. Uninstalling is `sana-mcp uninstall` and removing that directory.
+
+Note that the database holds your corrections, which cannot be re-synced from
+Sana. It is not purely a cache.
+
+## Development
+
+```sh
+go vet ./... && go test ./... && go test -race ./...
 ```
 
-`sana-mcp install` detects the MCP-capable clients on your machine and registers
-`sana-mcp` with the ones you choose. Each client's config is written safely -
-your existing servers are preserved - and the operation is idempotent.
+Live tests exercise the real API with your stored session; they are read-only,
+write to temporary databases, and are skipped unless `SANA_LIVE=1`.
 
-- **Detects:** Claude Desktop, Claude Code, Cursor, VS Code (Copilot), Codex,
-  Gemini CLI, Windsurf, Zed, Cline, Roo Code, Amazon Q, Continue, and opencode.
-  Exact compatible saved registrations for the installed command start checked.
-  Detected clients without that registration are shown unchecked, not
-  pre-selected. Press `v` to reveal other safely configurable supported clients.
-- **Flags:** `--dry-run` (show what would change), `--yes` (register with all
-  detected clients, no prompt), `--name <name>` (server name; default `sana-mcp`).
-- After registering, most clients need a restart or a session reload to pick up
-  the new server. Remove it later with `sana-mcp uninstall` (same flags).
+Releasing is bumping `VERSION` and merging to `main`.
 
-No supported client detected, or prefer to wire it up yourself? Point your client
-at the installed binary with the `mcp` subcommand (use the absolute path, or grab
-the binary from the [Releases page](https://github.com/laelhalawani/sana-mcp/releases)):
-
-```json
-{
-  "mcpServers": {
-    "sana-mcp": {
-      "command": "/absolute/path/to/sana-mcp",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-The server name is `sana-mcp`; the tool it exposes is `meeting_transcripts`. The
-daemon starts automatically on first use after login.
-
-## Sign in
-
-Sign in now:
-
-```bash
-sana-mcp login --email you@example.com                 # emails you a 6-digit code
-sana-mcp login --email you@example.com --code 123456   # verify it
-```
-
-Or skip it - the agent will ask for your email and the confirmation code the
-first time it tries to use the tools. After the first login, a catch-up sync runs
-and the daemon keeps your meetings current; run `sana-mcp status` to watch
-progress, then ask your agent to search, read, or summarize your meetings.
-
-## How sync works
-
-- **On every login**, a fresh catch-up sync runs. Meeting tools remain blocked
-  only until the current account's cache is safe to read; ready meetings can be
-  used while remaining transcripts and metadata continue syncing.
-- **Between logins**, the daemon checks periodically for new meetings and pulls
-  them in the background without interrupting anything. A meeting still
-  downloading shows as `downloading` in `list`.
-- Downloads that fail remain `retrying` with increasing delays. They are never
-  abandoned, and restarting or reinstalling sana-mcp retries them immediately.
-
-## Search
-
-**Keyword search is always available** - a line-level SQLite FTS5 index with BM25
-ranking, whole-word matching, and phrase / date-range / sort options.
-
-**Semantic / hybrid search is enabled by default**. Search combines keyword and
-semantic results using Reciprocal Rank Fusion. Set `SANA_SEMANTIC=0` for
-keyword-only search when the embedding model's RAM/CPU cost is undesirable.
-
-The model (`Xenova/all-MiniLM-L6-v2`, q8) is loaded lazily on demand and unloaded
-after roughly a minute of idle (about 150 MB only while active); vectors are
-stored in the same SQLite database via `sqlite-vec`. When enabled, embeddings are
-built as part of the login catch-up because they are required for hybrid ranking.
-
-> Prebuilt binaries bundle the semantic runtime, using `sqlite-vec` where Bun
-> supports dynamic extensions and a portable local vector backend otherwise.
-> Initial semantic indexing or search downloads the exact pinned model revision
-> (about 23.7 MB) over HTTPS and verifies every file's size and SHA-256.
-> If semantic initialization fails, `search` returns keyword (BM25) results with
-> an explicit degradation notice; it never presents those results as hybrid.
-
-## Configuration
-
-All environment variables are optional.
-
-| var | default | purpose |
-|-----|---------|---------|
-| `SANA_SEMANTIC`            | on              | `0` to disable semantic / hybrid search                      |
-| `SANA_SYNC_INTERVAL_MS`    | `600000`        | how often the daemon checks for new meetings                  |
-| `SANA_REQUEST_DELAY_MS`    | `150`           | delay between Sana artifact requests                          |
-| `SANA_MAX_ATTEMPTS`        | `5`             | failures before the retry delay stops increasing              |
-| `SANA_EMBED_MODEL`         | `Xenova/all-MiniLM-L6-v2` | embedding model id                                 |
-| `SANA_EMBED_DIM`           | `384`           | embedding vector dimension                                    |
-| `SANA_EMBED_IDLE_MS`       | `60000`         | unload the embedding model after this idle time               |
-| `SANA_DATA_DIR`            | `~/.sana-mcp`*  | where local state is stored (* `./data` when run from source) |
-| `SANA_BASE_URL`            | `https://sana.ai` | Sana origin                                                 |
-
-## Data & privacy
-
-Everything is stored locally under the data directory (`~/.sana-mcp` for the
-binary, `./data` when running from source), and nothing there is committed:
-
-- `session.json` - your login cookies and workspace id. **Sensitive; never commit.**
-- `sana.db` - SQLite: meetings, transcripts, metadata, the FTS index, vectors,
-  and sync state.
-- `models/` - cached embedding model (only when semantic search is enabled).
-- `daemon.log` - background daemon log.
-
-Meeting data leaves your machine only in authenticated requests to Sana.
-Initial semantic indexing or search also downloads the pinned public model
-files from Hugging Face; transcripts and queries are never sent there.
-
-## Build from source
-
-Requires [Bun](https://bun.sh) 1.3+.
-
-```bash
-git clone https://github.com/laelhalawani/sana-mcp.git
-cd sana-ai-mcp
-bun install
-bun run check         # typecheck + isolated-safe test suite
-bun run compile -- --target bun-linux-x64  # -> dist/sana-mcp
-```
-
-Run from source explicitly with `bun src/cli.ts ...` (for example,
-`bun src/cli.ts install`); source checkout commands do not rely on a globally
-installed `sana-mcp`. The
-compile target is always explicit; valid published targets are
-`bun-linux-x64`, `bun-linux-x64-musl`, `bun-linux-arm64`,
-`bun-linux-arm64-musl`, `bun-darwin-x64`, `bun-darwin-arm64`, and
-`bun-windows-x64`. Standalone builds keep Bun bytecode enabled. The canonical
-`bun-windows-x64` artifact must be built by x64 Bun running on native Windows
-(`process.platform === "win32"` and `process.arch === "x64"`) from a source
-checkout on a native Windows filesystem. Linux Bun, WSL Bun, and native
-Windows Bun invoked through UNC, mapped-network, `SUBST`, junction, symlink,
-or other reparse-backed source aliases reject that target before creating its
-output or parent directory. The guard resolves the source directory through
-Windows, derives its helper from the native system-directory API rather than
-environment paths, requires fixed local NTFS backing, and accepts ordinary and
-extended DOS paths that prove that backing.
-From Windows, run `bun run compile -- --target bun-windows-x64` in native
-PowerShell with native Windows Bun from an NTFS checkout. This restriction is
-specific to the Windows x64 target; the supported non-Windows build behavior
-is unchanged. Release jobs execute a private snapshot through one stable file
-identity: an inherited descriptor on Linux/macOS, a pinned read-only file mount
-for the musl compatibility smoke, and a write/delete-excluding file lease on
-Windows. Descriptor offsets are reset before every macOS consumer, and the
-macOS job forcibly replaces the snapshot pathname to prove execution stays
-bound to the open file. The snapshot digest must match before and after
-`--version`, `__inspect`, and `--help`, and attestation refuses an artifact
-that differs from those executed bytes. Assembly requires the exact ordered
-target matrix and current compatibility tuple, then publication binds every
-file to its attested assembled digest through one already-open descriptor.
-Uploads read those descriptors while supplying authoritative asset names;
-replacing a snapshot pathname cannot replace uploaded bytes. Before an
-authorization header is constructed, the uploader also requires the raw
-GitHub upload template to match the exact repository, release id, path, and
-GitHub-context upload origin. Publication pins that positive release id,
-re-fetches it directly across every verification boundary, downloads assets
-by their pinned API identities, and publishes only through an id-specific API
-update after a final draft recheck. A
-package-version bump merged to `main` publishes the matching release
-automatically when its tag does not exist. A pushed matching `v*` tag or
-manual dispatch can also build or resume that exact release.
+See [`AGENTS.md`](AGENTS.md) for the constraints that are load-bearing,
+[`docs/tool-contract.md`](docs/tool-contract.md) for the agent surface, and
+[`docs/app-design.md`](docs/app-design.md) for the application.
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE). Maintained by [laelhalawani](https://github.com/laelhalawani) -
-[github.com/laelhalawani/sana-mcp](https://github.com/laelhalawani/sana-mcp).
+GPL-3.0
