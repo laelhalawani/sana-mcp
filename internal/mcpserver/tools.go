@@ -35,8 +35,8 @@ func (s *Service) dispatch(ctx context.Context, _ *mcp.CallToolRequest, input to
 	}
 	handler, known := handlers[name]
 	if !known {
-		return textResult(fmt.Sprintf(
-			"Unknown tool %q.\n\n%s", input.Tool, helpText(""))), nil, nil
+		// helpText already words this, and it is one agent-facing sentence.
+		return textResult(helpText(input.Tool)), nil, nil
 	}
 	var raw json.RawMessage
 	if len(input.Args) > 0 {
