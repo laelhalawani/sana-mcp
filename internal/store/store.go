@@ -77,6 +77,15 @@ CREATE TABLE IF NOT EXISTS meetings (
 );
 CREATE INDEX IF NOT EXISTS meetings_by_date ON meetings(created_ms DESC);
 
+-- The summary document and participants are stored as the JSON Sana returned.
+-- Keeping the raw documents means a field Sana adds is not lost before this
+-- program learns to render it.
+CREATE TABLE IF NOT EXISTS meeting_metadata (
+  meeting_id        TEXT PRIMARY KEY REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+  summary_json      TEXT,
+  participants_json TEXT
+);
+
 CREATE TABLE IF NOT EXISTS transcript_lines (
   meeting_id    TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
   line_no       INTEGER NOT NULL,
