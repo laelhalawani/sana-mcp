@@ -63,6 +63,9 @@ type Server struct {
 	lock    *flock.Flock
 	log     *os.File
 	pidPath string
+	// backfilling is set while cycles run back to back to work through stored
+	// transcripts, so those cycles skip re-listing meetings.
+	backfilling bool
 }
 
 // Open acquires the singleton lock and opens the store.
@@ -149,13 +152,13 @@ func (s *Server) Serve(ctx context.Context) error {
 			after = before
 		}
 		if backfilling(before, after) {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return nil
-			default:
-				continue
 			}
+			s.backfilling = true
+			continue
 		}
+		s.backfilling = false
 		select {
 		case <-ctx.Done():
 			return nil
@@ -201,8 +204,10 @@ func (s *Server) SyncUntilIdle(ctx context.Context) error {
 			return err
 		}
 		if !backfilling(before, after) || ctx.Err() != nil {
+			s.backfilling = false
 			return nil
 		}
+		s.backfilling = true
 	}
 }
 
@@ -229,14 +234,21 @@ func (s *Server) syncCycle(ctx context.Context) error {
 	}
 	client := sana.New("", session)
 
-	if err := s.store.SetPhase(store.PhaseListing); err != nil {
-		return err
+	// Discovery is skipped while backfilling. A backfill runs many cycles to
+	// work through the transcript batches, and re-paginating the whole meeting
+	// list for each of them re-fetched and rewrote every row to learn nothing:
+	// only the transcripts changed. It still runs once per poll interval, which
+	// is what picks up meetings whose processing has finished.
+	if !s.backfilling {
+		if err := s.store.SetPhase(store.PhaseListing); err != nil {
+			return err
+		}
+		discovered, err := s.discover(ctx, client)
+		if err != nil {
+			return err
+		}
+		s.logf("listed %d meetings", discovered)
 	}
-	discovered, err := s.discover(ctx, client)
-	if err != nil {
-		return err
-	}
-	s.logf("listed %d meetings", discovered)
 
 	if err := s.store.SetPhase(store.PhaseDownloading); err != nil {
 		return err
@@ -323,27 +335,11 @@ func (s *Server) fetchTranscripts(ctx context.Context, client *sana.Client) (int
 	if err != nil {
 		return 0, err
 	}
-	fetched := 0
-	for _, meetingID := range pending {
-		if ctx.Err() != nil {
-			return fetched, nil
-		}
-		segments, err := client.Transcript(ctx, meetingID)
-		if err != nil {
-			if errors.Is(err, sana.ErrUnauthorized) {
-				return fetched, err
-			}
-			// One meeting failing must not stop the rest: it is left pending
-			// and retried on the next cycle.
-			s.logf("transcript %s failed: %v", meetingID, err)
-			continue
-		}
-		if err := s.store.PutTranscript(meetingID, linesFrom(segments)); err != nil {
-			return fetched, err
-		}
-		fetched++
-	}
-	return fetched, nil
+	return fetchEach(ctx, s, pending, "transcript",
+		client.Transcript,
+		func(meetingID string, segments []sana.Segment) error {
+			return s.store.PutTranscript(meetingID, linesFrom(segments))
+		})
 }
 
 // fetchMetadata stores the summary document and participants for meetings that
@@ -354,48 +350,39 @@ func (s *Server) fetchMetadata(ctx context.Context, client *sana.Client) (int, e
 	if err != nil {
 		return 0, err
 	}
-	stored := 0
-	for _, meetingID := range pending {
-		if ctx.Err() != nil {
-			return stored, nil
-		}
-		// The summary document and the participants are independent requests
-		// and both are always needed, so they go out together. Serially they
-		// were fifty round trips per cycle where twenty-five would do -
-		// measured at roughly 0.9 s each against Sana.
-		var (
-			metadata     sana.Metadata
-			participants []sana.Participant
-			metaErr      error
-			peopleErr    error
-			wait         sync.WaitGroup
-		)
-		wait.Add(2)
-		go func() {
-			defer wait.Done()
-			metadata, metaErr = client.Meeting(ctx, meetingID)
-		}()
-		go func() {
-			defer wait.Done()
-			participants, peopleErr = client.Participants(ctx, meetingID)
-		}()
-		wait.Wait()
-		if err := firstError(metaErr, peopleErr); err != nil {
-			if errors.Is(err, sana.ErrUnauthorized) {
-				return stored, err
-			}
-			s.logf("metadata %s failed: %v", meetingID, err)
-			continue
-		}
-		// The word count is not recomputed here: PutTranscript already stored
-		// it from the same lines, and reloading the whole transcript to arrive
-		// at the same number cost a full read per meeting.
-		if err := s.store.PutMetadata(meetingID, metadata, participants); err != nil {
-			return stored, err
-		}
-		stored++
-	}
-	return stored, nil
+	return fetchEach(ctx, s, pending, "metadata",
+		func(ctx context.Context, meetingID string) (meetingDocuments, error) {
+			// The summary document and the participants are independent
+			// requests and both are always needed, so they go out together.
+			var (
+				documents meetingDocuments
+				metaErr   error
+				peopleErr error
+				wait      sync.WaitGroup
+			)
+			wait.Add(2)
+			go func() {
+				defer wait.Done()
+				documents.metadata, metaErr = client.Meeting(ctx, meetingID)
+			}()
+			go func() {
+				defer wait.Done()
+				documents.participants, peopleErr = client.Participants(ctx, meetingID)
+			}()
+			wait.Wait()
+			return documents, firstError(metaErr, peopleErr)
+		},
+		func(meetingID string, documents meetingDocuments) error {
+			// The word count is not recomputed here: PutTranscript already
+			// stored it from the same lines.
+			return s.store.PutMetadata(meetingID, documents.metadata, documents.participants)
+		})
+}
+
+// meetingDocuments is the pair fetched together for one meeting.
+type meetingDocuments struct {
+	metadata     sana.Metadata
+	participants []sana.Participant
 }
 
 // firstError returns the first non-nil error, preferring an expired session so

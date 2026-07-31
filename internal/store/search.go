@@ -51,8 +51,6 @@ func (s *Store) Search(query string, limit, offset int, sort string) ([]Hit, err
 	// ms for a query matching 1,359 lines, against 4.0 ms this way, and 112 ms
 	// against 34 ms for a very common word. Only the sorts that need a column
 	// from meetings pull that table into the ranking step.
-	// The sorted variants need the meetings table inside the ranking step
-	// because it carries the sort key; relevance does not.
 	join := ""
 	if sort == SortNewest || sort == SortOldest {
 		join = "JOIN meetings m ON m.meeting_id = ls.meeting_id"
