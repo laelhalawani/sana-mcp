@@ -2,6 +2,9 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 
 	"path/filepath"
 	"strings"
@@ -212,5 +215,24 @@ func TestStatusReportsPhase(t *testing.T) {
 	text := call(t, session, "status", nil)
 	if !strings.Contains(text, "meetings") || !strings.Contains(text, "transcripts") {
 		t.Fatalf("status should report coverage, got %q", text)
+	}
+}
+
+// A client closing its end is how every MCP session ends. Reporting that as a
+// failure makes a harness log an error each time a session closes.
+func TestNormalDisconnectIsNotAnError(t *testing.T) {
+	for _, err := range []error{
+		io.EOF,
+		context.Canceled,
+		errors.New("server is closing: EOF"),
+		fmt.Errorf("wrapped: %w", io.EOF),
+	} {
+		if got := normalizeRunError(err); got != nil {
+			t.Errorf("%v should be a clean shutdown, got %v", err, got)
+		}
+	}
+	real := errors.New("permission denied")
+	if normalizeRunError(real) == nil {
+		t.Error("a real failure must still be reported")
 	}
 }
