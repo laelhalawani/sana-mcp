@@ -1,5 +1,5 @@
 # sana-mcp installer (Windows). Run in PowerShell:
-#   irm https://github.com/laelhalawani/sana-mcp/raw/main/install.ps1 | iex
+#   irm https://github.com/laelhalawani/sana-mcp/releases/latest/download/install.ps1 | iex
 $ErrorActionPreference = 'Stop'
 # Invoke-WebRequest's built-in progress bar is slow and flickers badly in
 # Windows PowerShell; the download below renders its own.
