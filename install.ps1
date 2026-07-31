@@ -142,7 +142,11 @@ if (-not (Test-Path $Target) -or (Get-Item $Target).Length -eq 0) {
 # the next tool call starts the version just installed.
 try {
   $stopped = (& $Target daemon --stop 2>$null | Out-String).Trim()
-  if ($stopped -and $stopped -notmatch 'No session daemon') {
+  # Announce only when something was actually stopped. Matching on the negative
+  # ("no daemon is running") ties this script to that exact sentence, and when
+  # the wording drifted the installer began reporting a stop that never
+  # happened.
+  if ($stopped -match 'Stopped') {
     Write-Host ""
     Write-Host "  $stopped"
     # The daemon carries session behaviour and restarts on the next tool call,
