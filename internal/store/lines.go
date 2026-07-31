@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -33,8 +34,12 @@ const (
 	TranscriptComplete = "complete"
 )
 
-// PutMeeting inserts or updates a meeting row, leaving transcript state alone:
-// listing meetings must never downgrade a transcript we already hold.
+// PutMeeting inserts or updates a meeting row from the meeting list.
+//
+// Transcript state and word count are deliberately left alone. The list carries
+// neither, so writing them here would reset what a transcript fetch already
+// established: every sync cycle would mark stored transcripts as missing and
+// report every meeting as empty.
 func (s *Store) PutMeeting(m Meeting) error {
 	_, err := s.db.Exec(
 		`INSERT INTO meetings (meeting_id, title, created_ms, status, word_count)
@@ -42,8 +47,7 @@ func (s *Store) PutMeeting(m Meeting) error {
 		 ON CONFLICT(meeting_id) DO UPDATE SET
 		   title = excluded.title,
 		   created_ms = excluded.created_ms,
-		   status = excluded.status,
-		   word_count = excluded.word_count`,
+		   status = excluded.status`,
 		m.MeetingID, m.Title, m.CreatedMS, m.Status, m.WordCount,
 	)
 	return err
@@ -110,9 +114,17 @@ func (s *Store) PutTranscript(meetingID string, lines []Line) error {
 			return err
 		}
 	}
+	// The word count is recorded here rather than waiting for the summary
+	// document, so the meeting list reports a real size as soon as the
+	// transcript lands.
+	words := 0
+	for _, line := range lines {
+		words += len(strings.Fields(line.OriginalText))
+	}
 	if _, err := tx.Exec(
-		`UPDATE meetings SET transcript_state = ?, fetched_ms = ? WHERE meeting_id = ?`,
-		TranscriptComplete, time.Now().UnixMilli(), meetingID,
+		`UPDATE meetings SET transcript_state = ?, fetched_ms = ?, word_count = ?
+		  WHERE meeting_id = ?`,
+		TranscriptComplete, time.Now().UnixMilli(), words, meetingID,
 	); err != nil {
 		return err
 	}
