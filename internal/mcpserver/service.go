@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
 	"github.com/laelhalawani/sana-mcp/internal/store"
@@ -62,8 +63,24 @@ func (s *Service) Server() *mcp.Server { return s.server }
 // RunStdio serves MCP framing on stdin and stdout. The SDK is the only thing
 // that writes to stdout; a stray byte there corrupts the protocol.
 func (s *Service) RunStdio(ctx context.Context) error {
-	err := s.server.Run(ctx, &mcp.StdioTransport{})
+	return normalizeRunError(s.server.Run(ctx, &mcp.StdioTransport{}))
+}
+
+// normalizeRunError turns an ordinary disconnect into a clean exit.
+//
+// A client closing its end is how every MCP session ends, so it must not be
+// reported as a failure. The SDK reports it as a wrapped "server is closing"
+// error whose chain does not always carry io.EOF, so the text is checked too:
+// exiting non-zero on a normal shutdown makes a harness log an error every
+// time a session closes.
+func normalizeRunError(err error) error {
+	if err == nil {
+		return nil
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closing") {
 		return nil
 	}
 	return err
