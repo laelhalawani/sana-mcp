@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -419,27 +420,53 @@ func firstError(errs ...error) error {
 	return nil
 }
 
-// linesFrom turns speaker segments into numbered transcript lines. One segment
-// is one line, which is what the tool contract's line numbers refer to.
+// linesFrom turns speaker segments into numbered transcript lines.
+//
+// A segment is one uninterrupted speaker turn, which for a screen-share
+// walkthrough runs to tens of thousands of characters. Lines are what the tool
+// contract numbers, what search returns and what a correction addresses, so a
+// long turn is broken into several by the same rule the stored-data migration
+// uses - one rule, or the database ends up with two line conventions in it.
+//
+// Each piece gets the timestamp of the word it starts on, which is the one
+// thing this path can do that the migration cannot: the per-word timings exist
+// here and nowhere else, so a long turn becomes many separately seekable lines
+// rather than one.
 func linesFrom(segments []sana.Segment) []store.Line {
 	lines := make([]store.Line, 0, len(segments))
-	for index, segment := range segments {
-		var text strings.Builder
-		start := 0.0
+	for _, segment := range segments {
+		var builder strings.Builder
+		// offsets[i] is where word i begins in the joined text, so a piece can
+		// be traced back to the word it starts on.
+		offsets := make([]int, 0, len(segment.Words))
 		for wordIndex, word := range segment.Words {
-			if wordIndex == 0 {
-				start = word.StartTimestamp
-			} else {
-				text.WriteByte(' ')
+			if wordIndex > 0 {
+				builder.WriteByte(' ')
 			}
-			text.WriteString(word.Text)
+			offsets = append(offsets, builder.Len())
+			builder.WriteString(word.Text)
 		}
-		lines = append(lines, store.Line{
-			LineNo:       index + 1,
-			Speaker:      segment.Speaker,
-			StartMS:      int64(start * 1000),
-			OriginalText: text.String(),
-		})
+		text := builder.String()
+		segmentStart := 0.0
+		if len(segment.Words) > 0 {
+			segmentStart = segment.Words[0].StartTimestamp
+		}
+
+		for _, piece := range store.SplitSegment(text) {
+			start := segmentStart
+			// The first word at or after the piece's offset is the word it
+			// begins with. Boundaries always land on a word start, so this is
+			// exact rather than approximate.
+			if at := sort.SearchInts(offsets, piece.Start); at < len(segment.Words) {
+				start = segment.Words[at].StartTimestamp
+			}
+			lines = append(lines, store.Line{
+				LineNo:       len(lines) + 1,
+				Speaker:      segment.Speaker,
+				StartMS:      int64(start * 1000),
+				OriginalText: piece.Text,
+			})
+		}
 	}
 	return lines
 }

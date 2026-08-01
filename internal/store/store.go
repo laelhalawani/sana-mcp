@@ -20,7 +20,7 @@ import (
 // schemaVersion is bumped whenever migrate needs to do more work. Every
 // migration must preserve line_edits: corrections are user-owned data, not
 // cache, and cannot be rebuilt by re-syncing.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Store is an open database.
 type Store struct {
@@ -223,6 +223,21 @@ func (s *Store) migrate() error {
 	if current < 2 {
 		if err := rebuildSearchIndex(s.db); err != nil {
 			return fmt.Errorf("rebuild search index: %w", err)
+		}
+	}
+	// Version 3 breaks long speaker turns into readable, searchable lines. A
+	// turn is however long somebody talked uninterrupted, which reached 25,456
+	// characters in one line - unreadable, near-unrankable under BM25, and far
+	// too coarse to address a correction to. See split.go for the rule and
+	// resplit.go for what it does to corrections recorded against a line that
+	// is about to become several.
+	//
+	// Line numbers move for any meeting containing a long turn. That is a
+	// visible change to what the tools report, and it is done once, here,
+	// rather than leaving the database with two line conventions in it.
+	if current < 3 {
+		if err := resplitTranscripts(s.db, splitLine); err != nil {
+			return fmt.Errorf("split long transcript lines: %w", err)
 		}
 	}
 	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {

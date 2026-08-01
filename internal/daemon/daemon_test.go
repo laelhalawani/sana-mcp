@@ -81,3 +81,51 @@ func TestASignInDuringACycleIsNotMarkedExpired(t *testing.T) {
 		t.Fatal("a replaced session must be distinguishable from the one in use")
 	}
 }
+
+// TestLinesFromSplitsALongTurnAndTimesEachPiece covers the one thing the
+// download path can do that the stored-data migration cannot: give every piece
+// of a long speaker turn the timestamp of the word it actually starts on. The
+// per-word timings exist only here, so a regression is invisible until someone
+// clicks a line in the recording and lands in the wrong place.
+func TestLinesFromSplitsALongTurnAndTimesEachPiece(t *testing.T) {
+	// One uninterrupted turn, long enough to be split, with a word every second.
+	var words []sana.Word
+	at := 0.0
+	for range 400 {
+		for _, text := range []string{"So", "then", "we", "import", "the", "products."} {
+			words = append(words, sana.Word{Text: text, StartTimestamp: at})
+			at++
+		}
+	}
+	lines := linesFrom([]sana.Segment{
+		{Speaker: "Linda", Words: []sana.Word{{Text: "Yeah.", StartTimestamp: 0}}},
+		{Speaker: "Lael", Words: words},
+	})
+
+	if len(lines) < 4 {
+		t.Fatalf("a long turn should become several lines, got %d", len(lines))
+	}
+	// Line numbers stay contiguous across the split, not per segment.
+	for index, line := range lines {
+		if line.LineNo != index+1 {
+			t.Fatalf("line %d is numbered %d", index+1, line.LineNo)
+		}
+	}
+	if lines[0].Speaker != "Linda" || lines[1].Speaker != "Lael" {
+		t.Fatalf("speakers did not survive the split: %+v", lines[:2])
+	}
+	// Every piece of the long turn carries its own increasing start time. The
+	// old code gave the whole turn one timestamp, so this is the regression
+	// that matters.
+	previous := int64(-1)
+	for _, line := range lines[1:] {
+		if line.StartMS <= previous {
+			t.Fatalf("timestamps must advance across pieces, got %d after %d",
+				line.StartMS, previous)
+		}
+		previous = line.StartMS
+	}
+	if lines[1].StartMS != 0 {
+		t.Fatalf("the first piece should start where the turn does, got %d", lines[1].StartMS)
+	}
+}
