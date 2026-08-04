@@ -98,6 +98,12 @@ func runDaemon(ctx context.Context, runtime *bootstrap.Runtime, command cli.Comm
 			}
 			return 0
 		}
+		// A detached daemon has no stderr and no caller left to read it, so the
+		// log is the only place this can be said. Without it a Mac that cannot
+		// start its daemon reports "0/0" forever with no evidence anywhere.
+		if command.Detach {
+			daemon.NoteStartupFailure(runtime.Paths, err)
+		}
 		fmt.Fprintln(os.Stderr, "sana-mcp:", err)
 		return 1
 	}
