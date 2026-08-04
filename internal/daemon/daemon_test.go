@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/laelhalawani/sana-mcp/internal/bootstrap"
@@ -127,5 +128,53 @@ func TestLinesFromSplitsALongTurnAndTimesEachPiece(t *testing.T) {
 	}
 	if lines[1].StartMS != 0 {
 		t.Fatalf("the first piece should start where the turn does, got %d", lines[1].StartMS)
+	}
+}
+
+// TestEnsureRunningRecordsWhyItDidNotStart covers the failure that is
+// impossible to diagnose remotely: no daemon, so no sync, so no sync error, so
+// every screen reports 0/0 with nothing wrong. Each branch that declines to
+// start one has to leave a trace.
+func TestEnsureRunningRecordsWhyItDidNotStart(t *testing.T) {
+	signedIn := []byte(`{"cookies":{"` + sana.SessionCookie + `":"abc"},"email":"a@b.c"}`)
+
+	for _, testCase := range []struct {
+		name       string
+		executable string
+		want       string
+	}{
+		{"own path unknown", "", "cannot resolve its own path"},
+		{"binary is gone", "/nonexistent/sana-mcp", "could not be run"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			paths := config.PathsUnder(t.TempDir())
+			if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(paths.Session, signedIn, 0o600); err != nil {
+				t.Fatalf("write session: %v", err)
+			}
+
+			EnsureRunning(&bootstrap.Runtime{Paths: paths, Executable: testCase.executable})
+
+			log, err := os.ReadFile(paths.Log)
+			if err != nil {
+				t.Fatalf("nothing was recorded, so the failure is invisible: %v", err)
+			}
+			if !strings.Contains(string(log), testCase.want) {
+				t.Fatalf("log does not say why: %q", log)
+			}
+		})
+	}
+}
+
+// A machine nobody has signed in on yet has nothing to sync. That is the normal
+// state, not a fault, and must not fill the log on every command.
+func TestEnsureRunningSaysNothingWhenNobodyHasSignedIn(t *testing.T) {
+	paths := config.PathsUnder(t.TempDir())
+	EnsureRunning(&bootstrap.Runtime{Paths: paths, Executable: "/nonexistent/sana-mcp"})
+	if _, err := os.Stat(paths.Log); !os.IsNotExist(err) {
+		log, _ := os.ReadFile(paths.Log)
+		t.Fatalf("no sign-in should be quiet, but the log says: %q", log)
 	}
 }
