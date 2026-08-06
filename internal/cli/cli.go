@@ -32,6 +32,7 @@ const Usage = `sana-mcp - your Sana.AI meeting transcripts, on this machine.
   sana-mcp participants <id>  who attended
   sana-mcp recording <id>     a temporary recording link
 
+  sana-mcp update             install the latest version
   sana-mcp help               this text
   sana-mcp version            the installed version
 `
@@ -66,7 +67,7 @@ func Parse(args []string) (Command, error) {
 	switch command.Name {
 	case "app", "mcp", "configure", "install", "uninstall",
 		"login", "status", "list", "read", "search", "summary",
-		"participants", "recording", "help", "version":
+		"participants", "recording", "update", "help", "version":
 		return command, nil
 	case "daemon":
 		for _, argument := range command.Args {
@@ -95,6 +96,11 @@ func Run(ctx context.Context, runtime *bootstrap.Runtime, command Command, optio
 	case "version":
 		fmt.Fprintln(options.Stdout, options.Version)
 		return 0
+	case "update":
+		// Replacing the binary needs no local state, and must work on a machine
+		// whose database this build cannot even open - that is one of the
+		// reasons to be updating.
+		return runUpdate(ctx, options)
 	}
 	if runtime == nil {
 		fmt.Fprintf(options.Stderr, "sana-mcp: %s needs local state\n", command.Name)

@@ -67,8 +67,8 @@ func Summary(metadata sana.Metadata, styles Styles) string {
 				assignee = *item.AssignedTo + ": "
 			}
 			due := ""
-			if item.DueDate != nil && *item.DueDate != "" {
-				due = " (due " + *item.DueDate + ")"
+			if item.DueDate.Set() {
+				due = " (due " + item.DueDate.String() + ")"
 			}
 			fmt.Fprintf(&out, "  - %s%s%s\n", assignee, item.Action, due)
 		}

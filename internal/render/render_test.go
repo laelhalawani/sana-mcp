@@ -37,7 +37,7 @@ func TestSummaryRendersNotesAndActions(t *testing.T) {
 		Summary: ptr("We compared vendors."),
 		Notes:   []sana.NoteGroup{{Topic: "Vendors", Notes: []string{"Fabrix ruled out"}}},
 		ActionItems: []sana.ActionItem{
-			{AssignedTo: ptr("Julia"), Action: "scale to 500 products", DueDate: ptr("2026-08-01")},
+			{AssignedTo: ptr("Julia"), Action: "scale to 500 products", DueDate: "2026-08-01"},
 			{Action: "unassigned work"},
 		},
 	}, Styles{})
