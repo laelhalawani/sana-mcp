@@ -342,7 +342,71 @@ type NoteGroup struct {
 type ActionItem struct {
 	AssignedTo *string `json:"assignedTo"`
 	Action     string  `json:"action"`
-	DueDate    *string `json:"dueDate"`
+	DueDate    DueDate `json:"dueDate"`
+}
+
+// DueDate is an action item's due date, which Sana has sent in more than one
+// shape.
+//
+// It was a string. It is now epoch milliseconds as a JSON number, and that
+// change cost eight meetings their metadata on every sync cycle, indefinitely:
+// one field of one item failed to decode, the whole document was rejected, and
+// the daemon logged "cannot unmarshal number into Go struct field
+// ActionItem.actionItems.dueDate of type string" every fifteen minutes.
+//
+// So this accepts either shape, and treats a third, unknown one as a value to
+// keep rather than a reason to throw the document away. A summary is worth
+// having even when one date in it is not understood.
+type DueDate string
+
+// String is the date as it should be shown, or "" when the item has none.
+func (d DueDate) String() string { return string(d) }
+
+// Set reports whether a due date was recorded.
+func (d DueDate) Set() bool { return d != "" }
+
+// dueDateLayout is the rendered form. It is a date rather than a timestamp
+// because that is what the string shape always carried, and an action item due
+// "2023-12-31 23:59:59" is due that day.
+const dueDateLayout = "2006-01-02"
+
+func (d *DueDate) UnmarshalJSON(data []byte) error {
+	text := strings.TrimSpace(string(data))
+	if text == "" || text == "null" {
+		*d = ""
+		return nil
+	}
+	// The shape it used to have, and the shape this marshals back to, so a
+	// stored document re-reads as what was stored.
+	var asString string
+	if err := json.Unmarshal(data, &asString); err == nil {
+		*d = DueDate(asString)
+		return nil
+	}
+	// The shape it has now: epoch milliseconds.
+	var asNumber json.Number
+	if err := json.Unmarshal(data, &asNumber); err == nil {
+		if milliseconds, err := asNumber.Int64(); err == nil {
+			if milliseconds == 0 {
+				*d = ""
+				return nil
+			}
+			*d = DueDate(time.UnixMilli(milliseconds).UTC().Format(dueDateLayout))
+			return nil
+		}
+	}
+	// Some third shape. Keep it as written rather than failing: losing a whole
+	// meeting's summary over one unreadable date is the bug this type exists to
+	// prevent.
+	*d = DueDate(text)
+	return nil
+}
+
+func (d DueDate) MarshalJSON() ([]byte, error) {
+	if d == "" {
+		return []byte("null"), nil
+	}
+	return json.Marshal(string(d))
 }
 
 // Metadata is the rich per-meeting document: summary, notes, actions, and the
