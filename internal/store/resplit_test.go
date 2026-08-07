@@ -32,12 +32,12 @@ func TestChangedSpanFindsWhatTheCorrectionTouched(t *testing.T) {
 		wantEnd          int
 		wantOK           bool
 	}{
-		{"one word", "we use Fabrics here", "we use Fabrix here", 9, 10, true},
-		// The shared "A" counts towards the prefix, so the span starts at 4 and
-		// not at the word boundary. Where it lands does not matter as long as
-		// putting the replacement back rebuilds the text, which is asserted
-		// below for every case.
-		{"longer replacement", "in Fabrik", "in Fabrix PIM", 4, 8, true},
+		{"one word", "we use Fabrics here", "we use Fabrix here", 12, 14, true},
+		// The shared prefix runs past the word boundary, so the span does not
+		// start where the differing word does. Where it lands does not matter as
+		// long as putting the replacement back rebuilds the text, which is
+		// asserted below for every case.
+		{"longer replacement", "in Fabrik", "in Fabrix PIM", 8, 9, true},
 		{"identical is not a correction", "same", "same", 0, 0, false},
 		{"insertion at the end", "abc", "abcdef", 3, 3, true},
 	} {
