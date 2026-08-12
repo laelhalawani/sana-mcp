@@ -79,7 +79,7 @@ meeting_transcripts("<tool>", { ...args })
 | `read` | `{meeting_id, full?, lines?, timestamps?}` | transcript lines, all or a `[start,end]` range |
 | `search` | `{query, page?, limit?, sort?, filter?}` | matching lines with meeting id and line number |
 | `summary` | `{meeting_id}` | summary, notes by topic, action items |
-| `participants` | `{meeting_id}` | attendees (name, email, host) |
+| `participants` | `{meeting_id}` | workspace members with access, and speakers heard in the transcript |
 | `recording` | `{meeting_id}` | a temporary recording link, fetched live |
 | `edit_line` | `{meeting_id, line, expected_text, new_text}` | corrects one line |
 | `line_history` | `{meeting_id, line?}` | what was changed, original and current |

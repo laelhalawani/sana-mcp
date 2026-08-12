@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -546,9 +547,24 @@ func (b *browser) openDocument(id, kind string, back backTo) tea.Cmd {
 	b.view = viewDetail
 	b.transcript = nil
 
-	meeting, found := b.meeting(id)
-	if !found {
+	// Read fresh rather than taken from the list cached by refresh(), which runs
+	// on a tick and is skipped entirely while a prompt is open. The row carries
+	// whether the transcript arrived, and a stale one makes both this screen and
+	// the attendance screen claim a downloaded transcript was never fetched -
+	// the false claim this whole change removes. The len() backstops below
+	// cannot catch it for a meeting Sana returned empty, because there is
+	// nothing in hand to outrank the row with.
+	meeting, err := b.app.store.GetMeeting(id)
+	if errors.Is(err, store.ErrNotFound) {
 		b.title, b.lines = "Meeting", []string{"No meeting found with ID " + id + "."}
+		return nil
+	}
+	if err != nil {
+		// A database that could not be read is not a meeting that does not
+		// exist. Saying the second while the daemon holds a write lock asserts
+		// something false about the meeting, which is what every other branch
+		// here stopped doing.
+		b.title, b.lines = "Meeting", []string{err.Error()}
 		return nil
 	}
 	b.title = meeting.Title
@@ -560,26 +576,64 @@ func (b *browser) openDocument(id, kind string, back backTo) tea.Cmd {
 			b.lines = []string{err.Error()}
 			return nil
 		}
-		if len(lines) == 0 {
+		// Whether it arrived is what the meeting row records. Sana returns an
+		// empty transcript for a meeting with no speech, and counting lines
+		// reports those as never downloaded - which is what the participants
+		// screen stopped doing, so this one must not still say it.
+		// Lines in hand outrank the cached row, which refresh() rewrites on a
+		// tick and skips entirely while a prompt is open: a transcript that
+		// landed since then would otherwise be read from the database and then
+		// thrown away with "not downloaded yet". Attendance defends against the
+		// same staleness the same way.
+		if meeting.TranscriptState != store.TranscriptComplete && len(lines) == 0 {
 			b.lines = []string{"Transcript is not downloaded yet."}
+			return nil
+		}
+		if len(lines) == 0 {
+			b.lines = []string{"This transcript has no lines."}
 			return nil
 		}
 		b.transcript = lines
 		b.lines = transcriptLines(lines)
 	case "s":
-		metadata, _, err := b.app.store.Metadata(id)
+		// Not yet fetched is not the same as unavailable: the summary document
+		// is fetched after the transcript, so a stored meeting is without one
+		// for a while during every sync.
+		// Absent is reported as absent; unreadable is reported as the error it
+		// is. Collapsing the second into "no summary is available" asserts
+		// something false about the meeting, which is what the participants
+		// branch below stopped doing.
+		metadata, err := b.app.store.Summary(id)
+		if errors.Is(err, store.ErrNotFound) {
+			b.lines = []string{render.SummaryNotDownloaded}
+			return nil
+		}
 		if err != nil {
-			b.lines = []string{"No summary is available."}
+			b.lines = []string{err.Error()}
 			return nil
 		}
 		b.lines = strings.Split(strings.TrimRight(render.Summary(metadata, render.Styles{}), "\n"), "\n")
 	case "p":
-		_, participants, err := b.app.store.Metadata(id)
+		// A meeting can have participants without a transcript, or a transcript
+		// before its metadata arrives, so neither absence hides the other. Only
+		// a missing document is tolerated though: an unreadable one must not
+		// render as "none are recorded", which would assert something false
+		// about the meeting rather than admit the row could not be parsed.
+		participants, metadataErr := b.app.store.Participants(id)
+		speakers, err := b.app.store.Speakers(id)
 		if err != nil {
-			b.lines = []string{"No participants are available."}
+			b.lines = []string{err.Error()}
 			return nil
 		}
-		b.lines = strings.Split(strings.TrimRight(render.Participants(participants, render.Styles{}), "\n"), "\n")
+		// The transcript screen already says "not downloaded yet" rather than
+		// claiming a meeting has no lines; this one says the same about both of
+		// its groups. Whether the transcript arrived is what the meeting row
+		// records, not something to infer from a line count - Sana returns an
+		// empty transcript for a meeting with no speech, and that one is
+		// downloaded. The row is the one openDocument already loaded.
+		b.lines = strings.Split(strings.TrimRight(render.Attendance(
+			participants, metadataErr, speakers,
+			meeting.TranscriptState == store.TranscriptComplete, render.Styles{}), "\n"), "\n")
 	}
 	return nil
 }

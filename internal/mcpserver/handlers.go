@@ -131,10 +131,22 @@ func handleRead(_ context.Context, database *store.Store, raw json.RawMessage) (
 	if err != nil {
 		return "", err
 	}
-	if count == 0 {
+	// Whether the transcript arrived is what the row records. Sana returns an
+	// empty transcript for a meeting with no speech, and calling that "not
+	// stored yet" contradicts participants, which reports the same meeting as
+	// downloaded, and status, which counts it complete - a loop for an agent
+	// trying to reconcile the three.
+	//
+	// Lines in hand still outrank the row, as everywhere else: the row and the
+	// count are two statements against two read snapshots, so a transcript
+	// committed between them would otherwise be counted and then denied.
+	if meeting.TranscriptState != store.TranscriptComplete && count == 0 {
 		return fmt.Sprintf(
 			"%s has no transcript stored yet (status: %s). Check meeting_transcripts(\"status\").",
 			meeting.Title, meeting.Status), nil
+	}
+	if count == 0 {
+		return fmt.Sprintf("%s has a transcript with no lines.", meeting.Title), nil
 	}
 
 	from, to := 0, 0
@@ -150,10 +162,10 @@ func handleRead(_ context.Context, database *store.Store, raw json.RawMessage) (
 		// Neither a range nor full: report the size and the options rather than
 		// dumping a transcript nobody asked for.
 		return fmt.Sprintf(
-			"%s\n%s, %d lines.\n\nRead it with lines: [1, %d] for a range, or full: true for everything.",
+			"%s\n%s, %s.\n\nRead it with lines: [1, %d] for a range, or full: true for everything.",
 			meeting.Title,
 			render.Timestamp(meeting.CreatedMS),
-			count, min(count, 50)), nil
+			render.Count(count, "line"), min(count, 50)), nil
 	}
 
 	lines, err := database.Lines(args.MeetingID, from, to)
@@ -207,9 +219,19 @@ func handleSummary(_ context.Context, database *store.Store, raw json.RawMessage
 	if err != nil {
 		return "", err
 	}
-	metadata, _, err := database.Metadata(meetingID)
-	if err != nil {
+	// Existence is a question about the meetings table. The summary document is
+	// fetched separately from the transcript, so a stored meeting can be without
+	// one for a while, and answering "not stored locally" then sends an agent to
+	// `list` for an id `list` will show it.
+	if _, err := database.GetMeeting(meetingID); err != nil {
 		return "", notFoundHint(err, meetingID)
+	}
+	metadata, err := database.Summary(meetingID)
+	if errors.Is(err, store.ErrNotFound) {
+		return render.SummaryNotDownloaded, nil
+	}
+	if err != nil {
+		return "", err
 	}
 	return render.Summary(metadata, render.Styles{}), nil
 }
@@ -219,11 +241,28 @@ func handleParticipants(_ context.Context, database *store.Store, raw json.RawMe
 	if err != nil {
 		return "", err
 	}
-	_, participants, err := database.Metadata(meetingID)
+	// Whether the meeting exists is a question about the meetings table, not
+	// about its documents. The two groups come from different places and the
+	// daemon fetches them separately, so mid-sync a meeting can have one, the
+	// other, or neither - and "neither has arrived yet" is a different answer
+	// from "this meeting is not stored". Deciding on a missing document sent an
+	// agent to `list` for an id `list` would happily show it.
+	meeting, err := database.GetMeeting(meetingID)
 	if err != nil {
 		return "", notFoundHint(err, meetingID)
 	}
-	return render.Participants(participants, render.Styles{}), nil
+	participants, metadataErr := database.Participants(meetingID)
+	speakers, err := database.Speakers(meetingID)
+	if err != nil {
+		return "", err
+	}
+	// Whether the transcript was fetched is what the meeting row records, not
+	// something to infer from how many lines came back. Sana returns an empty
+	// transcript for a meeting with no speech - 5 of 246 on a real corpus - and
+	// counting lines reports those as never downloaded, which is the same false
+	// claim in the other direction.
+	return render.Attendance(participants, metadataErr,
+		speakers, meeting.TranscriptState == store.TranscriptComplete, render.Styles{}), nil
 }
 
 // handleRecording fetches the link live: it expires after a few hours, so a

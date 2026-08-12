@@ -1,6 +1,7 @@
 package app
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/laelhalawani/sana-mcp/internal/statusview"
 	"github.com/laelhalawani/sana-mcp/internal/store"
 	"github.com/laelhalawani/sana-mcp/internal/tui"
+	_ "modernc.org/sqlite"
 )
 
 func testUI() tui.UI {
@@ -583,4 +585,112 @@ func TestEveryMenuActionIsDispatched(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The transcript screen reads its lines fresh but gates on the meeting row
+// cached by refresh(), which runs on a tick and is skipped entirely while a
+// prompt is open. A transcript that lands in that window must be shown, not
+// loaded and then thrown away with "not downloaded yet".
+func TestTranscriptScreenPrefersLinesInHandOverTheCachedRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sana.db")
+	database, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { database.Close() }()
+
+	if err := database.PutMeetings([]store.Meeting{{
+		MeetingID: "m1", Title: "Just landed", CreatedMS: 1, Status: store.StatusReady,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.PutTranscript("m1", []store.Line{
+		{LineNo: 1, Speaker: "Zara Nolan", Text: "we just started", OriginalText: "we just started"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The row itself is put into the state PutTranscript never writes: lines
+	// present, state still absent. That is the window between the daemon
+	// committing a transcript and this process reading the row, and it is the
+	// only thing the len(lines) half of the rule is there for.
+	database.Close()
+	if err := setTranscriptState(path, "m1", "absent"); err != nil {
+		t.Fatal(err)
+	}
+	database, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	model := &browser{
+		app: &application{store: database}, ui: testUI(), view: viewDetail,
+	}
+	model.openDocument("m1", "t", backList)
+
+	body := strings.Join(model.lines, "\n")
+	if strings.Contains(body, "not downloaded yet") {
+		t.Fatalf("the transcript was in the store, got %q", body)
+	}
+	if !strings.Contains(body, "we just started") {
+		t.Fatalf("the loaded lines should be shown, got %q", body)
+	}
+}
+
+// The screens read the meeting row fresh rather than from the list refresh()
+// cached, which runs on a tick and is skipped entirely while a prompt is open.
+// For a transcript Sana returned empty there are no lines to outrank a stale
+// row with, so a stale one makes both screens claim it was never downloaded.
+func TestDocumentScreensReadTheRowFreshNotFromTheCachedList(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "sana.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.PutMeetings([]store.Meeting{{
+		MeetingID: "m1", Title: "Silent", CreatedMS: 1, Status: store.StatusReady,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Fetched and genuinely empty: PutTranscript marks it complete either way.
+	if err := database.PutTranscript("m1", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The cached row is the one taken before the transcript landed.
+	stale := []store.Meeting{{
+		MeetingID: "m1", Title: "Silent", CreatedMS: 1,
+		Status: store.StatusReady, TranscriptState: "absent",
+	}}
+
+	transcript := &browser{
+		app: &application{store: database}, ui: testUI(), view: viewDetail, meetings: stale,
+	}
+	transcript.openDocument("m1", "t", backList)
+	if body := strings.Join(transcript.lines, "\n"); strings.Contains(body, "not downloaded yet") {
+		t.Fatalf("the transcript was fetched and is empty, got %q", body)
+	}
+
+	attendance := &browser{
+		app: &application{store: database}, ui: testUI(), view: viewDetail, meetings: stale,
+	}
+	attendance.openDocument("m1", "p", backList)
+	body := strings.Join(attendance.lines, "\n")
+	_, speakers, _ := strings.Cut(body, "Speakers in the transcript")
+	if strings.Contains(speakers, "Not downloaded yet") {
+		t.Fatalf("the speaker group claims a fetched transcript is missing, got %q", body)
+	}
+}
+
+// setTranscriptState writes a state PutTranscript would never write, so a test
+// can hold the row and the lines in disagreement.
+func setTranscriptState(path, meetingID, state string) error {
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	_, err = database.Exec(
+		`UPDATE meetings SET transcript_state = ? WHERE meeting_id = ?`, state, meetingID)
+	return err
 }

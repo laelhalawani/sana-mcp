@@ -458,7 +458,10 @@ func (c *Client) Meeting(ctx context.Context, assetID string) (Metadata, error) 
 	return metadata, nil
 }
 
-// Participant is one attendee.
+// Participant is one workspace member with access to a meeting. Sana's endpoint
+// answers who can see the asset, not who attended: measured across a real
+// corpus, 49% of meetings had no listed participant speak at all. Who spoke is
+// in the transcript's own speaker labels.
 type Participant struct {
 	ID          string  `json:"id"`
 	Email       *string `json:"email"`
@@ -466,7 +469,8 @@ type Participant struct {
 	IsHost      bool    `json:"isHost"`
 }
 
-// Participants returns a meeting's attendees.
+// Participants returns the workspace members with access to a meeting, which is
+// not the same as who attended it.
 func (c *Client) Participants(ctx context.Context, assetID string) ([]Participant, error) {
 	var participants []Participant
 	err := c.trpcQuery(ctx, "meeting.getMeetingParticipants", map[string]any{"assetId": assetID}, &participants)

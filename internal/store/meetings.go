@@ -190,32 +190,122 @@ func (s *Store) PutMetadata(meetingID string, metadata sana.Metadata, participan
 	return err
 }
 
-// Metadata returns a meeting's stored summary document and participants.
-func (s *Store) Metadata(meetingID string) (sana.Metadata, []sana.Participant, error) {
-	var summaryJSON, participantsJSON string
+// Speaker is one voice Sana's diarization identified in a transcript, with how
+// many lines it is credited with.
+//
+// Lines, not turns. Since schema v3 a long speaker turn is broken into several
+// lines, so counting rows counts lines - which is the honest label and, as a
+// rough measure of how much someone spoke, the more useful one anyway.
+type Speaker struct {
+	Name  string
+	Lines int
+}
+
+// Speakers lists the distinct speakers in a meeting's transcript, in the order
+// they first appear.
+//
+// This is a different fact from the participant list, not a better version of
+// it. Participants are the workspace members with access to the meeting, which
+// on a real corpus is a small fixed roster: measured across 241 meetings, 49%
+// had no listed participant speak at all, and only 2 had every speaker listed.
+// Neither list is attendance, and the renderer says so.
+//
+// Ordering is by first appearance rather than alphabetically, so the list reads
+// like the meeting did. There is no index on speaker and none is needed: this
+// is a single-meeting range scan on the (meeting_id, line_no) primary key.
+func (s *Store) Speakers(meetingID string) ([]Speaker, error) {
+	rows, err := s.db.Query(
+		`SELECT speaker, COUNT(*) FROM transcript_lines
+		  WHERE meeting_id = ? AND TRIM(speaker) != ''
+		  GROUP BY speaker ORDER BY MIN(line_no)`,
+		meetingID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// SQL groups byte-exactly and SQLite's TRIM only strips ASCII spaces, so a
+	// label carrying a tab or a non-breaking space survives the guard as an
+	// empty name, and "Dana " and "Dana" come back as two speakers with their
+	// counts split. Both are merged here instead: strings.TrimSpace knows every
+	// Unicode space, and the result set is a handful of rows, so folding them in
+	// Go costs nothing and is correct where the SQL cannot be.
+	var speakers []Speaker
+	seen := map[string]int{}
+	for rows.Next() {
+		var speaker Speaker
+		if err := rows.Scan(&speaker.Name, &speaker.Lines); err != nil {
+			return nil, err
+		}
+		speaker.Name = strings.TrimSpace(speaker.Name)
+		if speaker.Name == "" {
+			continue
+		}
+		if at, merged := seen[speaker.Name]; merged {
+			speakers[at].Lines += speaker.Lines
+			continue
+		}
+		seen[speaker.Name] = len(speakers)
+		speakers = append(speakers, speaker)
+	}
+	return speakers, rows.Err()
+}
+
+// Participants returns just a meeting's participant list.
+//
+// Metadata decodes the summary and the participants behind one error, so an
+// unreadable summary discards a perfectly readable roster - and that has
+// shipped: a field whose type changed upstream made eight meetings' summary
+// JSON undecodable. The participants tool answers about the roster and the
+// transcript's speakers, neither of which the summary can speak for, so it asks
+// only for what it needs.
+func (s *Store) Participants(meetingID string) ([]sana.Participant, error) {
+	var participantsJSON string
 	err := s.db.QueryRow(
-		`SELECT COALESCE(summary_json, ''), COALESCE(participants_json, '')
-		   FROM meeting_metadata WHERE meeting_id = ?`, meetingID,
-	).Scan(&summaryJSON, &participantsJSON)
+		`SELECT COALESCE(participants_json, '') FROM meeting_metadata WHERE meeting_id = ?`,
+		meetingID,
+	).Scan(&participantsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
-		return sana.Metadata{}, nil, fmt.Errorf("%w: metadata for %s", ErrNotFound, meetingID)
+		return nil, fmt.Errorf("%w: metadata for %s", ErrNotFound, meetingID)
 	}
 	if err != nil {
-		return sana.Metadata{}, nil, err
+		return nil, err
 	}
-	var metadata sana.Metadata
-	if summaryJSON != "" {
-		if err := json.Unmarshal([]byte(summaryJSON), &metadata); err != nil {
-			return sana.Metadata{}, nil, fmt.Errorf("stored summary for %s: %w", meetingID, err)
-		}
+	if participantsJSON == "" {
+		return nil, nil
 	}
 	var participants []sana.Participant
-	if participantsJSON != "" {
-		if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
-			return sana.Metadata{}, nil, fmt.Errorf("stored participants for %s: %w", meetingID, err)
-		}
+	if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
+		return nil, fmt.Errorf("stored participants for %s: %w", meetingID, err)
 	}
-	return metadata, participants, nil
+	return participants, nil
+}
+
+// Summary returns just a meeting's summary document, for the same reason
+// Participants returns just the roster: the two share one decode in Metadata,
+// so an unreadable roster took a readable summary down with it and the other
+// way about.
+func (s *Store) Summary(meetingID string) (sana.Metadata, error) {
+	var summaryJSON string
+	err := s.db.QueryRow(
+		`SELECT COALESCE(summary_json, '') FROM meeting_metadata WHERE meeting_id = ?`,
+		meetingID,
+	).Scan(&summaryJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sana.Metadata{}, fmt.Errorf("%w: metadata for %s", ErrNotFound, meetingID)
+	}
+	if err != nil {
+		return sana.Metadata{}, err
+	}
+	if summaryJSON == "" {
+		return sana.Metadata{}, nil
+	}
+	var metadata sana.Metadata
+	if err := json.Unmarshal([]byte(summaryJSON), &metadata); err != nil {
+		return sana.Metadata{}, fmt.Errorf("stored summary for %s: %w", meetingID, err)
+	}
+	return metadata, nil
 }
 
 // PendingMetadata returns ready meetings whose metadata has not been fetched.

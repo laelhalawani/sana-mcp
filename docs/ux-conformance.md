@@ -477,8 +477,35 @@ empty text reworded.
 
 **Participants**: original
 `{displayName ?? email ?? "Unnamed participant"}[  {email}][  (host)]`, all
-plain. Rewrite dims the email, greens `(host)`, has no `Unnamed participant`
-fallback, and reworded the empty case.
+plain. The rewrite had dropped the `Unnamed participant` fallback, which is
+restored - without it a participant with no name, no email and no host flag
+rendered as a blank line. The renderer takes styles for the email and the host
+marker, but every caller passes a zero `Styles` and the app sanitises body lines
+before drawing them, so all three surfaces render this plain, as the original
+did.
+
+The two-space separator is deliberately gone. It prefixed both the email and
+the `(host)` marker, and both are independently optional, so the line had six
+shapes and a host with no email put `(host)` exactly where a parser expects an
+address. The email is now delimited as `<address>`, which identifies itself.
+
+Known limitation, shared with **Summary**: the app draws body lines through
+`render.Wrap`, which drops a leading space run and collapses internal ones, so
+the two-space indent and the aligned speaker-count column show on the CLI and
+the MCP surface but not in the application. `Summary`'s `  - ` rows have always
+lost their indent the same way. The headings and the blank line between groups
+still carry the structure there.
+
+A summary document that has not been fetched now says so
+(`render.SummaryNotDownloaded`) rather than being collapsed into
+`No summary is available.`, on all three surfaces, and a transcript Sana
+returned empty is reported as having no lines rather than as never downloaded.
+
+The screen now shows two labelled groups rather than one list: the workspace
+members Sana returns, and the speakers the transcript names. Sana's participant
+endpoint answers "who has access", not "who attended" - on a real corpus 49% of
+meetings had no listed participant speak at all - so presenting it alone as
+attendees was wrong on the substance, not just the layout.
 
 **Recording**: original body is the bare URL; `Loading recording...` while
 fetching with a `Loading: ` header prefix; failures `No recording is available.`,

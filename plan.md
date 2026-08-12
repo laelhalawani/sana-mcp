@@ -59,7 +59,7 @@ unbranded and singular) and must not change.
 | `read` | `{meeting_id, full?, lines?, timestamps?}` | transcript lines (all, or a `[start,end]` range) |
 | `search` | `{query, page?, limit?, sort?, filter?}` | matching lines with meeting id + line number |
 | `summary` | `{meeting_id}` | summary, notes by topic, and action items |
-| `participants` | `{meeting_id}` | attendees (name, email, host) |
+| `participants` | `{meeting_id}` | workspace members with access, and speakers heard in the transcript |
 | `recording` | `{meeting_id}` | a temporary recording link, fetched live |
 
 Semantics that go with it: `list.sort` = `newest|oldest`; `list.filter` =

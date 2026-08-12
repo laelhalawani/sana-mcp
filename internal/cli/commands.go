@@ -98,6 +98,25 @@ func runRead(database *store.Store, command Command, options Options) int {
 		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
 		return 1
 	}
+	// Asked of the whole transcript, not of the range about to be read: a window
+	// past the end returns nothing and would otherwise be reported as a meeting
+	// whose transcript is empty, which is false and contradicts the MCP surface.
+	// It also comes first, so the range query is not run to be thrown away.
+	count, err := database.LineCount(meetingID)
+	if err != nil {
+		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+		return 1
+	}
+	if count == 0 {
+		if meeting.TranscriptState != store.TranscriptComplete {
+			fmt.Fprintf(options.Stdout, "%s has no transcript stored yet (status: %s).\n",
+				meeting.Title, meeting.Status)
+			return 0
+		}
+		fmt.Fprintf(options.Stdout, "%s has a transcript with no lines.\n", meeting.Title)
+		return 0
+	}
+
 	from, to := 0, 0
 	if len(command.Args) >= 3 {
 		from, _ = strconv.Atoi(command.Args[1])
@@ -140,19 +159,46 @@ func runDocument(database *store.Store, command Command, options Options) int {
 		fmt.Fprintf(options.Stderr, "sana-mcp: %s needs a meeting id\n", command.Name)
 		return 2
 	}
-	metadata, participants, err := database.Metadata(command.Args[0])
-	if err != nil {
-		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
-		return 1
-	}
 	// These are rendered rather than dumped. The stored documents are the raw
 	// JSON Sana returned, which is the right thing to keep but the wrong thing
 	// to show a person at a terminal.
 	if command.Name == "summary" {
+		metadata, err := database.Summary(command.Args[0])
+		if errors.Is(err, store.ErrNotFound) {
+			if _, err := database.GetMeeting(command.Args[0]); err != nil {
+				fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+				return 1
+			}
+			fmt.Fprintln(options.Stdout, render.SummaryNotDownloaded)
+			return 0
+		}
+		if err != nil {
+			fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+			return 1
+		}
 		fmt.Fprint(options.Stdout, render.Summary(metadata, render.Styles{}))
 		return 0
 	}
-	fmt.Fprint(options.Stdout, render.Participants(participants, render.Styles{}))
+	// The roster is asked for on its own: sharing a decode with the summary
+	// meant an unreadable summary discarded a readable roster and the speakers
+	// with it.
+	participants, metadataErr := database.Participants(command.Args[0])
+	// A meeting that is not stored at all is the only "not found" here; a
+	// document that has not arrived yet is reported as exactly that. The row
+	// also carries whether the transcript was fetched, which is a fact to read
+	// rather than infer from a line count - an empty transcript is downloaded.
+	meeting, err := database.GetMeeting(command.Args[0])
+	if err != nil {
+		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+		return 1
+	}
+	speakers, err := database.Speakers(command.Args[0])
+	if err != nil {
+		fmt.Fprintln(options.Stderr, "sana-mcp:", err)
+		return 1
+	}
+	fmt.Fprint(options.Stdout, render.Attendance(participants, metadataErr,
+		speakers, meeting.TranscriptState == store.TranscriptComplete, render.Styles{}))
 	return 0
 }
 

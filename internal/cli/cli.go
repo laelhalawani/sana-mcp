@@ -29,7 +29,7 @@ const Usage = `sana-mcp - your Sana.AI meeting transcripts, on this machine.
   sana-mcp read <id>          a transcript
   sana-mcp search <query>     search across transcripts
   sana-mcp summary <id>       summary, notes, and action items
-  sana-mcp participants <id>  who attended
+  sana-mcp participants <id>  workspace members and who spoke
   sana-mcp recording <id>     a temporary recording link
 
   sana-mcp update             install the latest version

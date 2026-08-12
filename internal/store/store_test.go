@@ -450,3 +450,176 @@ func TestEditRefusesAFragmentThatOccursMoreOftenThanClaimed(t *testing.T) {
 		t.Fatal("a count of zero must be refused")
 	}
 }
+
+// Speakers is the transcript's own answer to who was in the meeting, which is a
+// different question from the participant list Sana returns.
+func TestSpeakersAreCountedAndOrderedByFirstAppearance(t *testing.T) {
+	store := openTest(t)
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "m1", Title: "Review", CreatedMS: 1000, Status: "ready",
+	}); err != nil {
+		t.Fatalf("put meeting: %v", err)
+	}
+	// The first speaker sorts alphabetically after the second, deliberately: with
+	// names in alphabetical order this test would pass under either rule and
+	// prove nothing about ordering.
+	if err := store.PutTranscript("m1", []Line{
+		{LineNo: 1, Speaker: "Zara Nolan", OriginalText: "Shall we start."},
+		{LineNo: 2, Speaker: "Ines Duarte", OriginalText: "Yes."},
+		{LineNo: 3, Speaker: "Zara Nolan", OriginalText: "Right."},
+		{LineNo: 4, Speaker: "Zara Nolan", OriginalText: "So the plan is this."},
+		// A blank speaker is not a person and must not become one.
+		{LineNo: 5, Speaker: "", OriginalText: "inaudible"},
+	}); err != nil {
+		t.Fatalf("put transcript: %v", err)
+	}
+
+	speakers, err := store.Speakers("m1")
+	if err != nil {
+		t.Fatalf("speakers: %v", err)
+	}
+	if len(speakers) != 2 {
+		t.Fatalf("expected 2 speakers, got %d: %+v", len(speakers), speakers)
+	}
+	// First appearance, not alphabetical: the list should read like the meeting.
+	if speakers[0].Name != "Zara Nolan" || speakers[1].Name != "Ines Duarte" {
+		t.Fatalf("speakers are out of order: %+v", speakers)
+	}
+	if speakers[0].Lines != 3 || speakers[1].Lines != 1 {
+		t.Fatalf("line counts are wrong: %+v", speakers)
+	}
+}
+
+// A meeting can have participants and no transcript, so this must be empty
+// rather than an error.
+func TestSpeakersIsEmptyWithoutATranscript(t *testing.T) {
+	store := openTest(t)
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "m1", Title: "Review", CreatedMS: 1000, Status: "ready",
+	}); err != nil {
+		t.Fatalf("put meeting: %v", err)
+	}
+	speakers, err := store.Speakers("m1")
+	if err != nil {
+		t.Fatalf("a meeting with no transcript must not error: %v", err)
+	}
+	if len(speakers) != 0 {
+		t.Fatalf("expected no speakers, got %+v", speakers)
+	}
+}
+
+// SQLite's TRIM strips only ASCII spaces and its GROUP BY is byte-exact, so
+// labels that differ by a tab, a non-breaking space, or a trailing space would
+// otherwise come back as separate speakers with their counts split - or as an
+// empty name that passed the blank guard.
+func TestSpeakersFoldsLabelsThatDifferOnlyByWhitespace(t *testing.T) {
+	store := openTest(t)
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "m1", Title: "Review", CreatedMS: 1000, Status: "ready",
+	}); err != nil {
+		t.Fatalf("put meeting: %v", err)
+	}
+	if err := store.PutTranscript("m1", []Line{
+		{LineNo: 1, Speaker: "Dana Whitfield", OriginalText: "one"},
+		{LineNo: 2, Speaker: "Dana Whitfield ", OriginalText: "two"},   // trailing space
+		{LineNo: 3, Speaker: " Dana Whitfield", OriginalText: "three"}, // NBSP
+		{LineNo: 4, Speaker: "\t", OriginalText: "four"},               // tab only
+	}); err != nil {
+		t.Fatalf("put transcript: %v", err)
+	}
+
+	speakers, err := store.Speakers("m1")
+	if err != nil {
+		t.Fatalf("speakers: %v", err)
+	}
+	if len(speakers) != 1 {
+		t.Fatalf("expected the three labels to fold into one speaker, got %+v", speakers)
+	}
+	if speakers[0].Name != "Dana Whitfield" {
+		t.Fatalf("the folded name should be trimmed, got %q", speakers[0].Name)
+	}
+	if speakers[0].Lines != 3 {
+		t.Fatalf("counts should be summed across the labels, got %d", speakers[0].Lines)
+	}
+}
+
+// Metadata decodes the summary and the participants behind one error, so an
+// unreadable summary used to discard a readable roster - and that has shipped:
+// a field whose type changed upstream made eight meetings' summary JSON
+// undecodable. Participants asks only for what it needs.
+func TestParticipantsSurvivesAnUnreadableSummary(t *testing.T) {
+	store := openTest(t)
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "m1", Title: "Review", CreatedMS: 1, Status: StatusReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO meeting_metadata (meeting_id, summary_json, participants_json)
+		 VALUES ('m1', '{ broken', '[{"displayName":"Dana Whitfield"}]')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The summary reports its own corruption.
+	if _, err := store.Summary("m1"); err == nil {
+		t.Fatal("an unreadable summary should be reported")
+	}
+	// The roster is readable and must be returned.
+	participants, err := store.Participants("m1")
+	if err != nil {
+		t.Fatalf("a readable roster must not be lost to an unreadable summary: %v", err)
+	}
+	if len(participants) != 1 || participants[0].DisplayName != "Dana Whitfield" {
+		t.Fatalf("roster is wrong: %+v", participants)
+	}
+}
+
+// An unreadable roster is still an error: only the coupling was wrong.
+func TestParticipantsReportsItsOwnCorruption(t *testing.T) {
+	store := openTest(t)
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "m1", Title: "Review", CreatedMS: 1, Status: StatusReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO meeting_metadata (meeting_id, summary_json, participants_json)
+		 VALUES ('m1', 'null', '{ broken')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Participants("m1"); err == nil {
+		t.Fatal("an unreadable roster must be reported")
+	}
+}
+
+// The coupling runs both ways: an unreadable roster used to take a readable
+// summary down with it, exactly as an unreadable summary took the roster.
+func TestSummarySurvivesAnUnreadableRoster(t *testing.T) {
+	store := openTest(t)
+	if err := store.PutMeeting(Meeting{
+		MeetingID: "m1", Title: "Review", CreatedMS: 1, Status: StatusReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO meeting_metadata (meeting_id, summary_json, participants_json)
+		 VALUES ('m1', '{"summary":"we agreed the plan"}', '{ broken')`); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata, err := store.Summary("m1")
+	if err != nil {
+		t.Fatalf("a readable summary must not be lost to an unreadable roster: %v", err)
+	}
+	if metadata.Summary == nil || *metadata.Summary != "we agreed the plan" {
+		t.Fatalf("summary is wrong: %+v", metadata)
+	}
+	// And an unreadable summary is still reported as one.
+	if _, err := store.db.Exec(
+		`UPDATE meeting_metadata SET summary_json = '{ broken' WHERE meeting_id = 'm1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Summary("m1"); err == nil {
+		t.Fatal("an unreadable summary must be reported")
+	}
+}
