@@ -7,7 +7,8 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/gofrs/flock v0.13.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
-	github.com/sairaph/detect-harness v0.1.0
+	github.com/pelletier/go-toml/v2 v2.4.3
+	github.com/sairaph/detect-harness v0.3.0
 	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.55.0
 )
@@ -31,7 +32,6 @@ require (
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/pelletier/go-toml/v2 v2.4.3 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.15.0 // indirect
